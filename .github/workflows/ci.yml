@@ -113,7 +113,8 @@ jobs:
                   [ "$result" = "cheat item kanri kyoku no oshigoto" ]
 
             # One archive per platform: the executable, the READMEs, the config template, the license and the
-            # changes, in a folder of the same name; and the SHA-256 of the archive next to it.
+            # changes, in a folder of the same name; and the SHA-256 of the archive next to it. Every file in it has its
+            # modification time as UTC: the extended timestamp of the zip (Windows), the seconds since 1970 of the tar.gz.
             - name: Package
               shell: bash
               run: |
@@ -123,7 +124,13 @@ jobs:
                   cp README.md README.ja.md config.example.toml LICENSE Changes.md "$name/"
                   if [ "${{ runner.os }}" = "Windows" ]; then
                     archive="$name.zip"
-                    powershell -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$archive'"
+                    # The zip is written by Windows' own tar.exe (bsdtar, libarchive), not by Compress-Archive: it stores the
+                    # modification time as UTC in the extended timestamp field ("UT"), besides the plain MS-DOS time that
+                    # has no time zone. Compress-Archive writes only the MS-DOS time. (The tar.gz of the other platforms
+                    # keep their times as UTC seconds already.) The tar in Git Bash is GNU tar, which cannot write a zip.
+                    "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -a -cf "$archive" "$name"
+                    # and the field is there: the bytes of its header (55 54, 5 bytes of data) are in the file
+                    LC_ALL=C grep -qaP '\x55\x54\x05\x00' "$archive" || { echo "no extended timestamp in $archive"; exit 1; }
                   else
                     archive="$name.tar.gz"
                     tar czf "$archive" "$name"
