@@ -1,0 +1,32 @@
+name: security-review
+
+# Claude reads the diff of every pull request and comments on the security problems it finds
+# (https://github.com/anthropics/claude-code-security-review). It needs the repository secret CLAUDE_API_KEY
+# (Settings > Secrets and variables > Actions): an Anthropic API key.
+# The action is not hardened against prompt injection, so it only runs for pull requests from this repository, never from
+# forks, and the action is pinned to a commit.
+on:
+    pull_request:
+
+permissions:
+    contents: read
+    pull-requests: write
+
+concurrency:
+    group: security-review-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    security-review:
+        name: Security review
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.pull_request.head.sha }}
+                  fetch-depth: 2
+            - uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda # main, 2026-02-11
+              with:
+                  comment-pr: true
+                  claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
