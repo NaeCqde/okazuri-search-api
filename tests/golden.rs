@@ -8,7 +8,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn convert(args: &[&str], input: &str) -> Vec<String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pronounce-api"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_okazuri-search-api"))
         .arg("convert")
         .args(args)
         // a config.toml next to the tests must not change the results

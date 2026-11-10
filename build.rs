@@ -2,12 +2,12 @@
 //!
 //! A build script runs *before* the crate is compiled, so it cannot copy the
 //! result itself. Instead it starts a short-lived background copy of itself that
-//! waits for `target/release/pronounce-api[.exe]` to be (re)written and then
+//! waits for `target/release/okazuri-search-api[.exe]` to be (re)written and then
 //! copies it to the project root. The background copy gives up after half an hour
 //! and writes what it did to `target/release/copy-to-root.log`.
 //!
 //! Only release builds are copied, so a debug build never replaces the executable
-//! in the project root. Set `PRONOUNCE_API_NO_COPY=1` to turn the copy off.
+//! in the project root. Set `OKAZURI_SEARCH_API_NO_COPY=1` to turn the copy off.
 
 use std::env;
 use std::fs;
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const BIN: &str = "pronounce-api";
+const BIN: &str = "okazuri-search-api";
 const WATCH_FLAG: &str = "--copy-when-built";
 const GIVE_UP: Duration = Duration::from_secs(30 * 60);
 
@@ -31,9 +31,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=config.example.toml");
-    println!("cargo:rerun-if-env-changed=PRONOUNCE_API_NO_COPY");
+    println!("cargo:rerun-if-env-changed=OKAZURI_SEARCH_API_NO_COPY");
 
-    if env::var("PROFILE").as_deref() != Ok("release") || env::var_os("PRONOUNCE_API_NO_COPY").is_some() {
+    if env::var("PROFILE").as_deref() != Ok("release") || env::var_os("OKAZURI_SEARCH_API_NO_COPY").is_some() {
         return;
     }
     let (Some(out_dir), Some(manifest_dir)) = (env::var_os("OUT_DIR"), env::var_os("CARGO_MANIFEST_DIR")) else {

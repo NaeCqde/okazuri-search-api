@@ -2,6 +2,14 @@
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Seconds since 1970-01-01 UTC.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// The distance between a hiragana and the katakana of the same sound.
 const KANA_OFFSET: u32 = 0x60;
 

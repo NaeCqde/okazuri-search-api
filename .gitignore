@@ -1,5 +1,8 @@
 target/
 config.toml
+# the two SQLite files of the search engine (search.db, d1-mirror.db)
+search.db*
+d1-mirror.db*
 .DS_Store
-/pronounce-api.exe
-/pronounce-api
+/okazuri-search-api.exe
+/okazuri-search-api

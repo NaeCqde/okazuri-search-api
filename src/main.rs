@@ -1,8 +1,17 @@
 mod api;
 mod cli;
 mod config;
+mod cron;
+mod d1;
+mod engine;
+mod entity;
+mod mirror;
+mod prefetch;
+mod query;
 mod romaji;
 mod romanizer;
+mod sites;
+mod store;
 #[cfg(test)]
 mod testing;
 mod tokenizer;

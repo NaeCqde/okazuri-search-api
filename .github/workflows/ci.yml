@@ -28,7 +28,7 @@ concurrency:
 env:
     RUST_BACKTRACE: 1
     # build.rs would otherwise start a process that waits to copy the executable to the project root
-    PRONOUNCE_API_NO_COPY: 1
+    OKAZURI_SEARCH_API_NO_COPY: 1
 
 jobs:
     test:
@@ -60,27 +60,27 @@ jobs:
                 platform:
                     - os-name: Linux-x86_64
                       runs-on: ubuntu-24.04
-                      executable: pronounce-api
+                      executable: okazuri-search-api
                       target: ""
                     - os-name: Linux-x86_64-musl
                       runs-on: ubuntu-24.04
-                      executable: pronounce-api
+                      executable: okazuri-search-api
                       target: x86_64-unknown-linux-musl
                     - os-name: Linux-aarch64
                       runs-on: ubuntu-24.04-arm
-                      executable: pronounce-api
+                      executable: okazuri-search-api
                       target: ""
                     - os-name: Windows-x86_64
                       runs-on: windows-2025
-                      executable: pronounce-api.exe
+                      executable: okazuri-search-api.exe
                       target: ""
                     - os-name: Windows-aarch64
                       runs-on: windows-11-arm
-                      executable: pronounce-api.exe
+                      executable: okazuri-search-api.exe
                       target: ""
                     - os-name: macOS-aarch64
                       runs-on: macos-latest
-                      executable: pronounce-api
+                      executable: okazuri-search-api
                       target: ""
         runs-on: ${{ matrix.platform.runs-on }}
         env:
@@ -94,8 +94,9 @@ jobs:
             - uses: Swatinem/rust-cache@v2
               with:
                   key: ${{ matrix.platform.os-name }}
-            # The dictionary is downloaded by a build script that runs on the runner itself, and nothing in the
-            # program links C code, so for musl the C library headers and the `musl-gcc` wrapper are all it needs.
+            # The dictionary is downloaded by a build script that runs on the runner itself. The only C code in the
+            # program is the crypto of rustls (ring, for the HTTPS requests of the cron jobs), and `musl-gcc` from this
+            # package compiles it for the musl target.
             - name: Install musl tools
               if: matrix.platform.target == 'x86_64-unknown-linux-musl'
               run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -116,7 +117,7 @@ jobs:
             - name: Package
               shell: bash
               run: |
-                  name="pronounce-api-${{ matrix.platform.os-name }}"
+                  name="okazuri-search-api-${{ matrix.platform.os-name }}"
                   mkdir "$name"
                   cp "$BUILD_DIR/${{ matrix.platform.executable }}" "$name/"
                   cp README.md README.ja.md config.example.toml LICENSE Changes.md "$name/"
@@ -135,7 +136,7 @@ jobs:
                   echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
             - uses: actions/upload-artifact@v4
               with:
-                  name: pronounce-api-${{ matrix.platform.os-name }}
+                  name: okazuri-search-api-${{ matrix.platform.os-name }}
                   path: |
                       ${{ env.ARCHIVE }}
                       ${{ env.ARCHIVE }}.sha256

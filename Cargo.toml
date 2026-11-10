@@ -1,10 +1,10 @@
 [package]
-name = "pronounce_api"
+name = "okazuri_search_api"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "pronounce-api"
+name = "okazuri-search-api"
 path = "src/main.rs"
 
 [dependencies]
@@ -14,8 +14,20 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # The server. Only HTTP/1 and query strings are used, so the rest of axum is left out.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
+
+# The `[cron]` jobs: the HTTP client. Blocking (it runs on the blocking threads of tokio), with rustls,
+# so no OpenSSL is needed, also for musl. lindera's build script already compiles the same crates.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# The search engine (`[search]`): the two SQLite files (a copy of the D1 tables and the cache of the results), through
+# SeaORM (sqlx; the SQLite library is compiled into the executable), the patterns of the result links, and JSON for the
+# API and for Cloudflare's.
+sea-orm = { version = "1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite"] }
+regex = "1"
+serde_json = "1"
+url = "2"
 
 # The text is NFKC-normalized before it is split into words (`romanizer.rs`), like cutlet does.
 unicode-normalization = "0.1"

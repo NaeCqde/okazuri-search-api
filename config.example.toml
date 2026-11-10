@@ -1,8 +1,12 @@
-# pronounce-api config template.
+# okazuri-search-api config template.
+#
+# What the server does is switched here. The Japanese to romaji conversion (GET /romaji, and the romaji of every
+# search query and title) has no switch: it is always on. [search], [d1], [prefetch] and [cron] are off until they
+# are asked for with enabled = true.
 #
 # Copy this to config.toml (gitignored) and change what you need. Every key is optional: the
 # values below are the defaults, and a missing config.toml is the same as an empty one.
-# pronounce-api reads config.toml from the current working directory, and only from there
+# okazuri-search-api reads config.toml from the current working directory, and only from there
 # (or the file named with --config).
 
 [server]
@@ -17,10 +21,97 @@ port = 8000
 max_query_chars = 300
 
 # Words that are written out instead of being read from the dictionary. The key is a word as
-# UniDic splits it (see `pronounce-api convert`), the value is the romaji it is replaced by.
+# UniDic splits it (see `okazuri-search-api convert`), the value is the romaji it is replaced by.
 # They win over the built-in ones (ラーメン = ramen, メイド = maid, ...).
 #
 # Use it when the foreign spelling UniDic has for a katakana word is a different foreign word with
 # the same sound (ラーメン is "Rahmen", German for "frame").
 [exceptions]
 # "ナース" = "nurse"
+
+# The search engine: GET /okazuri/search?q=<words>. The query is asked to the search of every site of
+# okazuri_bot/src/websites.ts; what their list pages show of each work (the title as the page writes it, and the
+# path of its page; no image) is saved in a SQLite file; and the answer is every saved work whose title has all the
+# words of the query. GET /okazuri/sites lists the sites and which of them can be searched.
+[search]
+enabled = true
+# The first SQLite file (the second one is [d1] mirror_path). Made if it is not there.
+db_path = "search.db"
+# A query is not asked to a site again within this time, by a request to /okazuri/search (live) or by the prefetch: the
+# database answers. 720 hours is a month; after it the works are fetched again, and the ones that are gone are removed.
+ttl_hours = 720
+# A site that failed is not asked the same query again before this.
+retry_failed_minutes = 60
+# The longest query, in characters.
+max_query_chars = 300
+# How many sites are asked at the same time.
+concurrency = 8
+# How long a site may take to answer.
+timeout_secs = 20
+# The shortest time between two requests to the same site. Be kind to the sites: some answer 429 to a rush.
+min_delay_ms = 1000
+# The most works kept from one site's list page, and the most in one answer (a request may use limit=).
+max_results_per_site = 50
+max_results = 100
+# Sites to leave out (the names of GET /okazuri/sites).
+disabled_sites = []
+# Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
+try_unsupported = false
+
+# A copy of the magazine tables (magazines and numbers) of the Worker's D1 database. The server asks D1 whether
+# the data changed (the Time Travel bookmark: no rows are read), and when it did, downloads the SQL that D1
+# exports for those two tables and loads it into the second SQLite file. The whole database cannot be exported
+# because of its FTS5 table, so the tables are named. An export blocks the database for a moment.
+[d1]
+enabled = false
+account_id = ""
+database_id = ""
+# A Cloudflare API token that can edit D1. ${NAME} is the environment variable NAME: keep the token out of this file.
+api_token = "${CLOUDFLARE_API_TOKEN}"
+tables = ["magazines", "numbers"]
+mirror_path = "d1-mirror.db"
+check_interval_minutes = 10
+
+# Searching ahead of time: the name of every issue in the copy becomes a query the way the bot makes it
+# ("COMIC快楽天 2026年07月号" is "COMIC快楽天 2026 07", searched in romaji), and is searched like a request, newest issue first. A
+# query that is searched already is skipped. Needs [search]; the copy comes from [d1].
+[prefetch]
+enabled = false
+# The wait between two queries.
+query_delay_ms = 2000
+# The most queries in one round (0: all). The next round goes on from there.
+max_queries_per_round = 0
+# The wait between two rounds when everything is searched already (a change of the copy starts one at once).
+round_interval_minutes = 60
+
+# Scheduled HTTP requests: the server calls a URL on a schedule, so a job that has to be run from this
+# machine needs no crontab and curl next to it. Off unless enabled = true; while it is off, the jobs
+# below are not even checked. A mistake in this section stops the start with a message that names the job.
+[cron]
+enabled = false
+# The clock the schedules are read on: "+09:00", "-05:30" or "UTC".
+utc_offset = "UTC"
+
+# One [[cron.jobs]] for each request. Only name, schedule and url are required.
+#
+#   name          shown in the log; different for each job
+#   schedule      minute hour day-of-month month day-of-week, like crontab: "*", "5", "1-5", "*/15",
+#                 "10-30/5", "0,30"; month and weekday can be names ("jan", "mon-fri"). When both the day of
+#                 the month and the weekday are given, either of them is enough (as in cron).
+#   url           http:// or https://
+#   method        default "GET"
+#   headers       ${NAME} in a value is the environment variable NAME, so that a secret is not written here
+#   body          the request body (a string)
+#   timeout_secs  default 30. A job that is still running when its next time comes is skipped.
+#   enabled       default true
+#
+# [[cron.jobs]]
+# name = "okazuri-fetch-magazines"
+# schedule = "*/10 * * * *"
+# method = "POST"
+# url = "https://okazuri-bot.example.workers.dev/internal/fetch-magazines"
+# timeout_secs = 150
+#
+# [cron.jobs.headers]
+# Authorization = "Bearer ${CRON_SECRET}"
+# Content-Type = "application/json"

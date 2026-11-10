@@ -14,7 +14,12 @@ pub fn romanizer() -> &'static Romanizer {
     shared()
 }
 
+/// The same romanizer, shared, for what takes one (the engine).
+pub fn romanizer_arc() -> Arc<Romanizer> {
+    shared().clone()
+}
+
 /// The state of the server, with the default limit of 300 characters.
 pub fn romanizer_state() -> Arc<AppState> {
-    Arc::new(AppState { romanizer: shared().clone(), max_query_chars: 300 })
+    Arc::new(AppState { romanizer: shared().clone(), max_query_chars: 300, search: None })
 }
