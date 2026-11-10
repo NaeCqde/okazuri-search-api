@@ -1,0 +1,55 @@
+name: weekly-security
+
+# Once a week Claude handles the open Dependabot alerts, reads the whole repository against docs/SPEC.md, fixes the
+# vulnerabilities it finds, opens a pull request and merges it once the checks pass.
+# Needs: secret CLAUDE_CODE_OAUTH_TOKEN, and the setting "Allow GitHub Actions to create and approve pull requests".
+# Optional secret DEPENDABOT_ALERTS_TOKEN (a token with the Dependabot alerts read permission): the default GITHUB_TOKEN
+# cannot read alerts, so without it Claude falls back to the audit tools of the project.
+on:
+    schedule:
+        - cron: "17 21 * * 0"
+    workflow_dispatch:
+
+permissions:
+    contents: write
+    pull-requests: write
+
+concurrency:
+    group: weekly-security
+    cancel-in-progress: false
+
+jobs:
+    fix:
+        name: Weekly security fix
+        runs-on: ubuntu-24.04
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+            - uses: anthropics/claude-code-action@9008224dd4f743876f528e6ba0f0d611f076a7f9 # v1.0.271
+              env:
+                  ALERTS_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+              with:
+                  claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+                  github_token: ${{ github.token }}
+                  prompt: |
+                      REPO: ${{ github.repository }}
+                      DEFAULT BRANCH: ${{ github.event.repository.default_branch }}
+
+                      Weekly security maintenance. Work on a new branch `security/weekly-<date>`.
+                      1. Read `docs/SPEC.md` (if present). It is the up to date specification: when the code disagrees with it, the code is wrong.
+                      2. Open Dependabot alerts: `GH_TOKEN="$ALERTS_TOKEN" gh api repos/${{ github.repository }}/dependabot/alerts?state=open` when
+                         ALERTS_TOKEN is set; otherwise use the audit tools of the project (pnpm/bun/npm audit, cargo audit, govulncheck).
+                         Fix them by updating the dependency (lockfile too) or adding an override; if no fix exists, leave it and say so.
+                      3. Read the whole repository for exploitable vulnerabilities (injection, path traversal, SSRF, broken authentication or
+                         authorization, secrets in the code, unsafe deserialization, unsafe `unsafe`) and fix them without changing the behaviour
+                         described in SPEC.md. If a fix has to change the behaviour, update SPEC.md in the same change.
+                      4. Run the project's build and tests. If anything fails, undo that change.
+                      5. If there is nothing to change, stop. Otherwise commit, push the branch, open a pull request
+                         (`gh pr create`) listing each alert / finding and what was done, wait for the checks
+                         (`gh pr checks --watch`), and merge with `gh pr merge --squash --delete-branch` only when they pass.
+                         If the checks fail, leave the PR open and say why in a comment.
+                  claude_args: |
+                      --max-turns 80
+                      --allowedTools "Read,Grep,Glob,Edit,Write,Bash"
