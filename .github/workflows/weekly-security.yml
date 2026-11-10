@@ -50,9 +50,12 @@ jobs:
                          described in SPEC.md. If a fix has to change the behaviour, update SPEC.md in the same change.
                       4. Run the project's build and tests. If anything fails, undo that change.
                       5. If there is nothing to change, stop. Otherwise commit, push the branch, open a pull request
-                         (`gh pr create`) listing each alert / finding and what was done, wait for the checks
-                         (`gh pr checks --watch`), and merge with `gh pr merge --squash --delete-branch` only when they pass.
-                         If the checks fail, leave the PR open and say why in a comment.
+                         (`gh pr create`) listing each alert / finding and what was done. Then wait for the checks: checks start a few
+                         seconds after the pull request is opened, so run `sleep 60` first, then `gh pr checks --watch --interval 20`
+                         (repeat once if it reports no checks). The `Security review` check is always expected, so "no checks" means they
+                         have not started yet, not that none are configured. When every check has finished and none failed, merge with
+                         `gh pr merge --squash --delete-branch`. If a check fails, or the Security review comment reports an exploitable
+                         vulnerability, leave the PR open and say why in a comment.
                   claude_args: |
                       --max-turns 80
                       --allowedTools "Read,Grep,Glob,Edit,Write,Bash"
