@@ -76,7 +76,7 @@ jobs:
 
                       Weekly security maintenance. Work on a new branch `security/weekly-<date>`. The title of your pull request must start with `[weekly-security] `
                       (the next run uses it to tell your own merges from new work).
-                      0. Open Dependabot pull requests (`gh pr list --author "app/dependabot" --state open`): for each one, wait for its checks;
+                      0. Open Dependabot pull requests (`gh pr list --author "app/dependabot" --state open`): for each one, wait for its workflow runs (as in step 5);
                          when they pass, merge it with `gh pr merge --squash --delete-branch`. (There is no `Security review` check on
                          them.) When a check fails, try to fix it on the pull request branch; if you cannot, leave a comment with the reason.
                       1. Read `docs/SPEC.md` (if present). It is the up to date specification: when the code disagrees with it, the code is wrong.
@@ -88,11 +88,13 @@ jobs:
                          described in SPEC.md. If a fix has to change the behaviour, update SPEC.md in the same change.
                       4. Run the project's build and tests. If anything fails, undo that change.
                       5. If there is nothing to change, stop. Otherwise commit, push the branch, open a pull request
-                         (`gh pr create`, the title starts with `[weekly-security]`) listing each alert / finding and what was done. Then wait for the checks: checks start a few
-                         seconds after the pull request is opened, so run `sleep 60` first, then `gh pr checks --watch --interval 20`
-                         (repeat once if it reports no checks). The `Security review` check is always expected, so "no checks" means they
-                         have not started yet, not that none are configured. When every check has finished and none failed, merge with
-                         `gh pr merge --squash --delete-branch`. If a check fails, or the Security review comment reports an exploitable
+                         (`gh pr create`, the title starts with `[weekly-security]`) listing each alert / finding and what was done. Then wait for the checks. Do not use the checks or
+                         statuses APIs (the token cannot read them); use the workflow runs of the pull request branch: checks start a
+                         few seconds after the pull request is opened, so run `sleep 60`, then
+                         `gh run list --branch <branch> --json databaseId,name,status,conclusion` and `gh run watch <id> --exit-status` for each
+                         run that is not finished (repeat the list once if it is empty). The `Security review` run is always expected, so
+                         an empty list means the runs have not started yet. When every run has finished and none failed, merge with
+                         `gh pr merge --squash --delete-branch`. If a run fails, or the Security review comment reports an exploitable
                          vulnerability, leave the PR open and say why in a comment.
                   claude_args: |
                       --max-turns 80
