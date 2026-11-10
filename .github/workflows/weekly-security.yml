@@ -52,8 +52,11 @@ jobs:
                   [ "$(date -u +%-d)" -le 7 ] && run "monthly full read"
                   last=$(gh run list --workflow weekly-security.yml --status success --limit 1 --json headSha --jq '.[0].headSha // ""') || run "cannot read the runs"
                   [ -z "$last" ] && run "no earlier run"
-                  [ "$last" != "$GITHUB_SHA" ] && run "new commits since $last"
-                  alerts=$(gh api --paginate "repos/$GITHUB_REPOSITORY/dependabot/alerts?state=open" --jq '[.[]|select(.security_vulnerability.first_patched_version != null)]|length' 2>/dev/null | paste -sd+ - | bc) || run "cannot read the alerts"
+                  git cat-file -e "$last^{commit}" 2>/dev/null || run "the last checked commit is not in the history"
+                  # the job's own merged pull requests and Dependabot's were looked at already
+                  new=$(git log --format='%an|%s' "$last..$GITHUB_SHA" | grep -vE '^dependabot\[bot\]\||^[^|]*\|\[weekly-security\]' | wc -l)
+                  [ "$new" -gt 0 ] && run "$new new commits since $last"
+                  alerts=$(gh api --paginate "repos/$GITHUB_REPOSITORY/dependabot/alerts?state=open" --jq '[.[]|select(.security_vulnerability.first_patched_version != null)]|length' 2>/dev/null | paste -sd+ - | awk '{s+=$1} END {print s+0}') || run "cannot read the alerts"
                   [ "${alerts:-0}" -gt 0 ] && run "$alerts open alerts have a patched version"
                   prs=$(gh pr list --state open --author "app/dependabot" --json number --jq length) || run "cannot read the pull requests"
                   [ "${prs:-0}" -gt 0 ] && run "$prs open Dependabot pull requests"
@@ -71,7 +74,8 @@ jobs:
                       REPO: ${{ github.repository }}
                       DEFAULT BRANCH: ${{ github.event.repository.default_branch }}
 
-                      Weekly security maintenance. Work on a new branch `security/weekly-<date>`.
+                      Weekly security maintenance. Work on a new branch `security/weekly-<date>`. The title of your pull request must start with `[weekly-security] `
+                      (the next run uses it to tell your own merges from new work).
                       0. Open Dependabot pull requests (`gh pr list --author "app/dependabot" --state open`): for each one, wait for its checks;
                          when they pass, merge it with `gh pr merge --squash --delete-branch`. (There is no `Security review` check on
                          them.) When a check fails, try to fix it on the pull request branch; if you cannot, leave a comment with the reason.
@@ -84,7 +88,7 @@ jobs:
                          described in SPEC.md. If a fix has to change the behaviour, update SPEC.md in the same change.
                       4. Run the project's build and tests. If anything fails, undo that change.
                       5. If there is nothing to change, stop. Otherwise commit, push the branch, open a pull request
-                         (`gh pr create`) listing each alert / finding and what was done. Then wait for the checks: checks start a few
+                         (`gh pr create`, the title starts with `[weekly-security]`) listing each alert / finding and what was done. Then wait for the checks: checks start a few
                          seconds after the pull request is opened, so run `sleep 60` first, then `gh pr checks --watch --interval 20`
                          (repeat once if it reports no checks). The `Security review` check is always expected, so "no checks" means they
                          have not started yet, not that none are configured. When every check has finished and none failed, merge with
