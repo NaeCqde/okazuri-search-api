@@ -4,7 +4,7 @@ name: security-review
 # (https://github.com/anthropics/claude-code-action). It signs in with the subscription token in the repository secret
 # CLAUDE_CODE_OAUTH_TOKEN (made with `claude setup-token`).
 # It only runs for pull requests from this repository, never from forks (a fork has no secrets anyway), and the action
-# is pinned to a commit.
+# is pinned to a commit. Dependabot's pull requests are skipped: workflows started by Dependabot get no repository secrets.
 on:
     pull_request:
 
@@ -19,7 +19,7 @@ concurrency:
 jobs:
     security-review:
         name: Security review
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
         runs-on: ubuntu-24.04
         timeout-minutes: 30
         steps:
