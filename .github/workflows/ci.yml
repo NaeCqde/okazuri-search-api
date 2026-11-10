@@ -6,10 +6,36 @@ name: ci
 # pre-release `latest` (its tag moves to the pushed commit). A pull request does not publish anything.
 on:
     push:
+        paths-ignore:
+            - "**.md"
+            - "LICENSE*"
+            - "docs/**"
+            - ".gitignore"
+            - ".gitattributes"
+            - ".prettierrc*"
+            - ".editorconfig"
+            - ".vscode/**"
+            - ".github/dependabot.yml"
+            - ".github/workflows/security-review.yml"
+            - ".github/workflows/weekly-security.yml"
+            - "**/.DS_Store"
         branches: ["**"]
         tags:
             - "v*"
     pull_request:
+        paths-ignore:
+            - "**.md"
+            - "LICENSE*"
+            - "docs/**"
+            - ".gitignore"
+            - ".gitattributes"
+            - ".prettierrc*"
+            - ".editorconfig"
+            - ".vscode/**"
+            - ".github/dependabot.yml"
+            - ".github/workflows/security-review.yml"
+            - ".github/workflows/weekly-security.yml"
+            - "**/.DS_Store"
     workflow_dispatch:
         inputs:
             tag:
