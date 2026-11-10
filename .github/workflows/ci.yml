@@ -58,24 +58,16 @@ jobs:
                 # `target` is set for a build that is not for the machine it runs on (musl: a static executable
                 # with no glibc, for any Linux x86_64 server). Empty means the runner's own target.
                 platform:
-                    - os-name: Linux-x86_64
-                      runs-on: ubuntu-24.04
-                      executable: okazuri-search-api
-                      target: ""
                     - os-name: Linux-x86_64-musl
                       runs-on: ubuntu-24.04
                       executable: okazuri-search-api
                       target: x86_64-unknown-linux-musl
-                    - os-name: Linux-aarch64
+                    - os-name: Linux-aarch64-musl
                       runs-on: ubuntu-24.04-arm
                       executable: okazuri-search-api
-                      target: ""
+                      target: aarch64-unknown-linux-musl
                     - os-name: Windows-x86_64
                       runs-on: windows-2025
-                      executable: okazuri-search-api.exe
-                      target: ""
-                    - os-name: Windows-aarch64
-                      runs-on: windows-11-arm
                       executable: okazuri-search-api.exe
                       target: ""
                     - os-name: macOS-aarch64
@@ -98,7 +90,7 @@ jobs:
             # program is the crypto of rustls (ring, for the HTTPS requests of the cron jobs), and `musl-gcc` from this
             # package compiles it for the musl target.
             - name: Install musl tools
-              if: matrix.platform.target == 'x86_64-unknown-linux-musl'
+              if: contains(matrix.platform.target, 'linux-musl')
               run: sudo apt-get update && sudo apt-get install -y musl-tools
             - name: Build
               run: cargo build --locked --release ${{ matrix.platform.target && format('--target {0}', matrix.platform.target) }}
