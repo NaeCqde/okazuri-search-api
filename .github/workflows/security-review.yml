@@ -5,8 +5,11 @@ name: security-review
 # (Settings > Secrets and variables > Actions): an Anthropic API key.
 # The action is not hardened against prompt injection, so it only runs for pull requests from this repository, never from
 # forks, and the action is pinned to a commit.
+# DISABLED until CLAUDE_API_KEY is set: the trigger is only a manual run now. To turn it on again, replace the `on:` block
+# below with `on:
+#     pull_request:`.
 on:
-    pull_request:
+    workflow_dispatch:
 
 permissions:
     contents: read
@@ -19,7 +22,7 @@ concurrency:
 jobs:
     security-review:
         name: Security review
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         runs-on: ubuntu-24.04
         steps:
             - uses: actions/checkout@v4
