@@ -38,6 +38,8 @@ curl "http://127.0.0.1:8000/okazuri/search?q=%E5%BF%AB%E6%A5%BD%E5%A4%A9"
 curl "http://127.0.0.1:8000/romaji?q=%E3%83%81%E3%83%BC%E3%83%88"        # cheat
 ```
 
+A demo server is running at <https://okazuri-api.nae.quest/> (for example <https://okazuri-api.nae.quest/okazuri/search?q=a>).
+
 The query is percent-encoded UTF-8. The endpoints are in [docs/API.md](docs/API.md).
 
 ## Settings

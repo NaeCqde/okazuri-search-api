@@ -15,7 +15,7 @@ use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -99,7 +99,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
     let request = Request { query: &text, live, limit };
 
     match engine.search(&request).await {
-        Ok(outcome) => Json(outcome).into_response(),
+        Ok(outcome) => json(StatusCode::OK, &outcome),
         Err(e) => {
             log::error!("cannot search {:?}: {}", text, e);
             server_error()
@@ -110,11 +110,25 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
 async fn sites(State(state): State<Arc<AppState>>) -> Response {
     let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
 
-    Json(engine.sites_info()).into_response()
+    json(StatusCode::OK, &engine.sites_info())
 }
 
 async fn health() -> Response {
     plain_text(StatusCode::OK, "ok".to_string())
+}
+
+const JSON_UTF8: &str = "application/json; charset=utf-8";
+
+/// axum's `Json` sends a bare `application/json`, and axum has no option to add a charset.
+/// Some browsers (Orion on iOS) then guess Shift_JIS when they show the body as text, so the charset is set here.
+fn json<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(body) => (status, [(header::CONTENT_TYPE, JSON_UTF8)], body).into_response(),
+        Err(e) => {
+            log::error!("cannot serialize the response: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 fn plain_text(status: StatusCode, body: String) -> Response {
@@ -122,12 +136,12 @@ fn plain_text(status: StatusCode, body: String) -> Response {
 }
 
 fn server_error() -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "detail": "internal error" }))).into_response()
+    json(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "detail": "internal error" }))
 }
 
 fn invalid(detail: &str) -> Response {
     let body = format!("{{\"detail\":{}}}", json_string(detail));
-    (StatusCode::UNPROCESSABLE_ENTITY, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+    (StatusCode::UNPROCESSABLE_ENTITY, [(header::CONTENT_TYPE, JSON_UTF8)], body).into_response()
 }
 
 /// A JSON string literal (the messages here are plain ASCII, but a quote must not break the body).
@@ -202,7 +216,7 @@ mod tests {
     async fn a_bad_request_is_a_422() {
         let (status, content_type, body) = get_path("/romaji").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(content_type, "application/json");
+        assert_eq!(content_type, "application/json; charset=utf-8");
         assert!(body.contains("\"detail\""), "{body}");
 
         assert_eq!(get_path("/romaji?q=").await.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -245,7 +259,7 @@ mod tests {
         let (status, content_type, body) = get_from(state.clone(), &format!("/okazuri/search?q={}", encode("COMIC ExE"))).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(content_type, "application/json");
+        assert_eq!(content_type, "application/json; charset=utf-8");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["query"], "COMIC ExE");
         assert_eq!(json["results"][0]["website"], "Good");
