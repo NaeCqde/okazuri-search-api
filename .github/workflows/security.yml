@@ -132,7 +132,8 @@ jobs:
                   wait_ci() { # sha
                     local sha="$1" runs i
                     local docs=false
-                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/)' || docs=true
+                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/|^\.github/dependabot\.yml$|^\.github/workflows/security\.yml$)' || docs=true
+                    [ -f .github/workflows/ci.yml ] || docs=true # a repository without a CI has nothing to wait for
                     for i in $(seq 1 50); do
                       runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
                       if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
@@ -232,7 +233,8 @@ jobs:
                   wait_ci() { # sha
                     local sha="$1" runs i
                     local docs=false
-                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/)' || docs=true
+                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/|^\.github/dependabot\.yml$|^\.github/workflows/security\.yml$)' || docs=true
+                    [ -f .github/workflows/ci.yml ] || docs=true # a repository without a CI has nothing to wait for
                     for i in $(seq 1 50); do
                       runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
                       if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
