@@ -58,11 +58,13 @@ jobs:
             contents: write
             pull-requests: write
         steps:
+            # The owner's token (it can get past the branch protection) is given to Claude only for pull requests of the owner's own account:
+            # the diff of anybody else with write access is untrusted and could steer Claude (prompt injection) into using it.
             - uses: actions/checkout@v4
               with:
                   ref: ${{ github.event.pull_request.head.ref }}
                   fetch-depth: 0
-                  token: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  token: ${{ (github.event.pull_request.user.login == github.repository_owner && secrets.WEEKLY_SECURITY_TOKEN) || github.token }}
             - name: Decision file
               run: echo "DECISION=$RUNNER_TEMP/decision.json" >> "$GITHUB_ENV"
             - name: Was the last commit made by this job?
@@ -72,10 +74,10 @@ jobs:
             - uses: anthropics/claude-code-action@9008224dd4f743876f528e6ba0f0d611f076a7f9 # v1.0.271
               if: steps.last.outputs.mine != 'true'
               env:
-                  GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  GH_TOKEN: ${{ (github.event.pull_request.user.login == github.repository_owner && secrets.WEEKLY_SECURITY_TOKEN) || github.token }}
               with:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-                  github_token: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  github_token: ${{ (github.event.pull_request.user.login == github.repository_owner && secrets.WEEKLY_SECURITY_TOKEN) || github.token }}
                   prompt: |
                       REPO: ${{ github.repository }}
                       PR NUMBER: ${{ github.event.pull_request.number }}
@@ -108,10 +110,10 @@ jobs:
             - uses: anthropics/claude-code-action@9008224dd4f743876f528e6ba0f0d611f076a7f9 # v1.0.271
               if: steps.last.outputs.mine == 'true'
               env:
-                  GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  GH_TOKEN: ${{ (github.event.pull_request.user.login == github.repository_owner && secrets.WEEKLY_SECURITY_TOKEN) || github.token }}
               with:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-                  github_token: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  github_token: ${{ (github.event.pull_request.user.login == github.repository_owner && secrets.WEEKLY_SECURITY_TOKEN) || github.token }}
                   prompt: |
                       REPO: ${{ github.repository }}
                       PR NUMBER: ${{ github.event.pull_request.number }}
@@ -280,7 +282,7 @@ jobs:
                   why=$(unfinished) && { say "Not merged automatically: $why."; exit 0; }
                   # fixed rules
                   files=$(gh pr diff "$PR" --name-only)
-                  if echo "$files" | grep -Eqi '(^|/)(\.github/|Cargo\.(toml|lock)$|package(-lock)?\.json$|(pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|go\.(mod|sum)$|build\.rs$|post_build\.rs$|Dockerfile|compose\.ya?ml$|wrangler\.|LICENSE|docs/SPEC\.md$|[^/]*\.(sh|bat|ps1|cmd)$|[^/]*\.(exe|dll|so|dylib|wasm|zip|jar)$)'; then
+                  if echo "$files" | grep -Eqi '(^|/)(\.github/|Cargo\.(toml|lock)$|package(-lock)?\.json$|(pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|go\.(mod|sum)$|build\.rs$|post_build\.rs$|build\.[cm]?[jt]s$|patches/|bunfig\.toml$|\.npmrc$|tsconfig\.json$|Dockerfile|compose\.ya?ml$|wrangler\.|LICENSE|docs/SPEC\.md$|[^/]*\.(sh|bat|ps1|cmd)$|[^/]*\.(exe|dll|so|dylib|wasm|zip|jar)$)'; then
                     say "Not merged automatically: the change touches files that only the owner may merge (workflows, dependencies, build or install scripts, binaries, the license or the specification)."; exit 0
                   fi
                   read -r add del n < <(gh pr view "$PR" --json additions,deletions,changedFiles --jq '"\(.additions) \(.deletions) \(.changedFiles)"')
