@@ -188,6 +188,13 @@ jobs:
               run: |
                   gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/latest" -f sha="${{ github.sha }}" -F force=true \
                     || gh api -X POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/latest" -f sha="${{ github.sha }}"
+            # The rolling release is made again by every push (the tag was moved just above): its date is the date of the push, and only the
+            # files of this run are in it.
+            - name: Remove the old rolling release
+              if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: gh release delete latest --repo "${{ github.repository }}" --yes || true
             - name: Make the release
               if: github.event_name != 'pull_request'
               uses: softprops/action-gh-release@v2
