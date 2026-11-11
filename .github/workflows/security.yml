@@ -110,6 +110,7 @@ jobs:
                   PR: ${{ github.event.pull_request.number }}
                   AUTHOR: ${{ github.event.pull_request.user.login }}
                   OWNER: ${{ github.repository_owner }}
+                  BASE: ${{ github.base_ref }}
               run: |
                   say() { echo "$1"; gh pr comment "$PR" --body "$1" || true; }
                   # Only the pull requests of the owner's account are merged here: anybody else with write access could otherwise get
@@ -133,7 +134,7 @@ jobs:
                     local sha="$1" runs i
                     local docs=false
                     gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/|^\.github/dependabot\.yml$|^\.github/workflows/security\.yml$)' || docs=true
-                    [ -f .github/workflows/ci.yml ] || docs=true # a repository without a CI has nothing to wait for
+                    git cat-file -e "origin/$BASE:.github/workflows/ci.yml" 2>/dev/null || docs=true # the BASE has no CI: nothing to wait for (not the head: a pull request could delete ci.yml)
                     for i in $(seq 1 50); do
                       runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
                       if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
