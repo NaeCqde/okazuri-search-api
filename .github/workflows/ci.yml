@@ -128,41 +128,21 @@ jobs:
                   echo "$result"
                   [ "$result" = "cheat item kanri kyoku no oshigoto" ]
 
-            # One archive per platform: the executable, the READMEs, the config template, the license and the
-            # changes, in a folder of the same name; and the SHA-256 of the archive next to it. Every file in it has its
-            # modification time as UTC: the extended timestamp of the zip (Windows), the seconds since 1970 of the tar.gz.
+            # One file per program and platform, uploaded as it is (no archive): <program>-<platform>[.exe], and its SHA-256 next to it.
+            # The license, the changes and the config templates are added once, by the release job.
             - name: Package
               shell: bash
               run: |
-                  name="okazuri-search-api-${{ matrix.platform.os-name }}"
-                  mkdir "$name"
-                  cp "$BUILD_DIR/${{ matrix.platform.executable }}" "$name/"
-                  cp README.md README.ja.md config.example.toml LICENSE Changes.md "$name/"
-                  if [ "${{ runner.os }}" = "Windows" ]; then
-                    archive="$name.zip"
-                    # The zip is written by Windows' own tar.exe (bsdtar, libarchive), not by Compress-Archive: it stores the
-                    # modification time as UTC in the extended timestamp field ("UT"), besides the plain MS-DOS time that
-                    # has no time zone. Compress-Archive writes only the MS-DOS time. (The tar.gz of the other platforms
-                    # keep their times as UTC seconds already.) The tar in Git Bash is GNU tar, which cannot write a zip.
-                    "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -a -cf "$archive" "$name"
-                    # and the field is there: the bytes of its header (55 54, 5 bytes of data) are in the file
-                    LC_ALL=C grep -qaP '\x55\x54\x05\x00' "$archive" || { echo "no extended timestamp in $archive"; exit 1; }
-                  else
-                    archive="$name.tar.gz"
-                    tar czf "$archive" "$name"
-                  fi
-                  if command -v sha256sum > /dev/null; then
-                    sha256sum "$archive" > "$archive.sha256"
-                  else
-                    shasum -a 256 "$archive" > "$archive.sha256"
-                  fi
-                  echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+                  mkdir out
+                  asset="okazuri-search-api-${{ matrix.platform.os-name }}"
+                  exe="$BUILD_DIR/${{ matrix.platform.executable }}"
+                  case "$exe" in *.exe) asset="$asset.exe" ;; esac
+                  cp "$exe" "out/$asset"
+                  (cd out && { sha256sum "$asset" 2>/dev/null || shasum -a 256 "$asset"; } > "$asset.sha256")
             - uses: actions/upload-artifact@v4
               with:
                   name: okazuri-search-api-${{ matrix.platform.os-name }}
-                  path: |
-                      ${{ env.ARCHIVE }}
-                      ${{ env.ARCHIVE }}.sha256
+                  path: out/*
                   if-no-files-found: error
 
     # After every platform has built (so that no two jobs race to create the same release).
@@ -173,6 +153,7 @@ jobs:
         permissions:
             contents: write
         steps:
+            - uses: actions/checkout@v4
             - uses: actions/download-artifact@v4
               with:
                   path: dist
@@ -195,6 +176,13 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: gh release delete latest --repo "${{ github.repository }}" --yes || true
+            # Next to the executables, once: the license, the changes and the config templates (a file name that starts with a dot cannot be a
+            # release asset, so .env is example.env).
+            - name: Add the license, the changes and the config templates
+              run: |
+                  cp "LICENSE" "dist/LICENSE"
+                  cp "Changes.md" "dist/Changes.md"
+                  cp "config.example.toml" "dist/config.example.toml"
             - name: Make the release
               if: github.event_name != 'pull_request'
               uses: softprops/action-gh-release@v2
