@@ -103,17 +103,47 @@ jobs:
                   claude_args: |
                       --max-turns 40
                       --allowedTools "Read,Grep,Glob,Edit,Write,Bash"
+            # The head is a fix that an earlier run of this job pushed (that run was cancelled by the push): this run only verifies the
+            # fix and decides, it changes nothing.
+            - uses: anthropics/claude-code-action@9008224dd4f743876f528e6ba0f0d611f076a7f9 # v1.0.271
+              if: steps.last.outputs.mine == 'true'
+              env:
+                  GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+              with:
+                  claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+                  github_token: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  prompt: |
+                      REPO: ${{ github.repository }}
+                      PR NUMBER: ${{ github.event.pull_request.number }}
+                      BASE: ${{ github.base_ref }}
+
+                      An earlier run of this job reviewed this pull request and pushed fix commits (their messages start with `[security-fix]`).
+                      Check, WITHOUT changing anything: (1) do the fix commits (`git log origin/${{ github.base_ref }}..HEAD`, `git diff`)
+                      really fix what the earlier comment on the pull request says, without breaking the build or the behaviour in
+                      `docs/SPEC.md` (if present); (2) is anything else left unresolved; (3) does the pull request look finished (not WIP, not
+                      draft, no "do not merge", no unchecked task list, no TODO / FIXME the change adds). Run the build and the tests of the
+                      project. Then write `${{ runner.temp }}/decision.json` with exactly {"merge": true|false, "reason": "..."}; "merge": true
+                      only if (1) is yes, (2) is no and (3) is yes. If in doubt: false. Post ONE short comment with the result
+                      (`gh pr comment ${{ github.event.pull_request.number }} --body-file <file>`). Do not edit, commit, push or merge.
+                  claude_args: |
+                      --max-turns 30
+                      --allowedTools "Read,Grep,Glob,Write,Bash"
             - name: Merge if the review found nothing left and the pull request looks finished
-              if: steps.last.outputs.mine != 'true'
               env:
                   GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN }}
                   PR: ${{ github.event.pull_request.number }}
+                  AUTHOR: ${{ github.event.pull_request.user.login }}
+                  OWNER: ${{ github.repository_owner }}
+                  BASE: ${{ github.base_ref }}
               run: |
                   say() { echo "$1"; gh pr comment "$PR" --body "$1" || true; }
+                  # Only the pull requests of the owner's account are merged here: anybody else with write access could otherwise get
+                  # a merge with the owner's token past the branch protection (the diff is untrusted, and so is Claude's reading of it).
+                  [ "$AUTHOR" = "$OWNER" ] || { echo "the author is not the owner: not merging"; exit 0; }
                   # A pull request that looks unfinished is never merged automatically (draft, WIP / do-not-merge in the title, labels,
                   # commit messages, an unchecked task list in the description).
                   unfinished() {
-                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits)
+                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits) || { echo "the pull request could not be read"; return 0; }
                     [ "$(echo "$json" | jq -r .isDraft)" = "true" ] && { echo "it is a draft"; return 0; }
                     local re='(^|[^a-z])(wip|draft|dnm|do not merge|do-not-merge|hold|not ready|unfinished|work in progress)([^a-z]|$)|作り途中|作成途中|未完成|途中|あとで|まだ'
                     echo "$json" | jq -r '.title' | grep -Eqi "$re" && { echo "the title says it is not finished"; return 0; }
@@ -127,7 +157,8 @@ jobs:
                   wait_ci() { # sha
                     local sha="$1" runs i
                     local docs=false
-                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/)' || docs=true
+                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/|^\.github/dependabot\.yml$|^\.github/workflows/security\.yml$)' || docs=true
+                    git cat-file -e "origin/$BASE:.github/workflows/ci.yml" 2>/dev/null || docs=true # the BASE has no CI: nothing to wait for (not the head: a pull request could delete ci.yml)
                     for i in $(seq 1 50); do
                       runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
                       if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
@@ -145,6 +176,8 @@ jobs:
                   why=$(unfinished) && { say "Not merged automatically: $why."; exit 0; }
                   # the head now: the review may have pushed a fix
                   SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+                  # ... but nothing else may have been pushed: the head must be exactly what this job reviewed (or fixed and pushed)
+                  [ "$SHA" = "$(git rev-parse HEAD)" ] || { echo "the branch changed during the review: not merging"; exit 0; }
                   why=$(wait_ci "$SHA") || { say "Not merged automatically: $why."; exit 0; }
                   gh pr merge "$PR" --squash --match-head-commit "$SHA" && echo "merged"
 
@@ -203,6 +236,7 @@ jobs:
             # Without Claude: the fixed rules decide, whatever the decision file says.
             - name: Merge if the decision and the fixed rules agree
               env:
+                  BASE: ${{ github.base_ref }}
                   GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN }}
                   PR: ${{ github.event.pull_request.number }}
                   SHA: ${{ github.event.pull_request.head.sha }}
@@ -211,7 +245,7 @@ jobs:
                   # A pull request that looks unfinished is never merged automatically (draft, WIP / do-not-merge in the title, labels,
                   # commit messages, an unchecked task list in the description).
                   unfinished() {
-                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits)
+                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits) || { echo "the pull request could not be read"; return 0; }
                     [ "$(echo "$json" | jq -r .isDraft)" = "true" ] && { echo "it is a draft"; return 0; }
                     local re='(^|[^a-z])(wip|draft|dnm|do not merge|do-not-merge|hold|not ready|unfinished|work in progress)([^a-z]|$)|作り途中|作成途中|未完成|途中|あとで|まだ'
                     echo "$json" | jq -r '.title' | grep -Eqi "$re" && { echo "the title says it is not finished"; return 0; }
@@ -225,7 +259,8 @@ jobs:
                   wait_ci() { # sha
                     local sha="$1" runs i
                     local docs=false
-                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/)' || docs=true
+                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/|^\.github/dependabot\.yml$|^\.github/workflows/security\.yml$)' || docs=true
+                    [ -f .github/workflows/ci.yml ] || docs=true # a repository without a CI has nothing to wait for
                     for i in $(seq 1 50); do
                       runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
                       if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
