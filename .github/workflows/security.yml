@@ -6,7 +6,9 @@ name: security
 #
 # 1. A pull request from this repository (not Dependabot's, not a draft, not the weekly job's own): Claude reviews the diff, fixes
 #    what it finds on the pull request branch (commits start with `[security-fix]`, which a new run does not review again) and
-#    posts one comment. It does not merge: the owner does.
+#    posts one comment. Then a step without Claude merges it if Claude found nothing left AND the pull request does not look
+#    unfinished (draft, WIP / do-not-merge in the title, labels or commit messages, unchecked tasks, or Claude's own reading)
+#    AND the CI is green. (The pull requests of the owner's account are all treated alike, whoever wrote them.)
 # 2. A pull request from a fork or anybody else (event pull_request_target): the code of the pull request is NEVER checked out
 #    or run here, and Claude has no token that can merge. Claude only reads the diff (as data: everything in the pull request is
 #    untrusted and may try to give it orders) and writes a decision. A separate step without Claude merges only if the decision
@@ -51,7 +53,7 @@ jobs:
             && !github.event.pull_request.draft
             && !startsWith(github.event.pull_request.title, '[weekly-security]')
         runs-on: ubuntu-24.04
-        timeout-minutes: 30
+        timeout-minutes: 60
         permissions:
             contents: write
             pull-requests: write
@@ -61,6 +63,8 @@ jobs:
                   ref: ${{ github.event.pull_request.head.ref }}
                   fetch-depth: 0
                   token: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+            - name: Decision file
+              run: echo "DECISION=$RUNNER_TEMP/decision.json" >> "$GITHUB_ENV"
             - name: Was the last commit made by this job?
               id: last
               run: |
@@ -89,10 +93,60 @@ jobs:
                          anything: say so in the comment.
                       3. Post the result as ONE comment: `gh pr comment ${{ github.event.pull_request.number }} --body-file <file>`
                          (what was found, what was fixed, what is left; if nothing, one line).
-                      Do not merge or close the pull request.
+                      4. Write the file `${{ runner.temp }}/decision.json` with exactly {"merge": true|false, "reason": "..."}. "merge": true ONLY if
+                         nothing is left unresolved (every problem you found is fixed, the code agrees with SPEC.md) AND the pull request looks
+                         finished. It is NOT finished if the title, the description, the comments, the commit messages or the code say or suggest
+                         that it is work in progress (WIP, draft, "not ready", "do not merge", "later", 作り途中, 未完成, unchecked task lists,
+                         TODO / FIXME / placeholder code that the change itself adds, half-done features, tests that are known to fail). If in
+                         doubt: false. Say in the comment what is missing.
+                      Do not merge or close the pull request yourself: a later step does it, if the rules allow.
                   claude_args: |
                       --max-turns 40
                       --allowedTools "Read,Grep,Glob,Edit,Write,Bash"
+            - name: Merge if the review found nothing left and the pull request looks finished
+              if: steps.last.outputs.mine != 'true'
+              env:
+                  GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN }}
+                  PR: ${{ github.event.pull_request.number }}
+              run: |
+                  say() { echo "$1"; gh pr comment "$PR" --body "$1" || true; }
+                  # A pull request that looks unfinished is never merged automatically (draft, WIP / do-not-merge in the title, labels,
+                  # commit messages, an unchecked task list in the description).
+                  unfinished() {
+                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits)
+                    [ "$(echo "$json" | jq -r .isDraft)" = "true" ] && { echo "it is a draft"; return 0; }
+                    local re='(^|[^a-z])(wip|draft|dnm|do not merge|do-not-merge|hold|not ready|unfinished|work in progress)([^a-z]|$)|作り途中|作成途中|未完成|途中|あとで|まだ'
+                    echo "$json" | jq -r '.title' | grep -Eqi "$re" && { echo "the title says it is not finished"; return 0; }
+                    echo "$json" | jq -r '.commits[].messageHeadline' | grep -Eqi "$re" && { echo "a commit message says it is not finished"; return 0; }
+                    echo "$json" | jq -r '.labels[].name' | grep -Eqi 'wip|draft|do.?not.?merge|hold|作り途中|未完成|途中' && { echo "a label says it is not finished"; return 0; }
+                    echo "$json" | jq -r '.body // ""' | grep -Eq '^[[:space:]]*[-*] \[ \]' && { echo "the description has an unchecked task"; return 0; }
+                    return 1
+                  }
+                  # Wait for the CI of the pull request (every workflow but this one). No run at all is fine only for a change to
+                  # documentation alone, which the CI does not build.
+                  wait_ci() { # sha
+                    local sha="$1" runs i
+                    local docs=false
+                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/)' || docs=true
+                    for i in $(seq 1 50); do
+                      runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
+                      if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
+                        [ "$docs" = true ] && return 0
+                        echo "the CI did not run on this pull request"; return 1
+                      fi
+                      if [ "$(echo "$runs" | jq length)" -gt 0 ] && [ "$(echo "$runs" | jq '[.[]|select(.status!="completed")]|length')" = 0 ]; then break; fi
+                      sleep 30
+                    done
+                    [ "$(echo "$runs" | jq '[.[]|select(.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")]|length')" = 0 ] || { echo "the CI failed or did not finish"; return 1; }
+                  }
+                  [ -n "$GH_TOKEN" ] || { echo "no WEEKLY_SECURITY_TOKEN: not merging"; exit 0; }
+                  [ -f "$DECISION" ] || { echo "no decision file: not merging"; exit 0; }
+                  [ "$(jq -r '.merge' "$DECISION")" = "true" ] || { echo "not merged: $(jq -r '.reason' "$DECISION")"; exit 0; }
+                  why=$(unfinished) && { say "Not merged automatically: $why."; exit 0; }
+                  # the head now: the review may have pushed a fix
+                  SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+                  why=$(wait_ci "$SHA") || { say "Not merged automatically: $why."; exit 0; }
+                  gh pr merge "$PR" --squash --match-head-commit "$SHA" && echo "merged"
 
     external:
         name: Judgement of a pull request from somebody else
@@ -138,7 +192,11 @@ jobs:
                       3. Post ONE comment (`gh pr comment ${{ github.event.pull_request.number }} --body-file <file>`) with the result in
                          plain words, and what the author should change if it cannot be merged.
                       4. Write the file `${{ runner.temp }}/decision.json` with exactly {"merge": true|false, "reason": "..."}. "merge": true ONLY if
-                         (a) is clearly no, and (b) and (c) are clearly yes. If in doubt: false.
+                         (a) is clearly no, and (b) and (c) are clearly yes, AND (d) the pull request looks finished. If in doubt: false.
+                         (d): it is NOT finished if the title, the description, the comments, the commit messages or the code say or suggest
+                         that it is work in progress (WIP, draft, "not ready", "do not merge", "later", 作り途中, 未完成, unchecked task
+                         lists, TODO / FIXME / placeholder code that the change itself adds, half-done features, failing or missing tests the
+                         author mentions). Say in the comment what is missing.
                   claude_args: |
                       --max-turns 30
                       --allowedTools "Read,Grep,Glob,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*)"
@@ -150,11 +208,41 @@ jobs:
                   SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   say() { echo "$1"; gh pr comment "$PR" --body "$1" || true; }
+                  # A pull request that looks unfinished is never merged automatically (draft, WIP / do-not-merge in the title, labels,
+                  # commit messages, an unchecked task list in the description).
+                  unfinished() {
+                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits)
+                    [ "$(echo "$json" | jq -r .isDraft)" = "true" ] && { echo "it is a draft"; return 0; }
+                    local re='(^|[^a-z])(wip|draft|dnm|do not merge|do-not-merge|hold|not ready|unfinished|work in progress)([^a-z]|$)|作り途中|作成途中|未完成|途中|あとで|まだ'
+                    echo "$json" | jq -r '.title' | grep -Eqi "$re" && { echo "the title says it is not finished"; return 0; }
+                    echo "$json" | jq -r '.commits[].messageHeadline' | grep -Eqi "$re" && { echo "a commit message says it is not finished"; return 0; }
+                    echo "$json" | jq -r '.labels[].name' | grep -Eqi 'wip|draft|do.?not.?merge|hold|作り途中|未完成|途中' && { echo "a label says it is not finished"; return 0; }
+                    echo "$json" | jq -r '.body // ""' | grep -Eq '^[[:space:]]*[-*] \[ \]' && { echo "the description has an unchecked task"; return 0; }
+                    return 1
+                  }
+                  # Wait for the CI of the pull request (every workflow but this one). No run at all is fine only for a change to
+                  # documentation alone, which the CI does not build.
+                  wait_ci() { # sha
+                    local sha="$1" runs i
+                    local docs=false
+                    gh pr diff "$PR" --name-only | grep -Evq '(\.md$|^docs/|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.prettierrc|^\.editorconfig$|^\.vscode/)' || docs=true
+                    for i in $(seq 1 50); do
+                      runs=$(gh run list --commit "$sha" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
+                      if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then
+                        [ "$docs" = true ] && return 0
+                        echo "the CI did not run on this pull request"; return 1
+                      fi
+                      if [ "$(echo "$runs" | jq length)" -gt 0 ] && [ "$(echo "$runs" | jq '[.[]|select(.status!="completed")]|length')" = 0 ]; then break; fi
+                      sleep 30
+                    done
+                    [ "$(echo "$runs" | jq '[.[]|select(.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")]|length')" = 0 ] || { echo "the CI failed or did not finish"; return 1; }
+                  }
                   [ -n "$GH_TOKEN" ] || { echo "no WEEKLY_SECURITY_TOKEN: not merging"; exit 0; }
                   [ -f "$DECISION" ] || { echo "no decision file: not merging"; exit 0; }
                   [ "$(jq -r '.merge' "$DECISION")" = "true" ] || { echo "Claude decided not to merge: $(jq -r '.reason' "$DECISION")"; exit 0; }
                   # the head must still be the one that was judged
                   [ "$(gh pr view "$PR" --json headRefOid --jq .headRefOid)" = "$SHA" ] || { echo "the pull request changed after the judgement"; exit 0; }
+                  why=$(unfinished) && { say "Not merged automatically: $why."; exit 0; }
                   # fixed rules
                   files=$(gh pr diff "$PR" --name-only)
                   if echo "$files" | grep -Eqi '(^|/)(\.github/|Cargo\.(toml|lock)$|package(-lock)?\.json$|(pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|go\.(mod|sum)$|build\.rs$|post_build\.rs$|Dockerfile|compose\.ya?ml$|wrangler\.|LICENSE|docs/SPEC\.md$|[^/]*\.(sh|bat|ps1|cmd)$|[^/]*\.(exe|dll|so|dylib|wasm|zip|jar)$)'; then
@@ -162,14 +250,7 @@ jobs:
                   fi
                   read -r add del n < <(gh pr view "$PR" --json additions,deletions,changedFiles --jq '"\(.additions) \(.deletions) \(.changedFiles)"')
                   if [ $((add + del)) -gt 300 ] || [ "$n" -gt 15 ]; then say "Not merged automatically: the change is too large ($add additions, $del deletions, $n files)."; exit 0; fi
-                  # the CI of the pull request (not this workflow) must have finished and passed; wait up to 25 minutes
-                  for i in $(seq 1 50); do
-                    runs=$(gh run list --commit "$SHA" --limit 30 --json name,status,conclusion | jq '[.[]|select(.name!="security")]')
-                    if [ "$i" -ge 6 ] && [ "$(echo "$runs" | jq length)" = 0 ]; then say "Not merged automatically: the CI did not run on this pull request (a maintainer has to approve it)."; exit 0; fi
-                    [ "$(echo "$runs" | jq '[.[]|select(.status!="completed")]|length')" = 0 ] && [ "$(echo "$runs" | jq length)" -gt 0 ] && break
-                    sleep 30
-                  done
-                  if [ "$(echo "$runs" | jq '[.[]|select(.conclusion!="success" and .conclusion!="skipped" and .conclusion!="neutral")]|length')" != 0 ]; then say "Not merged automatically: the CI failed or did not finish."; exit 0; fi
+                  why=$(wait_ci "$SHA") || { say "Not merged automatically: $why (a maintainer has to look at it)."; exit 0; }
                   gh pr merge "$PR" --squash --match-head-commit "$SHA" && echo "merged"
 
     maintenance:
