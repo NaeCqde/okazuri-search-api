@@ -196,7 +196,9 @@ jobs:
               with:
                   tag_name: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'latest' }}
                   target_commitish: ${{ github.sha }}
-                  prerelease: ${{ !(inputs.tag || startsWith(github.ref, 'refs/tags/v')) }}
+                  prerelease: false
+                  # the rolling `latest` is shown as the latest release; a version tag keeps GitHub's own rule (by date)
+                  make_latest: ${{ (inputs.tag || startsWith(github.ref, 'refs/tags/v')) && 'legacy' || 'true' }}
                   files: dist/*
                   generate_release_notes: ${{ inputs.tag != '' || startsWith(github.ref, 'refs/tags/v') }}
                   fail_on_unmatched_files: true
