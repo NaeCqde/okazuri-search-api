@@ -1,17 +1,16 @@
 # Okazuri Search API
 
-English | [日本語](README.ja.md)
+[English](README.en.md) | 日本語
 
-The search server of [Okazuri BOT](https://github.com/NaeCqde/okazuri_bot). One executable, with everything it needs
-inside it. It has two functions, and each is switched on or off in `config.toml`:
+[Okazuri BOT](https://github.com/NaeCqde/okazuri_bot) の検索サーバーです。実行ファイル 1 つで、必要なものはすべて中に
+入っています。機能は 2 つあり、それぞれ `config.toml` でオン・オフを決めます。
 
-- **Search** (`[search]`, off by default): `GET /okazuri/search?q=` asks the search of every site that the bot knows
-  (DLsite, FANZA, momon:GA, ...), saves what their list pages show of each work (the title and the path of its page),
-  and answers with the saved works whose title has all the words of the query. The query is always turned into
-  romaji first, and the titles are kept as the sites write them and in romaji, so that they are matched in romaji. Magazine issues can be searched ahead
-  of time, from a copy of the Worker's D1 database that the server keeps up to date. [docs/SEARCH.md](docs/SEARCH.md)
-- **Romaji** (always on, it has no switch): `GET /romaji?q=` turns Japanese text into romaji, the way it was when
-  this was the romaji API alone.
+- **検索**(`[search]`、既定はオフ): `GET /okazuri/search?q=` が、BOT の知っているすべてのサイト(DLsite、FANZA、momon:GA など)の
+  検索を使い、一覧ページに出ている作品の情報(タイトルと作品ページの path)を保存して、ローマ字にしたクエリの語をすべて含むタイトル(原文とローマ字の両方を保存します)の
+  作品を返します。雑誌の号は、Worker の D1 データベースの写しから、事前に検索しておけます(写しはサーバーが最新に保ちます)。
+  [docs/SEARCH.md](docs/SEARCH.md)
+- **読みの変換**(常にオン。切り替えはありません): `GET /romaji?q=` が日本語をローマ字にします。読みの変換 API だけだった
+  ころと同じです。
 
 ```
 GET /okazuri/search?q=快楽天 2026 7
@@ -21,15 +20,15 @@ GET /romaji?q=チートアイテム管理局のお仕事
 -> cheat item kanri kyoku no oshigoto
 ```
 
-## Run it
+## 動かす
 
 ```
-okazuri-search-api                       start the server on 127.0.0.1:8000
-okazuri-search-api serve --port 9000     options: --config <path> --host <address> --port <port>
-okazuri-search-api search <words>...     search once (no server); --live off|diff|on --limit <n>
-okazuri-search-api sync                  copy the magazine tables of the D1 database now
-okazuri-search-api prefetch              search for the issues of that copy once through; --limit <n>
-okazuri-search-api convert "text"...     print the romaji (no server); without text, every line of stdin
+okazuri-search-api                       127.0.0.1:8000 でサーバーを起動
+okazuri-search-api serve --port 9000     オプション: --config <パス> --host <アドレス> --port <ポート>
+okazuri-search-api search <語>...        1 回検索(サーバーなし)。--live off|diff|on --limit <n>
+okazuri-search-api sync                  D1 データベースの雑誌のテーブルを今すぐ写す
+okazuri-search-api prefetch              その写しの号を 1 周、事前検索する。--limit <n>
+okazuri-search-api convert "文"...       ローマ字を表示(サーバーなし)。文がなければ標準入力の各行
 okazuri-search-api --help
 ```
 
@@ -38,60 +37,58 @@ curl "http://127.0.0.1:8000/okazuri/search?q=%E5%BF%AB%E6%A5%BD%E5%A4%A9"
 curl "http://127.0.0.1:8000/romaji?q=%E3%83%81%E3%83%BC%E3%83%88"        # cheat
 ```
 
-A demo server is running at <https://okazuri-api.nae.quest/> (for example <https://okazuri-api.nae.quest/okazuri/search?q=a>).
+デモサーバーを <https://okazuri-api.nae.quest/> で公開しています(例: <https://okazuri-api.nae.quest/okazuri/search?q=a>)。
 
-The query is percent-encoded UTF-8. The endpoints are in [docs/API.md](docs/API.md).
+クエリは UTF-8 をパーセントエンコードしたものです。エンドポイントは [docs/API.md](docs/API.md) にあります。
 
-## Settings
+## 設定
 
-`config.toml` in the current directory (the template is `config.example.toml`; every key is optional):
+カレントディレクトリの `config.toml`(雛形は `config.example.toml`。どのキーも省略できます)。
 
-| Section | What | Default |
+| セクション | 内容 | 既定 |
 |---|---|---|
-| `[server]` | `host` / `port`. `127.0.0.1` is this machine only: put a reverse proxy in front of it. | |
-| (none) | The romaji conversion: `/romaji`, and the romaji of every search query and title. It has no switch. | **always on** |
-| `[search]` | `/okazuri/search`, and the first SQLite file (`db_path`). | off |
-| `[d1]` | A copy of the magazine tables of the Worker's D1 database, in the second SQLite file (`mirror_path`). | off |
-| `[prefetch]` | Searching for every issue of that copy ahead of time. | off |
-| `[cron]` | HTTP requests that the server sends on a schedule (`[[cron.jobs]]`). `${NAME}` in a value is an environment variable. | off |
-| `[convert]`, `[exceptions]` | The longest `/romaji` query; words to write out instead of reading them from the dictionary. | |
+| `[server]` | `host` / `port`。既定の `127.0.0.1` はこのマシンだけです。外に出すときはリバースプロキシを前に置きます。 | |
+| (なし) | ローマ字への変換: `/romaji` と、検索のクエリ・タイトルのローマ字化。切り替えはありません。 | **常にオン** |
+| `[search]` | `/okazuri/search` と、1 つ目の SQLite ファイル(`db_path`)。 | オフ |
+| `[d1]` | Worker の D1 データベースの雑誌のテーブルの写し。2 つ目の SQLite ファイル(`mirror_path`)に入れます。 | オフ |
+| `[prefetch]` | その写しのすべての号を、事前に検索します。 | オフ |
+| `[cron]` | サーバーが決めた時刻に送る HTTP リクエスト(`[[cron.jobs]]`)。値の中の `${NAME}` は環境変数です。 | オフ |
+| `[convert]`、`[exceptions]` | `/romaji` のクエリの最大長。辞書から読まずに、決めた綴りで書く語。 | |
 
-The two database files are `search.db` (the works the sites listed) and `d1-mirror.db` (the copy of
-D1). Both are made if they are not there. They are read and written with [SeaORM](https://www.sea-ql.org/SeaORM/): the tables are
-the entities in `src/entity/`.
+データベースのファイルは 2 つです。`search.db`(サイトが一覧に出した作品)と `d1-mirror.db`(D1 の写し)。どちらも [SeaORM](https://www.sea-ql.org/SeaORM/) で読み書きします(テーブルは `src/entity/` のエンティティです)。
+どちらも、なければ作られます。
 
-## Downloads
+## ダウンロード
 
-Every push builds the archives (the executable, the READMEs, the config template, the license):
+push のたびに、実行ファイルがそのまま(アーカイブにせず)リリースの最上位に置かれます。同じ場所に Changes.md、LICENSE、設定の雛形 `config.example.toml` も置かれます。
 
-| Archive                                                 |                                                                            |
-| ------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `okazuri-search-api-Linux-x86_64-musl`                  | **static**, no glibc: runs on any Linux x86_64 server (a VPS, a container) |
-| `okazuri-search-api-Linux-x86_64`, `-Linux-aarch64`     | glibc                                                                      |
-| `okazuri-search-api-Windows-x86_64`, `-Windows-aarch64` |                                                                            |
-| `okazuri-search-api-macOS-aarch64`                      |                                                                            |
+| 実行ファイル                                            |                                                                                              |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `okazuri-search-api-Linux-x86_64-musl`                  | **静的リンク**で glibc に依存しません。どの Linux x86_64 サーバー(VPS、コンテナ)でも動きます |
+| `okazuri-search-api-Linux-x86_64`、`-Linux-aarch64`     | glibc 版                                                                                     |
+| `okazuri-search-api-Windows-x86_64`、`-Windows-aarch64` |                                                                                              |
+| `okazuri-search-api-macOS-aarch64`                      |                                                                                              |
 
-The executable is about 190 MB: UniDic is linked into it (and SQLite, with sqlx). How to run it on a server is in
-[docs/DEPLOY.md](docs/DEPLOY.md).
+実行ファイルは約 190 MB です(UniDic と SQLite を埋め込んでいるため)。サーバーでの動かし方は
+[docs/DEPLOY.md](docs/DEPLOY.md) にあります。
 
-## Build
+## ビルド
 
 ```
-cargo build --release          # downloads UniDic on the first build, so it needs the network
+cargo build --release          # 初回は UniDic をダウンロードするのでネットワークが要ります
 cargo test
 ```
 
-A release build copies the executable next to `Cargo.toml` (set `OKAZURI_SEARCH_API_NO_COPY=1` to turn that off).
-For musl: `rustup target add x86_64-unknown-linux-musl`, install `musl-tools`
-(`apt install musl-tools`), then `cargo build --release --target x86_64-unknown-linux-musl`. The TLS (rustls) and the
-SQLite library are C code that `musl-gcc` compiles.
+リリースビルドは、実行ファイルを `Cargo.toml` の隣にコピーします(`OKAZURI_SEARCH_API_NO_COPY=1` で止められます)。
+musl 向けは、`rustup target add x86_64-unknown-linux-musl` と `musl-tools`(`apt install musl-tools`)を入れて、
+`cargo build --release --target x86_64-unknown-linux-musl` です。TLS(rustls)と SQLite は C のコードで、`musl-gcc` が
+コンパイルします。
 
-## How it works
+## 仕組み
 
-- [docs/SEARCH.md](docs/SEARCH.md): the search, the sites, the two databases, the copy of D1, the prefetch.
-- [docs/ALGORITHM.md](docs/ALGORITHM.md): the romaji: the dictionary, the rules that were taken from cutlet, what was
-  added, and how close it is to the Python version.
+- [docs/SEARCH.md](docs/SEARCH.md): 検索、サイト、2 つのデータベース、D1 の写し、事前検索。
+- [docs/ALGORITHM.md](docs/ALGORITHM.md): ローマ字: 辞書、cutlet から移した規則、足した処理、Python 版との近さ。
 
-## License
+## ライセンス
 
 MIT
