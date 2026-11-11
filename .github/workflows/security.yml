@@ -103,8 +103,32 @@ jobs:
                   claude_args: |
                       --max-turns 40
                       --allowedTools "Read,Grep,Glob,Edit,Write,Bash"
+            # The head is a fix that an earlier run of this job pushed (that run was cancelled by the push): this run only verifies the
+            # fix and decides, it changes nothing.
+            - uses: anthropics/claude-code-action@9008224dd4f743876f528e6ba0f0d611f076a7f9 # v1.0.271
+              if: steps.last.outputs.mine == 'true'
+              env:
+                  GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+              with:
+                  claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+                  github_token: ${{ secrets.WEEKLY_SECURITY_TOKEN || github.token }}
+                  prompt: |
+                      REPO: ${{ github.repository }}
+                      PR NUMBER: ${{ github.event.pull_request.number }}
+                      BASE: ${{ github.base_ref }}
+
+                      An earlier run of this job reviewed this pull request and pushed fix commits (their messages start with `[security-fix]`).
+                      Check, WITHOUT changing anything: (1) do the fix commits (`git log origin/${{ github.base_ref }}..HEAD`, `git diff`)
+                      really fix what the earlier comment on the pull request says, without breaking the build or the behaviour in
+                      `docs/SPEC.md` (if present); (2) is anything else left unresolved; (3) does the pull request look finished (not WIP, not
+                      draft, no "do not merge", no unchecked task list, no TODO / FIXME the change adds). Run the build and the tests of the
+                      project. Then write `${{ runner.temp }}/decision.json` with exactly {"merge": true|false, "reason": "..."}; "merge": true
+                      only if (1) is yes, (2) is no and (3) is yes. If in doubt: false. Post ONE short comment with the result
+                      (`gh pr comment ${{ github.event.pull_request.number }} --body-file <file>`). Do not edit, commit, push or merge.
+                  claude_args: |
+                      --max-turns 30
+                      --allowedTools "Read,Grep,Glob,Write,Bash"
             - name: Merge if the review found nothing left and the pull request looks finished
-              if: steps.last.outputs.mine != 'true'
               env:
                   GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN }}
                   PR: ${{ github.event.pull_request.number }}
@@ -212,6 +236,7 @@ jobs:
             # Without Claude: the fixed rules decide, whatever the decision file says.
             - name: Merge if the decision and the fixed rules agree
               env:
+                  BASE: ${{ github.base_ref }}
                   GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN }}
                   PR: ${{ github.event.pull_request.number }}
                   SHA: ${{ github.event.pull_request.head.sha }}
