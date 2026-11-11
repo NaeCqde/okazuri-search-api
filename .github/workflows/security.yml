@@ -108,12 +108,17 @@ jobs:
               env:
                   GH_TOKEN: ${{ secrets.WEEKLY_SECURITY_TOKEN }}
                   PR: ${{ github.event.pull_request.number }}
+                  AUTHOR: ${{ github.event.pull_request.user.login }}
+                  OWNER: ${{ github.repository_owner }}
               run: |
                   say() { echo "$1"; gh pr comment "$PR" --body "$1" || true; }
+                  # Only the pull requests of the owner's account are merged here: anybody else with write access could otherwise get
+                  # a merge with the owner's token past the branch protection (the diff is untrusted, and so is Claude's reading of it).
+                  [ "$AUTHOR" = "$OWNER" ] || { echo "the author is not the owner: not merging"; exit 0; }
                   # A pull request that looks unfinished is never merged automatically (draft, WIP / do-not-merge in the title, labels,
                   # commit messages, an unchecked task list in the description).
                   unfinished() {
-                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits)
+                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits) || { echo "the pull request could not be read"; return 0; }
                     [ "$(echo "$json" | jq -r .isDraft)" = "true" ] && { echo "it is a draft"; return 0; }
                     local re='(^|[^a-z])(wip|draft|dnm|do not merge|do-not-merge|hold|not ready|unfinished|work in progress)([^a-z]|$)|作り途中|作成途中|未完成|途中|あとで|まだ'
                     echo "$json" | jq -r '.title' | grep -Eqi "$re" && { echo "the title says it is not finished"; return 0; }
@@ -145,6 +150,8 @@ jobs:
                   why=$(unfinished) && { say "Not merged automatically: $why."; exit 0; }
                   # the head now: the review may have pushed a fix
                   SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+                  # ... but nothing else may have been pushed: the head must be exactly what this job reviewed (or fixed and pushed)
+                  [ "$SHA" = "$(git rev-parse HEAD)" ] || { echo "the branch changed during the review: not merging"; exit 0; }
                   why=$(wait_ci "$SHA") || { say "Not merged automatically: $why."; exit 0; }
                   gh pr merge "$PR" --squash --match-head-commit "$SHA" && echo "merged"
 
@@ -211,7 +218,7 @@ jobs:
                   # A pull request that looks unfinished is never merged automatically (draft, WIP / do-not-merge in the title, labels,
                   # commit messages, an unchecked task list in the description).
                   unfinished() {
-                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits)
+                    local json; json=$(gh pr view "$PR" --json isDraft,title,body,labels,commits) || { echo "the pull request could not be read"; return 0; }
                     [ "$(echo "$json" | jq -r .isDraft)" = "true" ] && { echo "it is a draft"; return 0; }
                     local re='(^|[^a-z])(wip|draft|dnm|do not merge|do-not-merge|hold|not ready|unfinished|work in progress)([^a-z]|$)|作り途中|作成途中|未完成|途中|あとで|まだ'
                     echo "$json" | jq -r '.title' | grep -Eqi "$re" && { echo "the title says it is not finished"; return 0; }
