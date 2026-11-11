@@ -16,8 +16,7 @@ on:
             - ".editorconfig"
             - ".vscode/**"
             - ".github/dependabot.yml"
-            - ".github/workflows/security-review.yml"
-            - ".github/workflows/weekly-security.yml"
+            - ".github/workflows/security.yml"
             - "**/.DS_Store"
         branches: ["**"]
         tags:
@@ -33,8 +32,7 @@ on:
             - ".editorconfig"
             - ".vscode/**"
             - ".github/dependabot.yml"
-            - ".github/workflows/security-review.yml"
-            - ".github/workflows/weekly-security.yml"
+            - ".github/workflows/security.yml"
             - "**/.DS_Store"
     workflow_dispatch:
         inputs:
