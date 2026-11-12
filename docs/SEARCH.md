@@ -52,8 +52,7 @@ is missing may just be beyond the cut, so it stays. A failed try changes nothing
   matched against the words of the query. `彼女にできること (COMIC快楽天 2018年8月号)` is a work of the issue, not the issue, so it is not an
   answer to `COMIC快楽天 2018 8`; `[Mutsutake] Meguri Dokoro 11-po (COMIC ExE 61) [Chinese]` is not an answer to `COMIC ExE 11` (`COMIC ExE`
   is inside). `COMIC快楽天 2018年8月号 (デジタル特装版)` and `COMIC快楽天 (2018年8月号)` are answers. Brackets (`[ ]`, `【 】`) are not parentheses.
-- So `快楽天 2026 7` finds `COMIC快楽天 2026年07月号` (the query `kairakuten 2026 7` against `comic kairakuten 2026 nen 7 gatsu
-  gou`), and `exe 11` finds `COMIC ExE 11`. A query written in romaji finds the same works as the same words in Japanese.
+- So `快楽天 2026 7` finds `COMIC快楽天 2026年07月号` (the query `kairakuten 2026 7` against `comic kairakuten 2026-07`), and `exe 11` finds `COMIC ExE 11`. A query written in romaji finds the same works as the same words in Japanese.
 
 ## Request
 

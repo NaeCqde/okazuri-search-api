@@ -15,8 +15,10 @@
 
 use crate::romaji::{lookup, map_kana};
 use crate::tokenizer::{Tokenizer, Word};
-use crate::utils::{hira_to_kata, is_hiragana, is_kana, is_katakana_char, kata_to_hira, Result};
+use crate::utils::{hira_to_kata, is_hiragana, is_hiragana_char, is_kana, is_katakana_char, kata_to_hira, Result};
+use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
 
 /// The small kana: a word that is one of them was cut off the kana before it.
@@ -45,6 +47,31 @@ const BUILT_IN_EXCEPTIONS: &[(&str, &str)] = &[
     ("版", "ban"),
     // a magazine of this catalogue: UniDic cuts it into クリ (clitoris) and ベロン
     ("クリベロン", "kuriberon"),
+    // the other magazines of this catalogue, as the sites in the Latin alphabet write them
+    // (COMIC Shitsurakuten, COMIC Kairakuten Beast, COMIC Penguin Club Sanzokuban)
+    ("失楽天", "shitsurakuten"),
+    ("ビースト", "beast"),
+    ("山賊版", "sanzokuban"),
+    // the names of the tags: [DL版] is [Digital], [中国翻訳] is [Chinese]
+    ("DL版", "digital"),
+    ("中国翻訳", "chinese"),
+    // words that the sites in the Latin alphabet write in a fixed way (found by comparing the
+    // romaji of the Japanese titles with the English titles of the same works)
+    ("オルガ", "orga"),
+    ("エロ", "ero"),
+    ("コスプレ", "cosplay"),
+    ("コスプレイヤー", "cosplayer"),
+    ("プリキュア", "precure"),
+    ("えっち", "ecchi"),
+    ("エッチ", "ecchi"),
+    ("ケイ", "kei"),
+    ("お姉ちゃん", "oneechan"),
+    ("おねえちゃん", "oneechan"),
+    ("お姉さん", "oneesan"),
+    ("お兄ちゃん", "oniichan"),
+    ("お兄さん", "oniisan"),
+    ("お母さん", "okaasan"),
+    ("お父さん", "otousan"),
 ];
 
 /// What to do with a loanword that is written in hiragana (ふらすとれーしょん).
@@ -95,6 +122,7 @@ impl Romanizer {
         if text.is_empty() {
             return Ok(String::new());
         }
+        let text = issue_date(&text);
 
         let words = self.tokenizer.words(&text)?;
         let tokens = self.tokens(&words, loanwords)?;
@@ -109,7 +137,7 @@ impl Romanizer {
     }
 
     fn tokens(&self, words: &[Word], loanwords: Loanwords) -> Result<Vec<Token>> {
-        let words = &self.join_exceptions(words);
+        let words = &join_names(&self.join_exceptions(words));
         let mut tokens = self.cutlet_tokens(words);
 
         // cutlet joins a suffix to the word before it; after an English word that reads `maidsan`
@@ -128,7 +156,11 @@ impl Romanizer {
                 // a prolonged sound mark that was written as one stays a hyphen (rikabarii -> rikabari-),
                 // unless the word is an English word; a long vowel written in kana (ryokou) is kept
                 let word = &words[i];
-                if word.surface.contains('ー') && is_kana(&word.surface) && !word.has_foreign_lemma() {
+                if word.surface.contains('ー')
+                    && is_kana(&word.surface)
+                    && !word.has_foreign_lemma()
+                    && !self.exceptions.contains_key(&word.surface)
+                {
                     tokens[i].surface = hyphenated(&word.surface);
 
                     // サー|ヴァント: UniDic cut a katakana word after its mark; the word goes on
@@ -223,6 +255,13 @@ impl Romanizer {
                 continue;
             }
 
+            // a small tsu that UniDic took for a symbol, before kana (た～っぷり): it sticks to the next word,
+            // which doubles its first letter. Before anything else (スワッピングっ！) it is dropped as a symbol.
+            if (word.surface == "っ" || word.surface == "ッ") && word.pos1 == "補助記号" && next.is_some_and(|n| is_kana(&n.surface)) {
+                out.push(Token::new("っ", false));
+                continue;
+            }
+
             // a verb or adjective that was split: 乗っ|た
             let romaji = self.romaji_word(word);
             if let (Some(previous), Some(first)) = (out.last_mut(), romaji.chars().next()) {
@@ -268,6 +307,7 @@ impl Romanizer {
                         && n.surface != "です"
                 }));
 
+            // the small tsu of た～っぷり sticks to the word after it
             token.space = !no_space;
             out.push(token);
         }
@@ -314,6 +354,88 @@ impl Romanizer {
         let reading = word.reading();
         if reading.is_empty() { word.surface.clone() } else { map_kana(&kata_to_hira(&reading)) }
     }
+}
+
+/// `2024年8月号` is written `2024-08`, the way the sites that use the Latin alphabet write the issue of a
+/// magazine (`COMIC Kairakuten 2024-08`). A search for `2024 8` still finds it: the numbers of a title are
+/// its runs of digits.
+fn issue_date(text: &str) -> String {
+    static ISSUE: OnceLock<Regex> = OnceLock::new();
+    let issue = ISSUE.get_or_init(|| Regex::new(r"(\d{4})年\s*(\d{1,2})月号").expect("a valid pattern"));
+
+    issue.replace_all(text, |c: &regex::Captures| format!("{}-{:0>2}", &c[1], &c[2])).into_owned()
+}
+
+/// The most kana a name that is joined can have (ひつじだ, くまでら, むーにゃん).
+const MOST_NAME_KANA: usize = 8;
+
+/// A circle or an artist in brackets (`[ ]`, `( )`, `【 】`; not a quotation in 「 」), written in kana (`[ひつじだ (くまでら)]`), is one word to the sites that
+/// write it in the Latin alphabet (`Hitsujida (Kumadela)`), but UniDic cuts it into the words it knows
+/// (ひつじ / だ, くま / でら). Inside brackets, the pieces that are next to each other and are all hiragana (or
+/// all katakana) are made one word, if they are not longer than a name (`MOST_NAME_KANA`). Anything else is
+/// left alone: a foreign word (`ブルーアーカイブ` is `blue archive`), kanji words, and a hiragana piece next to a katakana one (`ちぃず` `オレ`).
+fn join_names(words: &[Word]) -> Vec<Word> {
+    fn closer(open: &str) -> &'static str {
+        match open {
+            "[" => "]",
+            "(" => ")",
+            "【" => "】",
+            _ => "",
+        }
+    }
+
+    // one script: all hiragana, or all katakana (with the prolonged sound mark)
+    fn script(word: &Word) -> Option<bool> {
+        if word.surface.chars().all(|c| is_hiragana_char(c) || c == 'ー') && word.surface.chars().any(is_hiragana_char) {
+            Some(true)
+        } else if is_katakana_word(&word.surface) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    let mut out: Vec<Word> = Vec::with_capacity(words.len());
+    let mut close: Vec<&'static str> = Vec::new();
+    // the position in `out` where the run of one script starts, and its script
+    let mut run: Option<(usize, bool)> = None;
+
+    for word in words {
+        if close.last() == Some(&word.surface.as_str()) {
+            close.pop();
+        } else if !closer(&word.surface).is_empty() {
+            close.push(closer(&word.surface));
+        }
+
+        // a foreign word (コミック, ブルー) keeps its foreign spelling (comic, blue)
+        let kana = if close.is_empty() || word.white_space || word.has_foreign_lemma() { None } else { script(word) };
+
+        if let (Some(kana), Some((start, same))) = (kana, run) {
+            let joined: usize = out[start..].iter().map(|w| w.surface.chars().count()).sum::<usize>()
+                + word.surface.chars().count();
+
+            if kana == same && joined <= MOST_NAME_KANA {
+                // the run is `out[start..]`: the pieces and the word are made one word
+                let mut name = out[start].clone();
+                for w in &out[start + 1..] {
+                    name.surface.push_str(&w.surface);
+                }
+                name.surface.push_str(&word.surface);
+                name.is_unk = true;
+                name.pos1 = "名詞".to_string();
+                name.pos2 = String::new();
+                name.lemma = String::new();
+                out.truncate(start);
+                out.push(name);
+                continue;
+            }
+        }
+
+        run = kana.map(|k| (out.len(), k));
+        out.push(word.clone());
+    }
+
+    out
 }
 
 /// Katakana, with the prolonged sound mark.
@@ -476,8 +598,61 @@ mod tests {
     #[test]
     fn particles_are_read_as_they_are_spoken() {
         assert_eq!(romaji("私は学生です"), "watashi wa gakusei desu");
-        // the particle を is wo (cutlet writes it so)
-        assert_eq!(romaji("本を読む"), "hon wo yomu");
+        // the particle を is o (not wo): the sites that write titles in the Latin alphabet write it so
+        assert_eq!(romaji("本を読む"), "hon o yomu");
+        assert_eq!(romaji("歪んだ三角の和を求めて"), "yuganda sankaku no wa o motomete");
+        // katakana ヲ too; ウォ (a loanword sound) stays wo
+        assert_eq!(romaji("ウォーター"), "water");
+    }
+
+    #[test]
+    fn the_issue_of_a_magazine_is_written_year_dash_month() {
+        assert_eq!(romaji("COMIC快楽天 2026年11月号"), "comic kairakuten 2026-11");
+        assert_eq!(romaji("COMICペンギンクラブ2017年12月号"), "comic penguin club 2017-12");
+        assert_eq!(romaji("COMIC快楽天ビースト 2024年8月号"), "comic kairakuten beast 2024-08");
+        assert_eq!(romaji("2024年8月号"), "2024-08");
+        // not an issue: no 号, or no year
+        assert_eq!(romaji("2024年8月"), "2024 nen 8 gatsu");
+        assert_eq!(romaji("8月号"), "8 gatsu gou");
+    }
+
+    #[test]
+    fn a_name_in_brackets_written_in_kana_is_one_word() {
+        assert_eq!(romaji("[ひつじだ (くまでら)]"), "[hitsujida (kumadera)]");
+        assert_eq!(romaji("[むーにゃん] 影"), "[mu-nyan] kage");
+        assert_eq!(romaji("【ずんだもん】"), "[zundamon]");
+        // one script only: ひらがな next to カタカナ stays two words
+        assert_eq!(romaji("[ちぃずオレ]"), "[chizu ore]");
+        // a foreign word keeps its foreign spelling
+        assert_eq!(romaji("(ブルーアーカイブ)"), "(blue archive)");
+        assert_eq!(romaji("(コミックグレープ Vol.100)"), "(comic grape vol.100)");
+        // outside brackets, and in a quotation, nothing is joined
+        assert_eq!(romaji("ひつじだとくまでら"), "hitsuji da to kuma dera");
+        assert_eq!(romaji("「ひつじだ」"), "\"hitsuji da\"");
+        // longer than a name: left as UniDic cut it
+        assert_eq!(romaji("[ほんとうにあったこわいはなし]"), "[hontouniatta kowaihanashi]");
+    }
+
+    #[test]
+    fn the_magazines_of_the_catalogue_are_written_like_the_sites_write_them() {
+        assert_eq!(romaji("COMIC失楽天 2023年03月号"), "comic shitsurakuten 2023-03");
+        assert_eq!(romaji("COMIC快楽天ビースト 2026年11月号"), "comic kairakuten beast 2026-11");
+        assert_eq!(romaji("COMICペンギンクラブ山賊版 2011年05月号"), "comic penguin club sanzokuban 2011-05");
+    }
+
+    #[test]
+    fn a_small_tsu_after_a_wave_dash_doubles_the_next_letter() {
+        assert_eq!(romaji("愛される話た～っぷり"), "aisareru hanashi ta~ppuri");
+        assert_eq!(romaji("ちょっと待って"), "chotto matte");
+    }
+
+    #[test]
+    fn words_that_the_sites_write_in_a_fixed_way() {
+        assert_eq!(romaji("COMICオルガ vol.75"), "comic orga vol.75");
+        assert_eq!(romaji("エロコスプレ"), "ero cosplay");
+        assert_eq!(romaji("えっちなお姉さん"), "ecchi na oneesan");
+        assert_eq!(romaji("お母さん"), "okaasan");
+        assert_eq!(romaji("[DL版] [中国翻訳]"), "[digital] [chinese]");
     }
 
     #[test]
