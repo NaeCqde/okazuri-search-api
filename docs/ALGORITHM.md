@@ -24,7 +24,7 @@ UniDic 2.3.0 has a `kana` column: the reading as it is spelled (号 is ゴウ, �
 the pronunciation (`pron`, where a long vowel is `ー`: ゴー, ショー) and the reading of the dictionary form
 (`lForm`: 見込んで is ミコム, not ミコン). `Word::reading` works the spelled reading out:
 
-1. A word written in kana is read as it is written (しよう is `shiyou`, を is `wo`, おねえちゃん is
+1. A word written in kana is read as it is written (しよう is `shiyou`, を is `o`, おねえちゃん is
    `oneechan`). An interjection keeps its pronunciation (こんにちは is `konnichiwa`).
 2. A word that is not inflected, or is in its dictionary form, is read from `lForm`, which spells the long
    vowels out (号 is ゴウ, 言う is イウ). Not a numeral: ふ is フ, not フタ.
@@ -70,9 +70,38 @@ UniDic's foreign spelling can be a different foreign word with the same sound: `
 (German, "frame"), `メイド` is `made`. `BUILT_IN_EXCEPTIONS` (and `[exceptions]` in `config.toml`)
 replaces such words. They are matched against a whole word as UniDic splits it.
 
+The built-in exceptions also hold what the sites in the Latin alphabet write in a fixed way, found by comparing the
+romaji of the Japanese titles with the English titles of the same works: the magazines (`失楽天` is `shitsurakuten`,
+`ビースト` is `beast`, `山賊版` is `sanzokuban`, `オルガ` is `orga`), the tags (`DL版` is `digital`, `中国翻訳` is `chinese`),
+and common words (`エロ` is `ero`, `コスプレ` is `cosplay`, `えっち` is `ecchi`, `お姉さん` is `oneesan`, `お母さん` is `okaasan`).
+
+A small tsu that UniDic takes for a symbol, before kana (`た～っぷり`), sticks to the next word and doubles its first letter
+(`ta~ppuri`).
+
 An English word followed by a suffix gets a space (`maid san`); cutlet would write `maidsan`.
 
-### 5. The output
+### 5. The issue of a magazine
+
+`2024年8月号` is written `2024-08` (year, a dash, the month in two digits), the way the sites that use the Latin
+alphabet write it (`COMIC Kairakuten 2024-08`). Only `<4 digits>年<month>月号` is changed; `8月号` and `2024年8月` are read
+as words. A search still finds it by the numbers: `2024 8` is a search for the runs of digits 2024 and 8.
+
+### 6. A name in brackets written in kana is one word
+
+A circle or an artist in `[ ]`, `( )` or `【 】`, written in kana, is one word to the sites that use the Latin alphabet
+(`[Hitsujida (Kumadela)]`), but UniDic cuts it into the words it knows (`ひつじ / だ`, `くま / でら`). Inside such
+brackets, the pieces that are next to each other and are all hiragana (or all katakana) are joined, if together they
+are at most 8 kana: `[ひつじだ (くまでら)]` is `[hitsujida (kumadera)]`, `[むーにゃん]` is `[mu-nyan]`.
+
+It is left alone when: the piece is a foreign word (`(ブルーアーカイブ)` is `blue archive`), the pieces are of two scripts
+(`ちぃず` `オレ`), the text is not in brackets (`ひつじだとくまでら`) or is in a quotation (`「 」`, which is a sentence), or it is longer
+than a name. The names of the magazines of the catalogue are in the exceptions instead (`失楽天` is `shitsurakuten`,
+`ビースト` is `beast`, `山賊版` is `sanzokuban`).
+
+Matching does not need the spaces (the title key has none), so this is about the output looking like the titles of
+the other sites; it measured 0.77 to 0.81 whole words of the romaji found as words of the English title.
+
+### 7. The output
 
 NFKC-normalized input, lowercase output, single spaces. A search does not care about the case, and cutlet
 capitalizes proper nouns.

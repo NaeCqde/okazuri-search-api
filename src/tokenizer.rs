@@ -63,7 +63,7 @@ impl Word {
     /// ショー), and the reading of the dictionary form (`l_form`: 見込んで is ミコム). So:
     ///
     /// 1. A word written in kana is read as it is written: をはへ aside, the spelling is the reading
-    ///    (しよう is shiyou, を is wo). An interjection keeps its pronunciation (こんにちは is こんにちワ).
+    ///    (しよう is shiyou, を is o). An interjection keeps its pronunciation (こんにちは is こんにちワ).
     /// 2. A word that is not inflected (or is in its dictionary form) is read from `l_form`, which spells
     ///    the long vowels out (号 is ゴウ, 言う is イウ). A numeral is not: ふ is フ, not フタ.
     /// 3. An inflected word is read from `pron` (見込んで is ミコン), and each `ー` becomes the vowel
@@ -229,7 +229,7 @@ mod tests {
         // the pronunciation has ー (ショー), the spelling is what is wanted
         assert_eq!(w("しよう", "ショー", "スル", "意志推量形").reading(), "しよう");
         assert_eq!(w("おねえちゃん", "オネーチャン", "オネエチャン", "").reading(), "おねえちゃん");
-        // をはへ: the spelling (を is wo), except when the word is read ワ / エ
+        // をはへ: the spelling (を is o), except when the word is read ワ / エ
         assert_eq!(w("を", "オ", "ヲ", "").reading(), "を");
         assert_eq!(w("ヲタ", "オタ", "ヲタ", "").reading(), "ヲタ");
         // …は at the end of a word that is pronounced ワ
