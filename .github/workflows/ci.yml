@@ -55,8 +55,60 @@ env:
     OKAZURI_SEARCH_API_NO_COPY: 1
 
 jobs:
+    # A push to main is, as a rule, the merge of a pull request that has already been built. When the tree of the merged commit is
+    # the very tree that the pull request run built (every platform recorded it in TREE-<platform>), that run's files are used and
+    # nothing is built again; any other case (main moved on, a direct push, a build missing or expired) builds as usual.
+    reuse:
+        name: Reuse the pull request build
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: read
+            actions: read
+            pull-requests: read
+        outputs:
+            reuse: ${{ steps.find.outputs.reuse }}
+        steps:
+            - uses: actions/checkout@v4
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+              with:
+                  persist-credentials: false
+            - name: Find the build of the pull request
+              id: find
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].head.sha // empty')
+                  [ -n "$head" ] || { echo "no pull request: build"; exit 0; }
+                  run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event pull_request --commit "$head" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+                  [ -n "$run" ] || { echo "no successful run of the pull request: build"; exit 0; }
+                  # only a run of a branch of this repository: the files of a fork's run are built by code that nobody here has trusted
+                  [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq '.head_repository.full_name')" = "$GITHUB_REPOSITORY" ] || { echo "the pull request run is from a fork: build"; exit 0; }
+                  mkdir dl reuse
+                  gh run download "$run" --repo "$GITHUB_REPOSITORY" --pattern 'okazuri-search-api-*' --dir dl || { echo "download failed: build"; exit 0; }
+                  mine=$(git rev-parse 'HEAD^{tree}')
+                  n=0
+                  for f in dl/*/TREE-*; do
+                    [ -f "$f" ] && [ "$(cat "$f")" = "$mine" ] || { echo "the tree differs from the pull request build: build"; exit 0; }
+                    n=$((n + 1))
+                  done
+                  # one per platform of the matrix below
+                  [ "$n" -eq 4 ] || { echo "$n platforms only: build"; exit 0; }
+                  mv dl/okazuri-search-api-*/* reuse/
+                  echo "reuse run $run (tree $mine)"
+                  echo "reuse=true" >> "$GITHUB_OUTPUT"
+            - uses: actions/upload-artifact@v4
+              if: steps.find.outputs.reuse == 'true'
+              with:
+                  name: okazuri-search-api-reused
+                  path: reuse/*
+                  if-no-files-found: error
+                  retention-days: 1
+
     test:
         name: Test - ${{ matrix.os }}
+        needs: [reuse]
+        if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' }}
         strategy:
             fail-fast: false
             matrix:
@@ -74,7 +126,8 @@ jobs:
     # One build and archive per platform, after the tests passed.
     package:
         name: Build - ${{ matrix.platform.os-name }}
-        needs: test
+        needs: [reuse, test]
+        if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && needs.test.result == 'success' }}
         strategy:
             fail-fast: false
             matrix:
@@ -134,6 +187,7 @@ jobs:
               shell: bash
               run: |
                   mkdir out
+                  git rev-parse 'HEAD^{tree}' > "out/TREE-${{ matrix.platform.os-name }}"
                   asset="okazuri-search-api-${{ matrix.platform.os-name }}"
                   exe="$BUILD_DIR/${{ matrix.platform.executable }}"
                   case "$exe" in *.exe) asset="$asset.exe" ;; esac
@@ -144,11 +198,13 @@ jobs:
                   name: okazuri-search-api-${{ matrix.platform.os-name }}
                   path: out/*
                   if-no-files-found: error
+                  retention-days: 1
 
     # After every platform has built (so that no two jobs race to create the same release).
     release:
         name: Release
-        needs: package
+        needs: [reuse, package]
+        if: ${{ !cancelled() && (needs.reuse.outputs.reuse == 'true' || needs.package.result == 'success') }}
         runs-on: ubuntu-24.04
         permissions:
             contents: write
@@ -163,7 +219,7 @@ jobs:
             # For a push that is not a version tag: the tag `latest` moves to this commit (created if it is not there).
             # It does not start this workflow again: only `v*` tags do.
             - name: Move the latest tag
-              if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
@@ -172,7 +228,7 @@ jobs:
             # The rolling release is made again by every push (the tag was moved just above): its date is the date of the push, and only the
             # files of this run are in it.
             - name: Remove the old rolling release
-              if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
               env:
                   GH_TOKEN: ${{ github.token }}
               run: gh release delete latest --repo "${{ github.repository }}" --yes || true
@@ -180,11 +236,12 @@ jobs:
             # release asset, so .env is example.env).
             - name: Add the license, the changes and the config templates
               run: |
+                  rm -f dist/TREE-*
                   cp "LICENSE" "dist/LICENSE"
                   cp "Changes.md" "dist/Changes.md"
                   cp "config.example.toml" "dist/config.example.toml"
             - name: Make the release
-              if: github.event_name != 'pull_request'
+              if: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || (github.event_name == 'workflow_dispatch' && inputs.tag != '') }}
               uses: softprops/action-gh-release@v2
               with:
                   tag_name: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'latest' }}
