@@ -226,13 +226,16 @@ jobs:
                   set -euo pipefail
                   keychain="$RUNNER_TEMP/sign.keychain-db"
                   pw=$(uuidgen)
-                  trap 'security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/sign.p12"' EXIT
+                  orig=$(security list-keychains -d user | tr -d '"' | tr -s ' \n' ' ')
+                  trap 'security list-keychains -d user -s $orig; security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/sign.p12"' EXIT
                   echo "$SIGN_P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
                   security create-keychain -p "$pw" "$keychain"
                   security set-keychain-settings -lut 3600 "$keychain"
                   security unlock-keychain -p "$pw" "$keychain"
                   security import "$RUNNER_TEMP/sign.p12" -k "$keychain" -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign
                   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$keychain" > /dev/null
+                  # codesign finds the identity only in a keychain of the search list
+                  security list-keychains -d user -s "$keychain" $orig
                   id=$(security find-identity -p codesigning "$keychain" | awk '/\)/ {print $2; exit}')
                   [ -n "$id" ] || { echo "no signing identity"; exit 1; }
                   mkdir signed
