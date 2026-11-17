@@ -201,10 +201,85 @@ jobs:
                   retention-days: 1
 
     # After every platform has built (so that no two jobs race to create the same release).
+    # The macOS files are signed after the build (or after the pull request build was reused), and only for merged code: a push to main or
+    # a version tag (pushes need write access). A pull request and other branches never enter the environment `signing`, which holds the
+    # certificate (the owner's self-signed one: macOS keeps its permissions for the app across updates when the identity is fixed).
+    sign:
+        name: Sign the macOS files
+        needs: [reuse, package]
+        if: ${{ !cancelled() && (needs.reuse.outputs.reuse == 'true' || needs.package.result == 'success') && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        runs-on: macos-latest
+        environment: signing
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: in
+                  pattern: okazuri-search-api-*
+                  merge-multiple: true
+            - name: Sign
+              env:
+                  SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+                  SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+              run: |
+                  set -euo pipefail
+                  keychain="$RUNNER_TEMP/sign.keychain-db"
+                  pw=$(uuidgen)
+                  orig=$(security list-keychains -d user | tr -d '"' | tr -s ' \n' ' ')
+                  trap 'security list-keychains -d user -s $orig; security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/sign.p12"' EXIT
+                  echo "$SIGN_P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+                  security create-keychain -p "$pw" "$keychain"
+                  security set-keychain-settings -lut 3600 "$keychain"
+                  security unlock-keychain -p "$pw" "$keychain"
+                  security import "$RUNNER_TEMP/sign.p12" -k "$keychain" -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign
+                  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$keychain" > /dev/null
+                  # codesign finds the identity only in a keychain of the search list
+                  security list-keychains -d user -s "$keychain" $orig
+                  id=$(security find-identity -p codesigning "$keychain" | awk '/\)/ {print $2; exit}')
+                  [ -n "$id" ] || { echo "no signing identity"; exit 1; }
+                  mkdir signed
+                  n=0
+                  for f in in/*macOS*; do
+                    case "$f" in *.sha256) continue ;; esac
+                    [ -f "$f" ] || continue
+                    b=$(basename "$f")
+                    cp "$f" "signed/$b"
+                    # the identifier is fixed per program, so the permissions stay with the program across builds
+                    codesign --force --keychain "$keychain" --sign "$id" --identifier "quest.nae.okazuri-search-api.${b%%-macOS*}" "signed/$b"
+                    codesign -v "signed/$b"
+                    (cd signed && shasum -a 256 "$b" > "$b.sha256")
+                    n=$((n + 1))
+                  done
+                  # an app in a disk image: the app inside is signed, with the bundle identifier
+                  for f in in/*.app.dmg; do
+                    [ -f "$f" ] || continue
+                    b=$(basename "$f")
+                    hdiutil convert "$f" -format UDRW -o "$RUNNER_TEMP/rw.dmg" -quiet
+                    mnt=$(hdiutil attach "$RUNNER_TEMP/rw.dmg" -nobrowse -readwrite | awk -F'\t' 'END {print $NF}')
+                    for app in "$mnt"/*.app; do
+                      bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+                      codesign --force --deep --keychain "$keychain" --sign "$id" --identifier "$bundle_id" "$app"
+                      codesign -v "$app"
+                    done
+                    hdiutil detach "$mnt" -quiet
+                    hdiutil convert "$RUNNER_TEMP/rw.dmg" -format UDZO -o "signed/$b" -quiet
+                    rm -f "$RUNNER_TEMP/rw.dmg"
+                    (cd signed && shasum -a 256 "$b" > "$b.sha256")
+                    n=$((n + 1))
+                  done
+                  [ "$n" -gt 0 ] || { echo "no macOS file to sign"; exit 1; }
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: signed-macos
+                  path: signed/*
+                  if-no-files-found: error
+                  retention-days: 1
+
     release:
         name: Release
-        needs: [reuse, package]
-        if: ${{ !cancelled() && (needs.reuse.outputs.reuse == 'true' || needs.package.result == 'success') }}
+        needs: [reuse, package, sign]
+        if: ${{ !cancelled() && needs.sign.result != 'failure' && (needs.reuse.outputs.reuse == 'true' || needs.package.result == 'success') }}
         runs-on: ubuntu-24.04
         permissions:
             contents: write
@@ -213,7 +288,16 @@ jobs:
             - uses: actions/download-artifact@v4
               with:
                   path: dist
+                  pattern: okazuri-search-api-*
                   merge-multiple: true
+            - uses: actions/download-artifact@v4
+              if: needs.sign.result == 'success'
+              with:
+                  name: signed-macos
+                  path: signed
+            - name: Use the signed macOS files
+              if: needs.sign.result == 'success'
+              run: cp signed/* dist/
             - name: List the files
               run: ls -l dist
             # For a push that is not a version tag: the tag `latest` moves to this commit (created if it is not there).
