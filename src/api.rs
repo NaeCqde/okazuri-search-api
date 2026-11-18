@@ -4,6 +4,7 @@
 //!   `okazuri_bot` called when it was the romaji API alone (`src/romaji.ts`).
 //! - `GET /okazuri/search?q=` (`[search] enabled`): the works found on the sites for the query, as JSON.
 //! - `GET /okazuri/sites` (`[search] enabled`): the sites, and whether each can be searched.
+//! - `GET /okazuri/hitomi?q=` (`[search] enabled`): the English titles that Hitomi.La has for a title, as JSON.
 //! - `GET /health`: `ok`.
 //!
 //! A function that is off has no route, so it answers 404. A bad request is a 422 with
@@ -32,7 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new().route("/health", get(health)).route("/romaji", get(romaji));
 
     if state.search.is_some() {
-        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites));
+        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/okazuri/hitomi", get(hitomi));
     }
 
     router.with_state(state)
@@ -103,6 +104,34 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
         Err(e) => {
             log::error!("cannot search {:?}: {}", text, e);
             server_error()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HitomiQuery {
+    q: Option<String>,
+}
+
+/// The title of a work (in Japanese, as a site writes it) asked to Hitomi.La, which has the English title of it too.
+/// Only the title is searched; the answer is the galleries whose title has the text, the ones with the same title first.
+async fn hitomi(State(state): State<Arc<AppState>>, Query(params): Query<HitomiQuery>) -> Response {
+    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
+    let text = params.q.unwrap_or_default();
+    let length = text.trim().chars().count();
+
+    if length == 0 {
+        return invalid("q is required (at least 1 character)");
+    }
+    if length > engine.max_query_chars() {
+        return invalid(&format!("q is too long (at most {} characters)", engine.max_query_chars()));
+    }
+
+    match engine.hitomi_english(&text).await {
+        Ok(results) => json(StatusCode::OK, &serde_json::json!({ "input": text.trim(), "results": results })),
+        Err(e) => {
+            log::warn!("cannot ask Hitomi.La for {:?}: {}", text, e);
+            json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Hitomi.La did not answer" }))
         }
     }
 }
@@ -243,7 +272,21 @@ mod tests {
         // the search is off in the state of the romaji tests
         assert_eq!(get_path("/okazuri/search?q=a").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/okazuri/sites").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_path("/okazuri/hitomi?q=a").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/romaji?q=a").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_hitomi_route_needs_a_title_and_says_when_the_site_does_not_answer() {
+        // the engine of the tests has no Hitomi.La among its sites
+        let (state, _) = search_state().await;
+
+        assert_eq!(get_from(state.clone(), "/okazuri/hitomi").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), "/okazuri/hitomi?q=%20").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, content_type, body) = get_from(state, &format!("/okazuri/hitomi?q={}", encode("姉弟"))).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(content_type.starts_with("application/json"));
+        assert!(body.contains("did not answer"), "{body}");
     }
 
     async fn search_state() -> (Arc<AppState>, Arc<crate::engine::tests::Hits>) {

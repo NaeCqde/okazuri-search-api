@@ -77,6 +77,19 @@ impl Plan {
     }
 }
 
+/// A work of Hitomi.La for a title (`hitomi_english`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HitomiTitle {
+    pub id: u32,
+    pub url: String,
+    /// The title the site gives: English, or the romaji (some galleries have the English title and the title of their language).
+    pub title: String,
+    pub japanese_title: Option<String>,
+    /// The text is the whole title.
+    pub exact: bool,
+}
+
 /// What `reromanize_works` did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reromanized {
@@ -629,7 +642,14 @@ impl Engine {
 
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
     fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
-        let mut fetch = |path: &str, range: Option<(u64, u64)>| -> std::result::Result<Vec<u8>, String> {
+        let mut fetch = self.hitomi_fetch(index);
+
+        crate::hitomi::search(&mut fetch, query, self.config.max_results_per_site)
+    }
+
+    /// Reads a file of the index host of Hitomi.La (the whole answer, or a range of it), after the turn of the site.
+    fn hitomi_fetch(&self, index: usize) -> impl FnMut(&str, Option<(u64, u64)>) -> std::result::Result<Vec<u8>, String> + '_ {
+        move |path: &str, range: Option<(u64, u64)>| {
             self.wait_turn(index);
 
             // the version is asked with a changing number, so that no cache answers with an old one
@@ -656,9 +676,50 @@ impl Engine {
             }
 
             response.body_mut().read_to_vec().map_err(|e| format!("{path}: {e}"))
+        }
+    }
+
+    /// The English titles of the works of Hitomi.La whose title (the Japanese one, or the English one) has the text. Only
+    /// the title is looked at: a gallery counts when the text, without the spaces and the marks, is in its title. The
+    /// ones that are the same title come first, then the newest. Asks the site now (nothing is saved).
+    pub async fn hitomi_english(self: &Arc<Self>, text: &str) -> Result<Vec<HitomiTitle>> {
+        let Some(index) = self.sites.iter().position(|site| site.def.format == Format::Hitomi) else {
+            return Err("Hitomi.La is not one of the sites".into());
         };
 
-        crate::hitomi::search(&mut fetch, query, self.config.max_results_per_site)
+        let words = normalize(text);
+        let limit = self.config.max_results_per_site.clamp(1, 20);
+        let worker = self.clone();
+
+        let galleries = tokio::task::spawn_blocking(move || {
+            let mut fetch = worker.hitomi_fetch(index);
+
+            crate::hitomi::galleries(&mut fetch, &words, limit)
+        })
+        .await
+        .map_err(|e| format!("the request task died: {e}"))??;
+
+        let wanted = crate::hitomi::squash(text);
+        let mut found: Vec<HitomiTitle> = galleries
+            .into_iter()
+            .filter_map(|gallery| {
+                let japanese = gallery.japanese_title.clone().unwrap_or_default();
+                let (in_japanese, in_title) = (crate::hitomi::squash(&japanese), crate::hitomi::squash(&gallery.title));
+
+                (!wanted.is_empty() && (in_japanese.contains(&wanted) || in_title.contains(&wanted))).then(|| HitomiTitle {
+                    id: gallery.id,
+                    url: self.sites[index].address(&gallery.path()),
+                    exact: in_japanese == wanted || in_title == wanted,
+                    title: gallery.title,
+                    japanese_title: gallery.japanese_title,
+                })
+            })
+            .collect();
+
+        // the same title first; the order of the galleries (the newest first) otherwise
+        found.sort_by_key(|title| !title.exact);
+
+        Ok(found)
     }
 
     /// Keeps `min_delay_ms` (or the longer delay of the site) between two requests to the same site.
