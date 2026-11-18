@@ -18,8 +18,8 @@ pub struct Model {
     pub title_key: String,
     pub first_seen: i64,
     pub updated_at: i64,
-    /// The language the title says the work is in (`language.rs`): two-letter codes joined with `,`, or `unknown`.
-    pub language: String,
+    /// The language the title says the work is in (`language.rs`): a two-letter code; NULL when the title says none.
+    pub language: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

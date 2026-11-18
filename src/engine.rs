@@ -51,8 +51,8 @@ pub struct Hit {
     pub title: String,
     /// The romaji of the title: what the query was matched with.
     pub title_romaji: String,
-    /// The language the title says (`language.rs`): two-letter codes joined with `,` (`zh`, `en,ko`), or `unknown`.
-    pub language: String,
+    /// The language the title says (`language.rs`): a two-letter code (`zh`, `en`, `ja`); null when the title says none.
+    pub language: Option<String>,
     /// This request found the work on a site and saved it: it was not in the database before.
     pub is_new: bool,
 }

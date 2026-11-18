@@ -134,7 +134,7 @@ impl SearchStore {
         }
 
         log::info!("works.language: adding the column and reading the language of every title");
-        db.execute_unprepared("ALTER TABLE works ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'").await?;
+        db.execute_unprepared("ALTER TABLE works ADD COLUMN language TEXT").await?;
 
         let transaction = db.begin().await?;
         let mut after: Option<(String, String)> = None;
@@ -149,9 +149,7 @@ impl SearchStore {
             after = Some((last.website.clone(), last.path.clone()));
 
             for row in &page {
-                let found = language::detect(&row.title);
-
-                if found != language::UNKNOWN {
+                if let Some(found) = language::detect(&row.title) {
                     work::Entity::update_many()
                         .col_expr(work::Column::Language, Expr::value(found))
                         .filter(work::Column::Website.eq(row.website.as_str()))
@@ -433,14 +431,14 @@ impl SearchStore {
                     title_key: Set(title_key(&item.romaji)),
                     first_seen: Set(now),
                     updated_at: Set(now),
-                    language: Set(language::detect(&item.title)),
+                    language: Set(language::detect(&item.title).map(str::to_string)),
                 }),
                 Some(known) if known.title != item.title || known.title_romaji != item.romaji => {
                     let mut changed = known.clone().into_active_model();
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
                     changed.title_key = Set(title_key(&item.romaji));
-                    changed.language = Set(language::detect(&item.title));
+                    changed.language = Set(language::detect(&item.title).map(str::to_string));
                     changed.updated_at = Set(now);
                     changed.update(db).await?;
                 }
@@ -461,6 +459,38 @@ impl SearchStore {
     /// Where the crawl of a site stands (None: it never ran).
     pub async fn crawl_state(&self, website: &str) -> Result<Option<crawl_state::Model>> {
         Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?)
+    }
+
+    /// Reads the language of every title again (`language.rs`), for when its rules changed. Only the works whose language is
+    /// different now are written. Returns how many works were looked at and how many were written.
+    pub async fn relanguage(&self) -> Result<(usize, usize)> {
+        let (mut looked, mut changed) = (0, 0);
+        let mut after: Option<(String, String)> = None;
+
+        loop {
+            let page = self.works_after(after.as_ref(), 2000).await?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.website.clone(), last.path.clone()));
+            looked += page.len();
+
+            let transaction = self.db.begin().await?;
+            for row in page {
+                let now = language::detect(&row.title);
+
+                if now != row.language.as_deref() {
+                    work::Entity::update_many()
+                        .col_expr(work::Column::Language, Expr::value(now))
+                        .filter(work::Column::Website.eq(row.website.as_str()))
+                        .filter(work::Column::Path.eq(row.path.as_str()))
+                        .exec(&transaction)
+                        .await?;
+                    changed += 1;
+                }
+            }
+            transaction.commit().await?;
+        }
+
+        Ok((looked, changed))
     }
 
     /// Writes works that came from another database (`transfer.rs`) as they are; the ones that are saved already stay as they
@@ -650,7 +680,7 @@ impl SearchStore {
             let mut changed = known.clone().into_active_model();
             changed.title_romaji = Set(romaji.clone());
             changed.title_key = Set(title_key(romaji));
-            changed.language = Set(language::detect(&known.title));
+            changed.language = Set(language::detect(&known.title).map(str::to_string));
             changed.update(&transaction).await?;
 
             for row in listing::Entity::find()
@@ -963,7 +993,7 @@ mod tests {
             title: Set("Old".into()),
             title_romaji: Set("old".into()),
             title_key: Set("old".into()),
-            language: Set("unknown".into()),
+            language: Set(None),
             first_seen: Set(1),
             updated_at: Set(1),
         }
@@ -1131,7 +1161,7 @@ mod tests {
         }
         store
             .db
-            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1, 'unknown'), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2, 'unknown')")
+            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1, NULL), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2, NULL)")
             .await
             .unwrap();
         drop(store);
@@ -1160,8 +1190,24 @@ mod tests {
 
         let store = SearchStore::open(&path).await.unwrap();
         let works = store.works_after(None, 10).await.unwrap();
-        assert_eq!(works.iter().map(|w| (w.path.as_str(), w.language.as_str())).collect::<Vec<_>>(), [("/g/1/", "zh"), ("/g/2/", "unknown")]);
+        assert_eq!(works.iter().map(|w| (w.path.as_str(), w.language.as_deref())).collect::<Vec<_>>(), [("/g/1/", Some("zh")), ("/g/2/", None)]);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn relanguage_writes_only_the_works_whose_language_changed() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+
+        store.save_crawled("A", 1, &[work("/1", "x [English]"), work("/2", "plain"), work("/3", "y [中国翻訳]")], None).await.unwrap();
+        // the rules were different when these were saved
+        store.db.execute_unprepared("UPDATE works SET language = 'ko' WHERE path = '/1'").await.unwrap();
+        store.db.execute_unprepared("UPDATE works SET language = 'fr' WHERE path = '/2'").await.unwrap();
+
+        assert_eq!(store.relanguage().await.unwrap(), (3, 2));
+        let found: Vec<_> = store.works_after(None, 10).await.unwrap().into_iter().map(|w| w.language).collect();
+        assert_eq!(found, [Some("en".to_string()), None, Some("zh".to_string())]);
+        assert_eq!(store.relanguage().await.unwrap(), (3, 0), "nothing changed the second time");
     }
 }

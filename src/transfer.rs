@@ -121,7 +121,7 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
             .map(|line| {
                 let converted = romaji(&line.title, &romanizer).unwrap_or_else(|_| line.title.clone());
 
-                let language = crate::language::detect(&line.title);
+                let language = crate::language::detect(&line.title).map(str::to_string);
 
                 work::Model {
                     website: line.website,
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(to.candidates(Some("alphatwo")).await.unwrap().len(), 1, "the index follows the imported works");
 
         let languages: Vec<_> = to.works_after(None, 10).await.unwrap().into_iter().map(|w| (w.path, w.language)).collect();
-        assert_eq!(languages, [("/a/1".to_string(), "unknown".to_string()), ("/a/2".to_string(), "unknown".to_string()), ("/b/1".to_string(), "en".to_string())], "the language is made on import: it is not in the file");
+        assert_eq!(languages, [("/a/1".to_string(), None), ("/a/2".to_string(), None), ("/b/1".to_string(), Some("en".to_string()))], "the language is made on import: it is not in the file");
 
         // the same file again changes nothing
         let again = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();

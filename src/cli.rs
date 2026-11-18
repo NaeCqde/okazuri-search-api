@@ -47,6 +47,9 @@ reromanize                             Make the romaji of the saved works again 
                                        which the server runs at its start, asks the sites for them again). Stop the\n\
                                        server first\n\
     --config <path>      Config file\n\
+relanguage                             Read the language of every saved title again with the rules of this version (`works.language`),
+                                       and write the works whose language is different now. Safe while the server runs
+    --config <path>      Config file
 export <file>                          Write the saved works to a file (JSON Lines, compressed with brotli), to put the works
                                        that a machine crawled into the database of another (`import`)
     --site <name>        Only the works of this site (more than once for more sites)
@@ -75,6 +78,7 @@ pub enum Command {
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
+    Relanguage { config: Option<PathBuf> },
     Export { file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf> },
     Import { files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf> },
     Help,
@@ -94,6 +98,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
+        "relanguage" => parse_relanguage(rest),
         "export" => parse_export(rest),
         "import" => parse_import(rest),
         // options with no command are the options of `serve`
@@ -210,6 +215,13 @@ fn parse_reromanize(args: &[String]) -> Result<Command> {
     Ok(Command::Reromanize { config })
 }
 
+fn parse_relanguage(args: &[String]) -> Result<Command> {
+    match parse_reromanize(args)? {
+        Command::Reromanize { config } => Ok(Command::Relanguage { config }),
+        other => Ok(other),
+    }
+}
+
 fn parse_export(args: &[String]) -> Result<Command> {
     let (mut file, mut sites, mut since, mut config) = (None, Vec::new(), 0, None);
     let mut iter = args.iter();
@@ -274,6 +286,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
+        Command::Relanguage { config } => relanguage(config).await,
         Command::Export { file, sites, since, config } => export(file, sites, since, config).await,
         Command::Import { files, mark_done, config } => import(files, mark_done, config).await,
     }
@@ -513,6 +526,17 @@ async fn reromanize(config: Option<PathBuf>) -> Result<()> {
         "{} works looked at, {} written again, {} searches to do again (the prefetch does them when the server starts)",
         done.works, done.changed, done.forgotten
     );
+
+    Ok(())
+}
+
+/// Reads the language of every saved title again.
+async fn relanguage(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let (looked, changed) = store.relanguage().await?;
+
+    println!("{looked} works looked at, {changed} written again");
 
     Ok(())
 }

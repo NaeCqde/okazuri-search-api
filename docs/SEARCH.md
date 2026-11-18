@@ -274,10 +274,12 @@ for them.
 ## The language of a work (`works.language`)
 
 `language.rs` reads the language from the title: the flag a site puts first, the marks of a translation (`[中国翻訳]`, `[汉化]`) and the
-brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). The answer is two-letter codes joined with `,` in the order found
-(`zh`, `en,ko`), or `unknown` when the title says nothing (most titles are Japanese and do not say so). Every result of the search has it
-as `language`. A database from before this has the column added, and the titles read, when it is opened. The file of `export` does not have it: `import`
-makes it (as it makes the romaji and the key); `reromanize` makes it again too.
+brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). A work has one language, a two-letter code (`zh`, `en`, `ja`), and
+NULL when the title says none (most titles are Japanese and do not say so). A title that names several languages is a pack: the first
+one that is not Japanese is the language. The search answers it as `language` (null when there is none). A database from before this has
+the column added, and the titles read, when it is opened. The file of `export` does not have it: `import` makes it (as it makes the
+romaji and the key). When the rules change, `okazuri-search-api relanguage` reads every title again and writes the works that came out different
+(`reromanize` also writes it for the works whose romaji changed).
 
 ## Crawling (`[crawl]`)
 

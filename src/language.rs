@@ -2,13 +2,12 @@
 //! brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). It is a guess from the title, so it is kept apart from
 //! the title (`works.language`) and made again by `import` and `reromanize`.
 //!
-//! The answer is two-letter language codes joined with `,` in the order they were found (`zh`, `en,ko`), or `unknown` when the title
-//! says nothing: most titles are Japanese and do not say so.
+//! A work has one language: a two-letter code (`zh`, `en`, `ja`), or None when the title says nothing (most titles are Japanese and do not say
+//! so). A title that names several languages (`[CN,EN,JP,KR]`) is a pack: the first language that is not Japanese is the one; Japanese
+//! is the answer only when it is the only one named.
 
 use regex::Regex;
 use std::sync::OnceLock;
-
-pub const UNKNOWN: &str = "unknown";
 
 /// The words that name a language in the brackets of a title (upper case) and the code of that language.
 fn code_of_word(word: &str) -> Option<&'static str> {
@@ -87,8 +86,15 @@ fn add(found: &mut Vec<&'static str>, code: &'static str) {
     }
 }
 
-/// The language codes of a title, joined with `,`; `unknown` when it has none.
-pub fn detect(title: &str) -> String {
+/// The language code of a title; None when it says none.
+pub fn detect(title: &str) -> Option<&'static str> {
+    let found = detect_all(title);
+
+    found.iter().copied().find(|code| *code != "ja").or(found.first().copied())
+}
+
+/// Every language the title names, in the order it names them.
+pub fn detect_all(title: &str) -> Vec<&'static str> {
     let patterns = patterns();
     let mut found: Vec<&'static str> = Vec::new();
     let mut text = title.trim();
@@ -134,11 +140,7 @@ pub fn detect(title: &str) -> String {
         }
     }
 
-    if found.is_empty() {
-        UNKNOWN.to_string()
-    } else {
-        found.join(",")
-    }
+    found
 }
 
 #[cfg(test)]
@@ -147,38 +149,74 @@ mod tests {
 
     #[test]
     fn marks_of_chinese() {
-        assert_eq!(detect("[A] B [Chinese] [Digital]"), "zh");
-        assert_eq!(detect("[A] B [RanaMycin个人汉化] [DL版]"), "zh");
-        assert_eq!(detect("[A] B [中国翻訳] [DL版]"), "zh");
-        assert_eq!(detect("[A] B [無邪気漢化組]"), "zh");
+        assert_eq!(detect("[A] B [Chinese] [Digital]"), Some("zh"));
+        assert_eq!(detect("[A] B [RanaMycin个人汉化] [DL版]"), Some("zh"));
+        assert_eq!(detect("[A] B [中国翻訳] [DL版]"), Some("zh"));
+        assert_eq!(detect("[A] B [無邪気漢化組]"), Some("zh"));
     }
 
     #[test]
     fn codes_and_names_in_brackets() {
-        assert_eq!(detect("x [EN]"), "en");
-        assert_eq!(detect("x [en]"), "en");
-        assert_eq!(detect("x (JP)"), "ja");
-        assert_eq!(detect("x 【KR】"), "ko");
-        assert_eq!(detect("x [English - EN] [Digital]"), "en");
-        assert_eq!(detect("x [CN,EN,JP,KR]"), "zh,en,ja,ko");
-        assert_eq!(detect("x [jap / eng / rus]"), "ja,en,ru");
-        assert_eq!(detect("x [French][Italian]"), "fr,it");
-        assert_eq!(detect("x [Japanese]"), "ja");
+        assert_eq!(detect("x [EN]"), Some("en"));
+        assert_eq!(detect("x [en]"), Some("en"));
+        assert_eq!(detect("x (JP)"), Some("ja"));
+        assert_eq!(detect("x 【KR】"), Some("ko"));
+        assert_eq!(detect("x [English - EN] [Digital]"), Some("en"));
+        assert_eq!(detect("x [French][Italian]"), Some("fr"));
+        assert_eq!(detect("x [Japanese]"), Some("ja"));
+    }
+
+    #[test]
+    fn a_pack_of_languages_is_the_first_one_that_is_not_japanese() {
+        assert_eq!(detect("x [CN,EN,JP,KR]"), Some("zh"));
+        assert_eq!(detect("x [jap / eng / rus]"), Some("en"));
+        assert_eq!(detect("x [JP,EN]"), Some("en"));
+        assert_eq!(detect("x [JP,JA]"), Some("ja"));
     }
 
     #[test]
     fn a_flag_that_the_site_put_first_counts_once() {
-        assert_eq!(detect("🇨🇳 [Hamao] Fallin' [Chinese]"), "zh");
-        assert_eq!(detect("🇯🇵 A [EN]"), "ja,en");
-        assert_eq!(detect("🇺🇸🇰🇷 A"), "en,ko");
-        assert_eq!(detect("🇹🇼 A"), "zh");
+        assert_eq!(detect("🇨🇳 [Hamao] Fallin' [Chinese]"), Some("zh"));
+        assert_eq!(detect("🇯🇵 A [EN]"), Some("en"), "the title says it is English");
+        assert_eq!(detect("🇯🇵 A"), Some("ja"));
+        assert_eq!(detect("🇺🇸🇰🇷 A"), Some("en"));
+        assert_eq!(detect("🇹🇼 A"), Some("zh"));
     }
 
     #[test]
-    fn a_title_that_says_nothing_is_unknown() {
-        assert_eq!(detect("[A] 普通の日本語タイトル"), UNKNOWN);
+    fn a_title_that_says_nothing_has_no_language() {
+        assert_eq!(detect("[A] 普通の日本語タイトル"), None);
         for title in ["x [HD]", "x [NR]", "x [UC]", "x [AI]", "x [VR]", "x [KS]", "x [It Girl]", "x [ID Card]", "x (mr)", "x EN", "x [English Edition Deluxe]"] {
-            assert_eq!(detect(title), UNKNOWN, "{title}");
+            assert_eq!(detect(title), None, "{title}");
         }
+    }
+
+    /// Lists the works of a database whose title names more than one language: `OKAZURI_DB=search.db cargo test list_packs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn list_packs() {
+        let Ok(path) = std::env::var("OKAZURI_DB") else { return };
+        let db = rusqlite_free_read(&path);
+
+        for (website, path, title) in db {
+            let all = detect_all(&title);
+
+            if all.len() > 1 {
+                println!("{}\t{website}\t{path}\t{title}", all.join(","));
+            }
+        }
+    }
+
+    /// The (website, path, title) rows of a database, read with the `sqlite3` program.
+    fn rusqlite_free_read(path: &str) -> Vec<(String, String, String)> {
+        let out = std::process::Command::new("sqlite3").args(["-separator", "\t", path, "select website, path, replace(title, char(10), ' ') from works"]).output().expect("sqlite3");
+
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, '\t');
+                Some((parts.next()?.to_string(), parts.next()?.to_string(), parts.next()?.to_string()))
+            })
+            .collect()
     }
 }
