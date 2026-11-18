@@ -41,6 +41,11 @@ sync                                   Copy the magazine tables of the D1 databa
 prefetch                               Search for the issues of the copy once through ([prefetch])\n\
     --limit <n>          The most queries (default: [prefetch] max_queries_per_round)\n\
     --config <path>      Config file\n\
+reromanize                             Make the romaji of the saved works again with the rules of this version, and\n\
+                                       forget the searches that listed a work whose romaji changed (the prefetch,\n\
+                                       which the server runs at its start, asks the sites for them again). Stop the\n\
+                                       server first\n\
+    --config <path>      Config file\n\
 convert [text]...                      Print the romaji of the text. Without text, every line of the\n\
                                        standard input is converted and printed as a line\n\
     --loanwords <romaji|english>       How to write loanwords spelled in hiragana (default: romaji)\n\
@@ -59,6 +64,7 @@ pub enum Command {
     Search { query: String, live: Live, limit: Option<usize>, config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
+    Reromanize { config: Option<PathBuf> },
     Help,
 }
 
@@ -75,6 +81,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "search" => parse_search(rest),
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
+        "reromanize" => parse_reromanize(rest),
         // options with no command are the options of `serve`
         arg if arg.starts_with("--") => parse_serve(args),
         other => Err(format!("unknown command: {other}\n\n{USAGE}").into()),
@@ -175,6 +182,20 @@ fn parse_prefetch(args: &[String]) -> Result<Command> {
     Ok(Command::Prefetch { limit, config })
 }
 
+fn parse_reromanize(args: &[String]) -> Result<Command> {
+    let mut config = None;
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+        }
+    }
+
+    Ok(Command::Reromanize { config })
+}
+
 fn value(iter: &mut std::slice::Iter<String>, option: &str) -> Result<String> {
     iter.next().cloned().ok_or_else(|| format!("{option} needs a value").into())
 }
@@ -198,6 +219,7 @@ pub async fn run(command: Command) -> Result<()> {
         }
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
+        Command::Reromanize { config } => reromanize(config).await,
     }
 }
 
@@ -412,6 +434,23 @@ async fn sync(config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Makes the romaji of the saved works again and forgets the searches of the ones that changed. Nothing is asked to
+/// a site: the prefetch of the server does that, when it starts.
+async fn reromanize(config: Option<PathBuf>) -> Result<()> {
+    let mut config = load(config)?;
+    config.search.enabled = true;
+
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
+    let done = engine.reromanize_works().await?;
+
+    println!(
+        "{} works looked at, {} written again, {} searches to do again (the prefetch does them when the server starts)",
+        done.works, done.changed, done.forgotten
+    );
+
+    Ok(())
+}
+
 async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
     let mut config = load(config)?;
     config.search.enabled = true;
@@ -485,6 +524,16 @@ mod tests {
             parse(&args(&["--port", "1"])).unwrap(),
             Command::Serve { config: None, host: None, port: Some(1) }
         );
+    }
+
+    #[test]
+    fn reromanize_takes_only_the_config() {
+        assert_eq!(parse(&args(&["reromanize"])).unwrap(), Command::Reromanize { config: None });
+        assert_eq!(
+            parse(&args(&["reromanize", "--config", "a.toml"])).unwrap(),
+            Command::Reromanize { config: Some(PathBuf::from("a.toml")) }
+        );
+        assert!(parse(&args(&["reromanize", "--limit", "1"])).is_err());
     }
 
     #[test]

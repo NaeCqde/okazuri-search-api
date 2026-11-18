@@ -151,6 +151,15 @@ only the sites that are missing or old are asked), so a restart of the program, 
 says `prefetch: n/total "query"` for each query. A slow site (177Picyy: one request in 20 seconds) is left out of the prefetch,
 because every query would wait for it; a request to `/okazuri/search` asks it, with one form of the query.
 
+### After the rules of the romaji changed (`reromanize`)
+
+A work is saved with the romaji it had when it was listed, so after an update of the rules the saved romaji is the old one
+until the work is listed again (a month). `okazuri-search-api reromanize` (the server stopped) makes the romaji of every saved
+work again; a work whose romaji came out different is rewritten (title, dates and the order of the results stay), and the
+searches that listed it are forgotten. It asks no site: the prefetch of the server, when it starts, finds those queries not
+searched and asks the sites again, newest issue first. The queries that are not issues are asked again when somebody searches
+for them.
+
 ## Not done
 
 - A site behind a Cloudflare challenge, Hitomi.La and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.

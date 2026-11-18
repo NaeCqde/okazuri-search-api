@@ -284,6 +284,56 @@ impl SearchStore {
         Ok(new)
     }
 
+    /// The next `limit` works after `after` (a website and a path), in the order of their keys. Reads the table page
+    /// by page, so a recount of every title does not need every row in memory.
+    pub async fn works_after(&self, after: Option<&(String, String)>, limit: u64) -> Result<Vec<Work>> {
+        let mut query = work::Entity::find();
+
+        if let Some((website, path)) = after {
+            query = query.filter(Expr::cust_with_values("(website, path) > (?, ?)", [website.as_str(), path.as_str()]));
+        }
+
+        Ok(query
+            .order_by_asc(work::Column::Website)
+            .order_by_asc(work::Column::Path)
+            .limit(limit)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// Writes a new romaji for works (the title, `first_seen` and `updated_at` stay as they are: the order of the
+    /// results does not change), and forgets that the queries which listed them were searched, so the next search
+    /// (the prefetch is one) asks those sites again. Returns how many searches were forgotten.
+    pub async fn rewrite_romaji(&self, changes: &[(Work, String)]) -> Result<usize> {
+        let transaction = self.db.begin().await?;
+        let mut searches: HashSet<(String, String)> = HashSet::new();
+
+        for (known, romaji) in changes {
+            let mut changed = known.clone().into_active_model();
+            changed.title_romaji = Set(romaji.clone());
+            changed.title_key = Set(title_key(romaji));
+            changed.update(&transaction).await?;
+
+            for row in listing::Entity::find()
+                .filter(listing::Column::Website.eq(known.website.as_str()))
+                .filter(listing::Column::Path.eq(known.path.as_str()))
+                .all(&transaction)
+                .await?
+            {
+                searches.insert((row.query, row.website));
+            }
+        }
+
+        let mut forgotten = 0;
+        for (query, website) in searches {
+            forgotten += search::Entity::delete_by_id((query, website)).exec(&transaction).await?.rows_affected as usize;
+        }
+
+        transaction.commit().await?;
+
+        Ok(forgotten)
+    }
+
     /// The works whose title key has `prefilter` in it (all works without one), the most recently saved first.
     /// This only narrows the rows; the caller still matches every word of its query.
     pub async fn candidates(&self, prefilter: Option<&str>) -> Result<Vec<Work>> {

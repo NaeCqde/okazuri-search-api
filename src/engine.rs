@@ -77,6 +77,17 @@ impl Plan {
     }
 }
 
+/// What `reromanize_works` did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reromanized {
+    /// Works looked at.
+    pub works: usize,
+    /// Works whose romaji came out different.
+    pub changed: usize,
+    /// Searches forgotten, to be done again.
+    pub forgotten: usize,
+}
+
 /// What the sites were asked for a query.
 #[derive(Debug, Default)]
 pub struct Fetched {
@@ -262,6 +273,44 @@ impl Engine {
                 NewWork { path: link.path, title: link.title, romaji: converted }
             })
             .collect()
+    }
+
+    /// Makes the romaji of every saved work again, with the rules of this version of the program. A work whose romaji
+    /// came out different is rewritten, and the searches that listed it are forgotten, so the prefetch (or the next
+    /// request) asks the sites for them again. Does nothing to the works that came out the same, so it is cheap to do on
+    /// every start.
+    pub async fn reromanize_works(&self) -> Result<Reromanized> {
+        const PAGE: u64 = 500;
+
+        let mut done = Reromanized::default();
+        let mut after: Option<(String, String)> = None;
+
+        loop {
+            let works = self.store.works_after(after.as_ref(), PAGE).await?;
+            let Some(last) = works.last() else { break };
+
+            after = Some((last.website.clone(), last.path.clone()));
+            done.works += works.len();
+
+            let changes: Vec<_> = works
+                .into_iter()
+                .filter_map(|work| {
+                    let converted = romaji(&work.title, &self.romanizer).unwrap_or_else(|_| work.title.clone());
+
+                    (converted != work.title_romaji).then_some((work, converted))
+                })
+                .collect();
+
+            if !changes.is_empty() {
+                done.changed += changes.len();
+                done.forgotten += self.store.rewrite_romaji(&changes).await?;
+            }
+
+            // the server keeps answering between two pages
+            tokio::task::yield_now().await;
+        }
+
+        Ok(done)
     }
 
     pub fn sites_info(&self) -> Vec<SiteInfo> {
@@ -790,6 +839,28 @@ pub(crate) mod tests {
         // another query is another answer
         engine.search(&Request::new("other")).await.unwrap();
         assert_eq!(requests(&hits), (3, 3, 3));
+    }
+
+    #[tokio::test]
+    async fn a_work_whose_romaji_changed_is_written_again_and_its_search_is_forgotten() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into() };
+
+        // saved by an older version: the romaji of 彼女を was "kanojo wo"; the second work is the same as now
+        store.save("q1", "Good", 7, &Ok(vec![work("/work/1", "彼女を", "kanojo wo")]), false).await.unwrap();
+        store.save("q2", "Good", 8, &Ok(vec![work("/work/2", "comic", "comic")]), false).await.unwrap();
+
+        let done = engine.reromanize_works().await.unwrap();
+
+        assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
+        let saved = store.candidates(None).await.unwrap();
+        let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
+        assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
+        assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
+        assert!(!store.states("q2").await.unwrap().is_empty(), "the other one stays");
+
+        // the second time there is nothing to do
+        assert_eq!(engine.reromanize_works().await.unwrap(), Reromanized { works: 2, changed: 0, forgotten: 0 });
     }
 
     #[tokio::test]

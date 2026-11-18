@@ -28,6 +28,7 @@ okazuri-search-api serve --port 9000     オプション: --config <パス> --ho
 okazuri-search-api search <語>...        1 回検索(サーバーなし)。--live off|diff|on --limit <n>
 okazuri-search-api sync                  D1 データベースの雑誌のテーブルを今すぐ写す
 okazuri-search-api prefetch              その写しの号を 1 周、事前検索する。--limit <n>
+okazuri-search-api reromanize            保存済み作品のローマ字を作り直し、変わった作品の検索履歴を消す(先にサーバーを止める)
 okazuri-search-api convert "文"...       ローマ字を表示(サーバーなし)。文がなければ標準入力の各行
 okazuri-search-api --help
 ```

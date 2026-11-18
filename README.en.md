@@ -29,6 +29,7 @@ okazuri-search-api serve --port 9000     options: --config <path> --host <addres
 okazuri-search-api search <words>...     search once (no server); --live off|diff|on --limit <n>
 okazuri-search-api sync                  copy the magazine tables of the D1 database now
 okazuri-search-api prefetch              search for the issues of that copy once through; --limit <n>
+okazuri-search-api reromanize            make the romaji of the saved works again and forget the searches of the ones that changed (stop the server first)
 okazuri-search-api convert "text"...     print the romaji (no server); without text, every line of stdin
 okazuri-search-api --help
 ```
