@@ -271,6 +271,20 @@ searches that listed it are forgotten. It asks no site: the prefetch of the serv
 searched and asks the sites again, newest issue first. The queries that are not issues are asked again when somebody searches
 for them.
 
+## Crawling (`[crawl]`)
+
+The searches only know the works that a query listed. With `[crawl] enabled = true` the server also walks the list of each site that has one
+(`crawl.rs`: the index of Hitomi.La and the file of each gallery, the WordPress API of momon:GA and Nya:Hentai, the list pages of DLsite, Wnacg,
+AsmHentai, HentaiEra and HentaiEnvy, the JSON of RokuHentai, the list of E-Hentai) and saves the title of every work, with no query. The
+sites are walked at the same time, each one page after page, newest first.
+
+- **Where it is:** table `crawls` (a row per site: the cursor of the walk, `done`, how many works it saved). A restart goes on from the cursor.
+- **After the first walk:** at the `schedule` the newest pages are read again, up to a page with nothing new in it (`refresh_pages` at the most).
+- **The prefetch** leaves out the sites whose first walk is done, and goes on asking the sites that have no list (Sukebei, JComic, ...).
+- **The delay** of a site is kept by every request of the program together (`[search] min_delay_ms`, or `[search.site_delay_ms]` for one site).
+- **More than one machine:** `shard = "k/N"` on each, then `export` on each (`okazuri-search-api export out.jsonl.br`; JSON Lines, brotli) and
+  `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` on the server. A work that is saved already stays as it is.
+
 ## Not done
 
 - A site behind a Cloudflare challenge and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.

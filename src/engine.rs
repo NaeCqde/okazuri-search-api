@@ -328,6 +328,8 @@ pub struct Engine {
     order: HashMap<&'static str, usize>,
     /// When the site was asked last, to keep `min_delay_ms` between two requests.
     gates: Vec<Mutex<Option<Instant>>>,
+    /// The shortest time between two requests to each site: the one every request of the program keeps (`wait_turn`).
+    delays: Vec<Duration>,
     store: Arc<SearchStore>,
     client: reqwest::Client,
     config: SearchConfig,
@@ -366,7 +368,10 @@ impl Engine {
             .build()
             .expect("the HTTP client");
 
+        let delays = sites.iter().map(|site| Self::delay_of(site, config)).collect();
+
         Arc::new(Self {
+            delays,
             gates: sites.iter().map(|_| Mutex::new(None)).collect(),
             sites,
             active,
@@ -1110,15 +1115,22 @@ impl Engine {
         Ok(found)
     }
 
+    /// The time that is kept between two requests to a site: the one `[search] site_delay_ms` names; else the delay of the site
+    /// when it has its own (Hitomi.La: a few dozen small files on a static host); else the longer of `min_delay_ms` and the delay
+    /// the program knows for the site.
+    fn delay_of(site: &Site, config: &SearchConfig) -> Duration {
+        let named = config.site_delay_ms.iter().find(|(name, _)| name.eq_ignore_ascii_case(site.def.name));
+
+        Duration::from_millis(match named {
+            Some((_, ms)) => *ms,
+            None if site.def.format == Format::Hitomi => site.def.delay_ms,
+            None => config.min_delay_ms.max(site.def.delay_ms),
+        })
+    }
+
     /// Keeps `min_delay_ms` (or the longer delay of the site) between two requests to the same site.
     async fn wait_turn(&self, index: usize) {
-        let site = &self.sites[index];
-        // Hitomi.La is asked a few dozen small files for one query, on a static host: its own short delay, not `min_delay_ms`
-        let delay = if site.def.format == Format::Hitomi {
-            Duration::from_millis(site.def.delay_ms)
-        } else {
-            Duration::from_millis(self.config.min_delay_ms.max(site.def.delay_ms))
-        };
+        let delay = self.delays[index];
         let mut last = self.gates[index].lock().await;
 
         if let Some(at) = *last {
@@ -1831,5 +1843,29 @@ pub(crate) mod tests {
         engine.search(&Request::new("two")).await.unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_delay_of_a_site_in_the_settings_replaces_the_minimum_and_is_kept_by_every_kind_of_request() {
+        // 'good' (case does not matter) waits 400 ms, the others the 0 of min_delay_ms
+        let config = SearchConfig { site_delay_ms: [("good".to_string(), 400)].into(), ..config() };
+        let (engine, _, _) = setup(&config).await;
+        let good = engine.site_named("Good").unwrap();
+        let failing = engine.site_named("Failing").unwrap();
+        let (_, url) = {
+            let site = engine.site(good);
+            (site.def.name, site.search_url("x").unwrap())
+        };
+        let started = Instant::now();
+
+        // a search and a page of the crawl are two kinds of request to one site: they share its turn
+        engine.search(&Request::new("one")).await.unwrap();
+        engine.get_page(good, &url).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(400), "the second request waited for the first: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        let _ = engine.get_page(failing, &engine.site(failing).search_url("x").unwrap()).await;
+        let _ = engine.get_page(failing, &engine.site(failing).search_url("y").unwrap()).await;
+        assert!(started.elapsed() < Duration::from_millis(400), "another site is not slowed: {:?}", started.elapsed());
     }
 }

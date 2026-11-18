@@ -47,6 +47,15 @@ reromanize                             Make the romaji of the saved works again 
                                        which the server runs at its start, asks the sites for them again). Stop the\n\
                                        server first\n\
     --config <path>      Config file\n\
+export <file>                          Write the saved works to a file (JSON Lines, compressed with brotli), to put the works
+                                       that a machine crawled into the database of another (`import`)
+    --site <name>        Only the works of this site (more than once for more sites)
+    --since <unix time>  Only the works saved at this time or later
+    --config <path>      Config file
+import <file>...                        Read the files that `export` wrote into the database; the works saved already stay as they are
+    --mark-done <name>   The whole list of this site is read now (the files of every shard are in): the crawl then reads only its
+                         newest pages again, and the prefetch leaves the site to it (more than once for more sites)
+    --config <path>      Config file
 convert [text]...                      Print the romaji of the text. Without text, every line of the\n\
                                        standard input is converted and printed as a line\n\
     --loanwords <romaji|english>       How to write loanwords spelled in hiragana (default: romaji)\n\
@@ -66,6 +75,8 @@ pub enum Command {
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
+    Export { file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf> },
+    Import { files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf> },
     Help,
 }
 
@@ -83,6 +94,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
+        "export" => parse_export(rest),
+        "import" => parse_import(rest),
         // options with no command are the options of `serve`
         arg if arg.starts_with("--") => parse_serve(args),
         other => Err(format!("unknown command: {other}\n\n{USAGE}").into()),
@@ -197,6 +210,46 @@ fn parse_reromanize(args: &[String]) -> Result<Command> {
     Ok(Command::Reromanize { config })
 }
 
+fn parse_export(args: &[String]) -> Result<Command> {
+    let (mut file, mut sites, mut since, mut config) = (None, Vec::new(), 0, None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--site" => sites.push(value(&mut iter, arg)?),
+            "--since" => {
+                let text = value(&mut iter, arg)?;
+                since = text.parse::<i64>().map_err(|_| format!("--since needs a unix time, got {text}"))?;
+            }
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other if file.is_none() => file = Some(PathBuf::from(other)),
+            other => return Err(format!("export writes one file, got {other} too").into()),
+        }
+    }
+
+    Ok(Command::Export { file: file.ok_or("export needs the file to write")?, sites, since, config })
+}
+
+fn parse_import(args: &[String]) -> Result<Command> {
+    let (mut files, mut mark_done, mut config) = (Vec::new(), Vec::new(), None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--mark-done" => mark_done.push(value(&mut iter, arg)?),
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other => files.push(PathBuf::from(other)),
+        }
+    }
+    if files.is_empty() {
+        return Err("import needs the files to read".into());
+    }
+
+    Ok(Command::Import { files, mark_done, config })
+}
+
 fn value(iter: &mut std::slice::Iter<String>, option: &str) -> Result<String> {
     iter.next().cloned().ok_or_else(|| format!("{option} needs a value").into())
 }
@@ -221,6 +274,8 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
+        Command::Export { file, sites, since, config } => export(file, sites, since, config).await,
+        Command::Import { files, mark_done, config } => import(files, mark_done, config).await,
     }
 }
 
@@ -458,6 +513,34 @@ async fn reromanize(config: Option<PathBuf>) -> Result<()> {
         "{} works looked at, {} written again, {} searches to do again (the prefetch does them when the server starts)",
         done.works, done.changed, done.forgotten
     );
+
+    Ok(())
+}
+
+async fn export(file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let moved = crate::transfer::export(&store, &file, &sites, since).await?;
+    let size = tokio::fs::metadata(&file).await.map(|m| m.len()).unwrap_or(0);
+
+    println!("{} works of {} sites written to {} ({size} bytes)", moved.works, moved.sites.len(), file.display());
+
+    Ok(())
+}
+
+async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+
+    for file in &files {
+        let moved = crate::transfer::import(&store, file).await?;
+
+        println!("{}: {} works read, {} of them new", file.display(), moved.works, moved.new);
+    }
+    for site in &mark_done {
+        store.mark_crawled(site, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)).await?;
+        println!("{site}: marked as read to its end");
+    }
 
     Ok(())
 }

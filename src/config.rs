@@ -68,6 +68,10 @@ pub struct SearchConfig {
     pub timeout_secs: u64,
     /// The shortest time between two requests to the same site.
     pub min_delay_ms: u64,
+    /// The shortest time between two requests to one site, by the name of the site (`GET /okazuri/sites`; case does not matter),
+    /// in place of `min_delay_ms` and of the delay the program knows for the site. Every request of the program to the site (a
+    /// search, the prefetch, the crawl) keeps it together.
+    pub site_delay_ms: BTreeMap<String, u64>,
     /// The most results kept from one site.
     pub max_results_per_site: usize,
     /// The most works in one answer (a request may ask for fewer with limit).
@@ -95,6 +99,7 @@ impl Default for SearchConfig {
             concurrency: 8,
             timeout_secs: 20,
             min_delay_ms: 1000,
+            site_delay_ms: BTreeMap::new(),
             max_results_per_site: 50,
             max_results: 100,
             disabled_sites: Vec::new(),

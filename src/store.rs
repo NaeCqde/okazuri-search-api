@@ -413,6 +413,47 @@ impl SearchStore {
         Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?)
     }
 
+    /// Writes works that came from another database (`transfer.rs`) as they are; the ones that are saved already stay as they
+    /// are. Returns how many were new. The index of the titles follows by its triggers.
+    pub async fn import_works(&self, works: Vec<Work>) -> Result<usize> {
+        if works.is_empty() {
+            return Ok(0);
+        }
+
+        let rows: Vec<work::ActiveModel> = works.into_iter().map(IntoActiveModel::into_active_model).collect();
+        let transaction = self.db.begin().await?;
+        let new = work::Entity::insert_many(rows)
+            .on_conflict(OnConflict::columns([work::Column::Website, work::Column::Path]).do_nothing().to_owned())
+            .exec_without_returning(&transaction)
+            .await?;
+        transaction.commit().await?;
+
+        Ok(new as usize)
+    }
+
+    /// Notes that the whole list of a site is read (the works came from the files of every shard): the crawl then only reads the newest
+    /// pages again, and the prefetch leaves the site to it.
+    pub async fn mark_crawled(&self, website: &str, now: i64) -> Result<()> {
+        let before = crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?;
+        let row = crawl_state::ActiveModel {
+            website: Set(website.to_string()),
+            cursor: Set(String::new()),
+            done: Set(true),
+            saved: Set(before.map_or(0, |row| row.saved)),
+            updated_at: Set(now),
+        };
+        crawl_state::Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(crawl_state::Column::Website)
+                    .update_columns([crawl_state::Column::Cursor, crawl_state::Column::Done, crawl_state::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
     /// The sites whose crawl read the whole list (so the works they list are saved, and a query does not need to ask them).
     pub async fn crawl_done(&self) -> Result<Vec<String>> {
         Ok(crawl_state::Entity::find().filter(crawl_state::Column::Done.eq(true)).all(&self.db).await?.into_iter().map(|row| row.website).collect())
