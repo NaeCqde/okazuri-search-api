@@ -485,7 +485,9 @@ impl Engine {
         // the sites in their order; in a site, the works seen last come first (the order of the database)
         hits.sort_by_key(|hit| self.order.get(hit.website.as_str()).copied().unwrap_or(usize::MAX));
 
+        let hits = dedupe_by_url(hits);
         let total = hits.len();
+        let mut hits = hits;
         hits.truncate(request.limit.max(1));
 
         Ok(Outcome {
@@ -679,6 +681,27 @@ impl Engine {
     }
 }
 
+/// One hit for each address: the same page saved twice (`/g/1/` and `/g/1`, two sites that answer with the same address) is
+/// one result. The first one (the order of the answer) stays, and is new when any of them is.
+fn dedupe_by_url(hits: Vec<Hit>) -> Vec<Hit> {
+    let mut places: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<Hit> = Vec::new();
+
+    for hit in hits {
+        let key = hit.url.split('#').next().unwrap_or(&hit.url).trim_end_matches('/').to_lowercase();
+
+        match places.get(&key) {
+            Some(&place) => kept[place].is_new |= hit.is_new,
+            None => {
+                places.insert(key, kept.len());
+                kept.push(hit);
+            }
+        }
+    }
+
+    kept
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -814,7 +837,8 @@ pub(crate) mod tests {
         assert_eq!(store.states("COMIC E×E 11").await.unwrap().keys().collect::<Vec<_>>(), ["Times"]);
         let asked: Vec<_> = outcome.sites.iter().map(|site| (site.website.as_str(), site.queries.clone())).collect();
         assert_eq!(asked, [("Plain", vec!["COMIC ExE 11".to_string()]), ("Times", vec!["COMIC E×E 11".to_string()])]);
-        assert_eq!(outcome.total, 4, "both sites answer, and the sign does not matter to the match");
+        // both sites answer (the same two addresses: they are 2 results, not 4), and the sign does not matter to the match
+        assert_eq!(outcome.total, 2);
 
         // the bot writes the sign as x already: between capitals it is put back for the site
         let outcome = engine.search(&Request { query: "COMIC ExE 12", live: Live::Diff, limit: 10 }).await.unwrap();
@@ -956,6 +980,22 @@ pub(crate) mod tests {
         assert_eq!(titles.len(), 0, "the paths are the same for every query, so a page keeps the last title the site gave");
         assert_eq!(outcome.sites[0].status, "not searched");
         assert_eq!(requests(&hits), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn the_same_address_is_one_result() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+
+        // one page saved with and without the slash at the end, and a different page
+        store.save("a", "Good", 1, &Ok(vec![work("/work/10/", "alpha one"), work("/work/11", "alpha two")]), false).await.unwrap();
+        store.save("b", "Good", 2, &Ok(vec![work("/work/10", "alpha one")]), false).await.unwrap();
+
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("alpha") }).await.unwrap();
+
+        assert_eq!(outcome.total, 2, "the total counts a page once");
+        assert_eq!(outcome.results.len(), 2);
+        assert_eq!(outcome.results.iter().filter(|hit| hit.title == "alpha one").count(), 1);
     }
 
     #[tokio::test]

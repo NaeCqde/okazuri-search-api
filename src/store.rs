@@ -8,6 +8,7 @@
 
 use crate::entity::{listing, search, work};
 use crate::query::title_key;
+use crate::sites::toggle_slash;
 use crate::utils::Result;
 use sea_orm::sea_query::{Expr, Index, OnConflict};
 use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -140,6 +141,16 @@ impl SearchStore {
         let transaction = self.db.begin().await?;
         let mut new = Vec::new();
 
+        // a page that is saved already with the other form of its path (`/g/1/` and `/g/1`) is that page
+        let same;
+        let outcome = match outcome {
+            Ok(listed) => {
+                same = Ok(Self::same_pages(&transaction, website, listed).await?);
+                &same
+            }
+            Err(_) => outcome,
+        };
+
         match outcome {
             Ok(listed) => {
                 new = Self::save_works(&transaction, website, now, listed).await?;
@@ -235,6 +246,76 @@ impl SearchStore {
         }
 
         Ok(removed)
+    }
+
+    /// The listed works with the path they are saved under. `/g/1/` and `/g/1` are one page, so a site that writes the
+    /// address in two ways does not make two works:
+    /// - a page listed in both forms is listed once, without the slash (a site that writes it that way does not need it);
+    /// - a page that is saved with the slash and is listed now without it is **renamed**: the saved row (and the lists
+    ///   that name it) get the path without the slash;
+    /// - a page that is listed with the slash and is saved without it stays as it is saved.
+    /// A page that is listed only with the slash and is not saved is saved with the slash.
+    async fn same_pages(db: &impl ConnectionTrait, website: &str, listed: &[NewWork]) -> Result<Vec<NewWork>> {
+        let ends_with_slash = |path: &str| path.split('?').next().is_some_and(|base| base.ends_with('/') && base != "/");
+
+        // each page once, in the order of the list; the form without the slash when the list has it
+        let mut places: HashMap<String, usize> = HashMap::new();
+        let mut kept: Vec<NewWork> = Vec::new();
+
+        for item in listed {
+            let key = if ends_with_slash(&item.path) { toggle_slash(&item.path) } else { item.path.clone() };
+
+            match places.get(&key) {
+                Some(&place) => {
+                    if ends_with_slash(&kept[place].path) && !ends_with_slash(&item.path) {
+                        kept[place].path = item.path.clone();
+                    }
+                }
+                None => {
+                    places.insert(key, kept.len());
+                    kept.push(item.clone());
+                }
+            }
+        }
+
+        let wanted: Vec<String> = kept.iter().flat_map(|w| [w.path.clone(), toggle_slash(&w.path)]).collect();
+        let saved: HashSet<String> = work::Entity::find()
+            .filter(work::Column::Website.eq(website))
+            .filter(work::Column::Path.is_in(wanted))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+
+        for item in &mut kept {
+            let other = toggle_slash(&item.path);
+
+            if saved.contains(&item.path) || !saved.contains(&other) {
+                continue;
+            }
+
+            if ends_with_slash(&item.path) {
+                // listed with the slash, saved without: the saved form stays
+                item.path = other;
+            } else {
+                // listed without the slash, saved with it: the saved page gets the path without
+                work::Entity::update_many()
+                    .col_expr(work::Column::Path, Expr::value(item.path.clone()))
+                    .filter(work::Column::Website.eq(website))
+                    .filter(work::Column::Path.eq(other.as_str()))
+                    .exec(db)
+                    .await?;
+                listing::Entity::update_many()
+                    .col_expr(listing::Column::Path, Expr::value(item.path.clone()))
+                    .filter(listing::Column::Website.eq(website))
+                    .filter(listing::Column::Path.eq(other.as_str()))
+                    .exec(db)
+                    .await?;
+            }
+        }
+
+        Ok(kept)
     }
 
     /// Adds the works that are not saved, updates the ones whose title changed. Returns the paths of the new ones.
@@ -447,6 +528,34 @@ mod tests {
         let one = store.candidates(None).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
         assert_eq!((one.title.as_str(), one.updated_at, one.first_seen), ("One (2nd)", 300, 100));
         assert_eq!(one.title_key, "one(2nd)", "the key follows the title");
+    }
+
+    #[tokio::test]
+    async fn a_page_written_with_and_without_the_slash_is_one_work_and_a_slash_less_path_replaces_the_one_with_it() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One"), link("/g/3", "Three")]), false).await.unwrap();
+        // later the site writes /g/1 without the slash, /g/3 with it; and /g/2 in both forms at once
+        let new = store
+            .save("q2", "A", 200, &Ok(vec![link("/g/1", "One (new title)"), link("/g/3/", "Three"), link("/g/2/", "Two"), link("/g/2", "Two")]), false)
+            .await
+            .unwrap();
+
+        let saved = store.candidates(None).await.unwrap();
+        let mut paths: Vec<_> = saved.iter().map(|w| (w.path.as_str(), w.title.as_str(), w.first_seen)).collect();
+        paths.sort();
+
+        assert_eq!(
+            paths,
+            [("/g/1", "One (new title)", 100), ("/g/2", "Two", 200), ("/g/3", "Three", 100)],
+            "/g/1 replaces /g/1/ (the same row: first_seen stays), /g/3 stays without the slash, /g/2 is saved once, without the slash"
+        );
+        assert_eq!(new, ["/g/2"]);
+
+        // the list of the first query follows the rename, so it is not read as a work that is gone
+        let gone = store.save("q", "A", 300, &Ok(vec![link("/g/1", "One (new title)")]), true).await.unwrap();
+        assert!(gone.is_empty());
+        assert!(store.candidates(None).await.unwrap().iter().any(|w| w.path == "/g/1"));
     }
 
     #[tokio::test]
