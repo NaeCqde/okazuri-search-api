@@ -877,6 +877,9 @@ impl Engine {
     /// the site may have the work now. `off` never asks the site. Returns the translations (the ones that are the whole
     /// title first) and whether they are the saved ones.
     pub async fn translate_hitomi(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
+        // only the title of the work: the circle, the artist, the event, the series and the tags around it are left out
+        let title = crate::query::work_title(text, from == Lang::Japanese);
+        let text = title.as_str();
         let key = crate::hitomi::squash(text);
 
         if key.is_empty() {

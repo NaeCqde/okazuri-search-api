@@ -110,6 +110,7 @@ English (its letters are all Latin) to Japanese. Any other text is a 422: only t
 ```json
 {
   "input": "姉弟でシたらいけません",
+  "title": "姉弟でシたらいけません",
   "from": "ja",
   "to": "en",
   "translation": "Kyoudai de Shitara Ikemasen",
@@ -125,6 +126,8 @@ English (its letters are all Latin) to Japanese. Any other text is a 422: only t
   "saved": false
 }
 ```
+
+**Only the title of the work is translated**: what the site puts around it is left out before Hitomi.La is asked (and before the translation is saved), and `title` says what was left: the event, the circle and the artist at the front (`(C103) [Circle (Artist)]`), the series, the tags and the language at the back (`(Series) [English] [DL版]`), and the other title after ` | ` or ` / ` (the one in the language of the text is kept). `[Yamamoto Zenzen] 学園サポ日記 comix 第1話 (COMIC Kuriberon DUMA 2025-09 Vol.76) [MTL]` is asked as `学園サポ日記 comix 第1話`. A text with nothing left (`【推しの子】`) is asked as it is. Google Translate gets the whole text.
 
 `translation` is the text of the first result in the other language (`null` when nothing answered). The Japanese gallery has the
 Japanese title, the galleries in English have the English one (the site has the Japanese words in the index of the galleries of

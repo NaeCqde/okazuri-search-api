@@ -188,7 +188,7 @@ async fn hitomila_translate(State(state): State<Arc<AppState>>, Query(params): Q
 
             json(
                 StatusCode::OK,
-                &serde_json::json!({ "input": text.trim(), "from": from.code(), "to": to.code(), "translation": translation, "saved": saved, "results": results }),
+                &serde_json::json!({ "input": text.trim(), "title": crate::query::work_title(&text, from == Lang::Japanese), "from": from.code(), "to": to.code(), "translation": translation, "saved": saved, "results": results }),
             )
         }
         Err(e) => {
