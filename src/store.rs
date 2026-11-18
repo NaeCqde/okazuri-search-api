@@ -248,11 +248,37 @@ impl SearchStore {
         Ok(removed)
     }
 
-    /// The listed works with the path they are saved under: a work that is not saved with this path but is saved with
-    /// the other form of it (the slash at the end put on or taken off) is that saved work, so a site that writes the
-    /// address in two ways does not make two works. The saved form stays. A page listed twice is listed once.
+    /// The listed works with the path they are saved under. `/g/1/` and `/g/1` are one page, so a site that writes the
+    /// address in two ways does not make two works:
+    /// - a page listed in both forms is listed once, without the slash (a site that writes it that way does not need it);
+    /// - a page that is saved with the slash and is listed now without it is **renamed**: the saved row (and the lists
+    ///   that name it) get the path without the slash;
+    /// - a page that is listed with the slash and is saved without it stays as it is saved.
+    /// A page that is listed only with the slash and is not saved is saved with the slash.
     async fn same_pages(db: &impl ConnectionTrait, website: &str, listed: &[NewWork]) -> Result<Vec<NewWork>> {
-        let wanted: Vec<String> = listed.iter().flat_map(|w| [w.path.clone(), toggle_slash(&w.path)]).collect();
+        let ends_with_slash = |path: &str| path.split('?').next().is_some_and(|base| base.ends_with('/') && base != "/");
+
+        // each page once, in the order of the list; the form without the slash when the list has it
+        let mut places: HashMap<String, usize> = HashMap::new();
+        let mut kept: Vec<NewWork> = Vec::new();
+
+        for item in listed {
+            let key = if ends_with_slash(&item.path) { toggle_slash(&item.path) } else { item.path.clone() };
+
+            match places.get(&key) {
+                Some(&place) => {
+                    if ends_with_slash(&kept[place].path) && !ends_with_slash(&item.path) {
+                        kept[place].path = item.path.clone();
+                    }
+                }
+                None => {
+                    places.insert(key, kept.len());
+                    kept.push(item.clone());
+                }
+            }
+        }
+
+        let wanted: Vec<String> = kept.iter().flat_map(|w| [w.path.clone(), toggle_slash(&w.path)]).collect();
         let saved: HashSet<String> = work::Entity::find()
             .filter(work::Column::Website.eq(website))
             .filter(work::Column::Path.is_in(wanted))
@@ -262,27 +288,30 @@ impl SearchStore {
             .map(|row| row.path)
             .collect();
 
-        let mut places: HashMap<String, usize> = HashMap::new();
-        let mut kept: Vec<NewWork> = Vec::new();
-
-        for item in listed {
+        for item in &mut kept {
             let other = toggle_slash(&item.path);
-            let saved_form = saved.contains(&item.path) || saved.contains(&other);
-            let path = if !saved.contains(&item.path) && saved.contains(&other) { other.clone() } else { item.path.clone() };
-            // the two forms are one page: the key is the form without the slash
-            let key = if item.path.split('?').next().is_some_and(|base| base.ends_with('/') && base != "/") { other } else { item.path.clone() };
 
-            match places.get(&key) {
-                Some(&place) => {
-                    // listed in both forms: the one without the slash (the site writes it too), unless a form is saved already
-                    if !saved_form && kept[place].path.split('?').next().is_some_and(|base| base.ends_with('/')) && key == item.path {
-                        kept[place].path = path;
-                    }
-                }
-                None => {
-                    places.insert(key, kept.len());
-                    kept.push(NewWork { path, ..item.clone() });
-                }
+            if saved.contains(&item.path) || !saved.contains(&other) {
+                continue;
+            }
+
+            if ends_with_slash(&item.path) {
+                // listed with the slash, saved without: the saved form stays
+                item.path = other;
+            } else {
+                // listed without the slash, saved with it: the saved page gets the path without
+                work::Entity::update_many()
+                    .col_expr(work::Column::Path, Expr::value(item.path.clone()))
+                    .filter(work::Column::Website.eq(website))
+                    .filter(work::Column::Path.eq(other.as_str()))
+                    .exec(db)
+                    .await?;
+                listing::Entity::update_many()
+                    .col_expr(listing::Column::Path, Expr::value(item.path.clone()))
+                    .filter(listing::Column::Website.eq(website))
+                    .filter(listing::Column::Path.eq(other.as_str()))
+                    .exec(db)
+                    .await?;
             }
         }
 
@@ -502,19 +531,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_page_written_with_and_without_the_slash_is_one_work_and_the_saved_form_stays() {
+    async fn a_page_written_with_and_without_the_slash_is_one_work_and_a_slash_less_path_replaces_the_one_with_it() {
         let store = SearchStore::in_memory().await.unwrap();
 
-        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One")]), false).await.unwrap();
-        // later the site writes it without the slash; and a page that is listed in both forms at once
-        let new = store.save("q2", "A", 200, &Ok(vec![link("/g/1", "One (new title)"), link("/g/2", "Two"), link("/g/2/", "Two")]), false).await.unwrap();
+        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One"), link("/g/3", "Three")]), false).await.unwrap();
+        // later the site writes /g/1 without the slash, /g/3 with it; and /g/2 in both forms at once
+        let new = store
+            .save("q2", "A", 200, &Ok(vec![link("/g/1", "One (new title)"), link("/g/3/", "Three"), link("/g/2/", "Two"), link("/g/2", "Two")]), false)
+            .await
+            .unwrap();
 
         let saved = store.candidates(None).await.unwrap();
-        let mut paths: Vec<_> = saved.iter().map(|w| (w.path.as_str(), w.title.as_str())).collect();
+        let mut paths: Vec<_> = saved.iter().map(|w| (w.path.as_str(), w.title.as_str(), w.first_seen)).collect();
         paths.sort();
 
-        assert_eq!(paths, [("/g/1/", "One (new title)"), ("/g/2", "Two")], "no second row; the first form stays");
+        assert_eq!(
+            paths,
+            [("/g/1", "One (new title)", 100), ("/g/2", "Two", 200), ("/g/3", "Three", 100)],
+            "/g/1 replaces /g/1/ (the same row: first_seen stays), /g/3 stays without the slash, /g/2 is saved once, without the slash"
+        );
         assert_eq!(new, ["/g/2"]);
+
+        // the list of the first query follows the rename, so it is not read as a work that is gone
+        let gone = store.save("q", "A", 300, &Ok(vec![link("/g/1", "One (new title)")]), true).await.unwrap();
+        assert!(gone.is_empty());
+        assert!(store.candidates(None).await.unwrap().iter().any(|w| w.path == "/g/1"));
     }
 
     #[tokio::test]
