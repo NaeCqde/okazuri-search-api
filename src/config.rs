@@ -75,6 +75,12 @@ pub struct SearchConfig {
     pub disabled_sites: Vec<String>,
     /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
     pub try_unsupported: bool,
+    /// The address of `tools/google-translate-bridge` (a Chrome that makes the token of Google Translate), such as
+    /// `http://100.64.0.1:8130`. Empty: Google Translate is asked without the token, which gets the answer of the classic
+    /// model.
+    pub google_bridge_url: String,
+    /// What the bridge wants in `Authorization: Bearer` (its `BRIDGE_TOKEN`); empty for none.
+    pub google_bridge_token: String,
 }
 
 impl Default for SearchConfig {
@@ -92,6 +98,8 @@ impl Default for SearchConfig {
             max_results: 100,
             disabled_sites: Vec::new(),
             try_unsupported: false,
+            google_bridge_url: String::new(),
+            google_bridge_token: String::new(),
         }
     }
 }

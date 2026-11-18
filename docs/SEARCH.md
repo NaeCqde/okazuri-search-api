@@ -161,13 +161,16 @@ The same rules for `q` (Japanese or English, the direction follows), and the sam
 
 Google Translate is asked the way its web page asks (the RPC `MkEWBc` of `translate.google.com`, the request of the model that the
 page calls Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. Only the Advanced model is used, and the test
-`gtranslate::tests::the_advanced_model_...` (`cargo test -- --ignored`, it asks Google) is how a change is noticed: the request works when
+`gtranslate::tests::the_advanced_model_...` (`cargo test -- --ignored`, it asks Google) is how a change is noticed: it works when
 `パエトーン強襲戦` comes back as `The Phaethon Assault` (the classic model says `The Battle of Phaeton`), and any other answer means that
-Google changed. **At the moment the test fails**, and it is known why (checked 2026-11-19 in the browser): the page's own request has the same URL
-parameters and the same body as this one, plus the header `x-goog-batchexecute-bgr` (a token of Google's bot check). With the token the
-answer is `The Phaethon Assault` (`[[3],[[6,3]]]`); without it (also when the page itself sends a typed request, with 高度 selected) it is
-`Assault on Phaeton` (`[[0],[[6,1]]]`). The token is made for one request: it is accepted again for the same text (also with another `_reqid`),
-and not for another text. It cannot be made without running Google's script, so only a real browser (headless Chromium) can get it.
+Google changed. Without the bridge the test fails: the page's own request has the same URL parameters and body as this program's, plus the
+header `x-goog-batchexecute-bgr` (a token of Google's bot check); with it the answer is `The Phaethon Assault` (`[[3],[[6,3]]]`), without it
+`Assault on Phaeton` (`[[0],[[6,1]]]`). The token is made for one text (the same text again is accepted, also with another `_reqid`) and is
+checked with the `User-Agent` and `Referer` of the page, not with its cookies. It cannot be made without running Google's script, so
+`tools/google-translate-bridge` (a Chrome with no window, `node server.mjs`, see its README) makes it: `GET /token` opens the page with the
+text, holds back the page's own request and hands it over, and this program sends it (`reqwest`, with gzip). `[search] google_bridge_url`
+(and `google_bridge_token`) is its address; when it is set and it is down, Google Translate fails (there is no fallback to the classic answer,
+which would be saved for good). To run the test with the bridge: `OKAZURI_GOOGLE_BRIDGE=http://127.0.0.1:8130 cargo test -- --ignored`.
 
 ```json
 { "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "Assault on Phaeton", "saved": false }

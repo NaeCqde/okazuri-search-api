@@ -57,20 +57,82 @@ async fn wait_turn() {
     *last = Some(tokio::time::Instant::now());
 }
 
-/// Asks Google Translate.
-pub async fn translate(client: &reqwest::Client, text: &str, from: Lang, to: Lang) -> Result<String, String> {
+/// Where the token is made: `tools/google-translate-bridge` (a Chrome), or nowhere (the url is empty).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Bridge<'a> {
+    pub url: &'a str,
+    pub token: &'a str,
+}
+
+/// The request that the page of Google Translate made for a text, held back by the bridge.
+#[derive(Debug, serde::Deserialize)]
+struct PageRequest {
+    url: String,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Token {
+    model: u8,
+    request: PageRequest,
+}
+
+/// The headers of the page's request that the token is made for (the browser makes the rest, and the token is checked against these).
+const TOKEN_HEADERS: [&str; 5] = ["x-goog-batchexecute-bgr", "content-type", "x-same-domain", "user-agent", "referer"];
+
+/// The request of the page for this text, with its token, from the bridge.
+async fn token(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: Lang, to: Lang) -> Result<Token, String> {
+    let mut request = client
+        .get(format!("{}/token", bridge.url.trim_end_matches('/')))
+        .query(&[("from", from.code()), ("to", to.code()), ("text", text)])
+        .timeout(std::time::Duration::from_secs(60));
+    if !bridge.token.is_empty() {
+        request = request.bearer_auth(bridge.token);
+    }
+
+    let response = request.send().await.map_err(|e| format!("the bridge of Google Translate: {e}"))?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let said = response.text().await.unwrap_or_default();
+
+        return Err(format!("the bridge of Google Translate answered {status}: {}", said.chars().take(200).collect::<String>()));
+    }
+
+    let token: Token = response.json().await.map_err(|e| format!("the bridge of Google Translate: {e}"))?;
+
+    if token.model != MODEL_ADVANCED {
+        return Err(format!("the bridge made the request of the model {}, not the Advanced one", token.model));
+    }
+
+    Ok(token)
+}
+
+/// Asks Google Translate. With a bridge, the request is the one that the page made (the browser only made its token, and its own
+/// request was held back), sent from here; without one it is the request of this program, which has no token and gets the answer of
+/// the classic model.
+pub async fn translate(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: Lang, to: Lang) -> Result<String, String> {
+    let failed = |e: reqwest::Error| format!("Google Translate: {e}");
+
     wait_turn().await;
 
-    let failed = |e: reqwest::Error| format!("Google Translate: {e}");
-    let body = client
-        .post(URL)
-        .form(&[("f.req", request(text, from, to))])
-        .send()
-        .await
-        .map_err(failed)?
-        .text()
-        .await
-        .map_err(failed)?;
+    let response = if bridge.url.is_empty() {
+        client.post(URL).form(&[("f.req", request(text, from, to))]).send().await.map_err(failed)?
+    } else {
+        let page = token(client, bridge, text, from, to).await?.request;
+        let mut sent = client.post(&page.url).body(page.body);
+
+        for (name, value) in &page.headers {
+            if TOKEN_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                sent = sent.header(name, value);
+            }
+        }
+
+        sent.send().await.map_err(failed)?
+    };
+
+    let body = response.text().await.map_err(failed)?;
 
     parse(&body).ok_or_else(|| "Google Translate: no translation in the answer".to_string())
 }
@@ -96,9 +158,67 @@ mod tests {
     #[ignore = "asks Google Translate"]
     async fn the_advanced_model_translates_paeton_kyoushuusen_the_way_gemini_does() {
         let client = reqwest::Client::new();
-        let translated = translate(&client, "パエトーン強襲戦", Lang::Japanese, Lang::English).await.unwrap();
+        // the token needs the bridge: `OKAZURI_GOOGLE_BRIDGE=http://127.0.0.1:8130` (and `OKAZURI_GOOGLE_BRIDGE_TOKEN`)
+        let (url, secret) = (std::env::var("OKAZURI_GOOGLE_BRIDGE").unwrap_or_default(), std::env::var("OKAZURI_GOOGLE_BRIDGE_TOKEN").unwrap_or_default());
+        let translated = translate(&client, Bridge { url: &url, token: &secret }, "パエトーン強襲戦", Lang::Japanese, Lang::English).await.unwrap();
 
         assert_eq!(translated, "The Phaethon Assault", "Google Translate changed: it is not the answer of the Advanced (Gemini) model any more");
+    }
+
+    /// A bridge and a "Google" on one local server: the request that the bridge hands over is sent by `translate`, with the headers of the
+    /// token and no others of the page, and the answer of Google is the translation.
+    #[tokio::test]
+    async fn the_request_of_the_page_is_sent_from_here_with_its_token() {
+        use axum::extract::Query;
+        use axum::http::HeaderMap;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::collections::HashMap;
+
+        let answer = ")]}'\n\n100\n[[\"wrb.fr\",\"MkEWBc\",\"[[null,null,null,null,null,null,[\\\"姉弟\\\",\\\"ja\\\",\\\"en\\\",true,null,1]],[[[null,null,null,null,null,[[\\\"Siblings\\\",null,null,null,null,null,\\\"姉弟\\\",1]],null,null,null,[]]],\\\"en\\\",1,\\\"ja\\\"],\\\"ja\\\",null,null,null,null,[[[3],[[6,3]]]]]\",null,null,null,\"generic\"]]\n";
+        let router = Router::new()
+            .route(
+                "/token",
+                get(|headers: HeaderMap, Query(asked): Query<HashMap<String, String>>| async move {
+                    let host = headers["host"].to_str().unwrap().to_string();
+                    assert_eq!(headers["authorization"], "Bearer secret");
+                    assert_eq!((asked["from"].as_str(), asked["to"].as_str(), asked["text"].as_str()), ("ja", "en", "姉弟"));
+
+                    Json(serde_json::json!({
+                        "model": 1,
+                        "request": {
+                            "url": format!("http://{host}/google"),
+                            "headers": { "x-goog-batchexecute-bgr": "TOKEN", "Referer": "https://translate.google.com/", "User-Agent": "Chrome", "cookie": "never sent" },
+                            "body": "f.req=BODY&"
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/google",
+                post(move |headers: HeaderMap, body: String| async move {
+                    assert_eq!(headers["x-goog-batchexecute-bgr"], "TOKEN");
+                    assert_eq!(headers["user-agent"], "Chrome");
+                    assert!(headers.get("cookie").is_none(), "only the headers of the token are sent");
+                    assert_eq!(body, "f.req=BODY&");
+
+                    answer
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let translated = translate(&reqwest::Client::new(), Bridge { url: &url, token: "secret" }, "姉弟", Lang::Japanese, Lang::English).await.unwrap();
+
+        assert_eq!(translated, "Siblings");
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_is_down_is_an_error_not_the_classic_answer() {
+        let error = translate(&reqwest::Client::new(), Bridge { url: "http://127.0.0.1:1", token: "" }, "姉弟", Lang::Japanese, Lang::English).await.unwrap_err();
+
+        assert!(error.contains("the bridge of Google Translate"), "{error}");
     }
 
     #[test]

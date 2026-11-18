@@ -57,6 +57,12 @@ max_results = 100
 disabled_sites = []
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
 try_unsupported = false
+# Google Translate gives the Advanced (Gemini) answer only to a request that has a token of its bot check, which only a browser
+# makes. tools/google-translate-bridge is a Chrome (on a Mac, say) that makes the token and hands the request over; this program
+# sends it. Empty: no bridge, and the answer is the one of the classic model.
+google_bridge_url = ""
+# What the bridge wants in "Authorization: Bearer" (its BRIDGE_TOKEN). Empty for none.
+google_bridge_token = ""
 
 # A copy of the magazine tables (magazines and numbers) of the Worker's D1 database. The server asks D1 whether
 # the data changed (the Time Travel bookmark: no rows are read), and when it did, downloads the SQL that D1

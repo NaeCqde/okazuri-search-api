@@ -379,6 +379,11 @@ impl Engine {
         })
     }
 
+    /// Where the token of Google Translate is made (`gtranslate::Bridge`; empty: nowhere).
+    fn bridge(&self) -> crate::gtranslate::Bridge<'_> {
+        crate::gtranslate::Bridge { url: &self.config.google_bridge_url, token: &self.config.google_bridge_token }
+    }
+
     pub fn max_query_chars(&self) -> usize {
         self.config.max_query_chars
     }
@@ -917,7 +922,7 @@ impl Engine {
             }
         }
 
-        let translated = crate::gtranslate::translate(&self.client, text.trim(), from, from.other()).await?;
+        let translated = crate::gtranslate::translate(&self.client, self.bridge(), text.trim(), from, from.other()).await?;
         let translated = if from == Lang::Japanese { without_the(&translated) } else { translated };
 
         let (english, japanese) = if from == Lang::English { (text.trim().to_string(), translated) } else { (translated, text.trim().to_string()) };
@@ -1093,7 +1098,8 @@ impl crate::hitomi::Fetch for HitomiFetch<'_> {
             format!("{}{path}", crate::hitomi::ORIGIN)
         };
 
-        let mut request = self.engine.client.get(&url).header("Referer", "https://hitomi.la/");
+        // a range of a file is read as it is: no compression of it
+        let mut request = self.engine.client.get(&url).header("Referer", "https://hitomi.la/").header("Accept-Encoding", "identity");
         if let Some((from, to)) = range {
             request = request.header("Range", format!("bytes={from}-{to}"));
         }
