@@ -60,6 +60,9 @@ pub fn sources() -> Vec<(&'static str, Source)> {
 /// A list of pages goes on past empty pages at its very start, up to this many of them (the first pages of DLsite have no work that is out yet).
 const EMPTY_PAGES_AT_START: usize = 20;
 
+/// The waits, in seconds, before a page that failed is asked again (then the walk gives up until `retry_minutes` have passed).
+const STEP_RETRY_SECS: [u64; 4] = [5, 20, 60, 120];
+
 /// The most links one page of a list is read for.
 const MOST_LINKS: usize = 1000;
 
@@ -238,7 +241,7 @@ impl Crawler {
         let leading_empty = if name == "DLsite" && cursor.is_empty() { EMPTY_PAGES_AT_START } else { 0 };
 
         loop {
-            let step = self.step(index, source, &cursor, shard).await?;
+            let step = self.step_again(index, source, &cursor, shard).await?;
             let mut next = step.next.clone();
             let listed = step.links.len();
             if next.is_none() && matches!(source, Source::Pages(_)) && walk.pages < leading_empty {
@@ -269,6 +272,25 @@ impl Crawler {
         }
     }
 
+    /// `step`, asked again after a short wait when it fails (the sites answer 502, 504 and broken bodies now and then), so a walk does
+    /// not wait `retry_minutes` for every one of them. A ban of the address is not asked again.
+    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64)) -> std::result::Result<Step, String> {
+        let mut waits = STEP_RETRY_SECS.iter();
+
+        loop {
+            match self.step(index, source, cursor, shard).await {
+                Err(e) if !e.contains("banned") => match waits.next() {
+                    Some(secs) => {
+                        log::debug!("crawl {}: {e}, again in {secs} s", self.engine.site(index).def.name);
+                        tokio::time::sleep(Duration::from_secs(*secs)).await;
+                    }
+                    None => return Err(e),
+                },
+                other => return other,
+            }
+        }
+    }
+
     /// The page of the list at `cursor` (empty: the first), and where the next one is.
     async fn step(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64)) -> std::result::Result<Step, String> {
         let site = self.engine.site(index);
@@ -292,7 +314,12 @@ impl Crawler {
             }
             Source::Pages(template) => {
                 let number = page_number(cursor, shard);
-                let (page_url, body) = self.engine.get_page(index, &template.replace("{n}", &number.to_string())).await?;
+                // a page beyond the last one is a 404 (DLsite)
+                let (page_url, body) = match self.engine.get_page(index, &template.replace("{n}", &number.to_string())).await {
+                    Ok(page) => page,
+                    Err(e) if e == "HTTP 404" && number > 1 => return Ok(Step { links: Vec::new(), next: None }),
+                    Err(e) => return Err(e),
+                };
                 let links = site.read(&page_url, &body, MOST_LINKS)?;
                 let next = (!links.is_empty()).then(|| (number + shard.1).to_string());
 
