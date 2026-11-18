@@ -8,6 +8,7 @@
 
 use crate::entity::{listing, search, work};
 use crate::query::title_key;
+use crate::sites::toggle_slash;
 use crate::utils::Result;
 use sea_orm::sea_query::{Expr, Index, OnConflict};
 use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -140,6 +141,16 @@ impl SearchStore {
         let transaction = self.db.begin().await?;
         let mut new = Vec::new();
 
+        // a page that is saved already with the other form of its path (`/g/1/` and `/g/1`) is that page
+        let same;
+        let outcome = match outcome {
+            Ok(listed) => {
+                same = Ok(Self::same_pages(&transaction, website, listed).await?);
+                &same
+            }
+            Err(_) => outcome,
+        };
+
         match outcome {
             Ok(listed) => {
                 new = Self::save_works(&transaction, website, now, listed).await?;
@@ -235,6 +246,47 @@ impl SearchStore {
         }
 
         Ok(removed)
+    }
+
+    /// The listed works with the path they are saved under: a work that is not saved with this path but is saved with
+    /// the other form of it (the slash at the end put on or taken off) is that saved work, so a site that writes the
+    /// address in two ways does not make two works. The saved form stays. A page listed twice is listed once.
+    async fn same_pages(db: &impl ConnectionTrait, website: &str, listed: &[NewWork]) -> Result<Vec<NewWork>> {
+        let wanted: Vec<String> = listed.iter().flat_map(|w| [w.path.clone(), toggle_slash(&w.path)]).collect();
+        let saved: HashSet<String> = work::Entity::find()
+            .filter(work::Column::Website.eq(website))
+            .filter(work::Column::Path.is_in(wanted))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+
+        let mut places: HashMap<String, usize> = HashMap::new();
+        let mut kept: Vec<NewWork> = Vec::new();
+
+        for item in listed {
+            let other = toggle_slash(&item.path);
+            let saved_form = saved.contains(&item.path) || saved.contains(&other);
+            let path = if !saved.contains(&item.path) && saved.contains(&other) { other.clone() } else { item.path.clone() };
+            // the two forms are one page: the key is the form without the slash
+            let key = if item.path.split('?').next().is_some_and(|base| base.ends_with('/') && base != "/") { other } else { item.path.clone() };
+
+            match places.get(&key) {
+                Some(&place) => {
+                    // listed in both forms: the one without the slash (the site writes it too), unless a form is saved already
+                    if !saved_form && kept[place].path.split('?').next().is_some_and(|base| base.ends_with('/')) && key == item.path {
+                        kept[place].path = path;
+                    }
+                }
+                None => {
+                    places.insert(key, kept.len());
+                    kept.push(NewWork { path, ..item.clone() });
+                }
+            }
+        }
+
+        Ok(kept)
     }
 
     /// Adds the works that are not saved, updates the ones whose title changed. Returns the paths of the new ones.
@@ -447,6 +499,22 @@ mod tests {
         let one = store.candidates(None).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
         assert_eq!((one.title.as_str(), one.updated_at, one.first_seen), ("One (2nd)", 300, 100));
         assert_eq!(one.title_key, "one(2nd)", "the key follows the title");
+    }
+
+    #[tokio::test]
+    async fn a_page_written_with_and_without_the_slash_is_one_work_and_the_saved_form_stays() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One")]), false).await.unwrap();
+        // later the site writes it without the slash; and a page that is listed in both forms at once
+        let new = store.save("q2", "A", 200, &Ok(vec![link("/g/1", "One (new title)"), link("/g/2", "Two"), link("/g/2/", "Two")]), false).await.unwrap();
+
+        let saved = store.candidates(None).await.unwrap();
+        let mut paths: Vec<_> = saved.iter().map(|w| (w.path.as_str(), w.title.as_str())).collect();
+        paths.sort();
+
+        assert_eq!(paths, [("/g/1/", "One (new title)"), ("/g/2", "Two")], "no second row; the first form stays");
+        assert_eq!(new, ["/g/2"]);
     }
 
     #[tokio::test]
