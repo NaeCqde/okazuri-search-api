@@ -65,6 +65,20 @@ mod tests {
         );
     }
 
+    /// Asks Google Translate (the network): `cargo test -- --ignored`.
+    ///
+    /// The title of a work that was translated by hand is the proof of the model: the Advanced (Gemini) model of the page says
+    /// `The Phaethon Assault`, and the classic model says `The Battle of Phaeton`.
+    #[test]
+    #[ignore = "asks Google Translate"]
+    fn the_advanced_model_translates_paeton_kyoushuusen_the_way_gemini_does() {
+        let agent = ureq::Agent::new_with_defaults();
+        let translated = translate(&agent, "パエトーン強襲戦", Lang::Japanese, Lang::English).unwrap();
+
+        assert_ne!(translated, "The Battle of Phaeton", "this is the classic model");
+        assert_eq!(translated, "The Phaethon Assault", "the Advanced (Gemini) model says this; the classic one says The Battle of Phaeton");
+    }
+
     #[test]
     fn the_translation_is_read_from_the_answer() {
         let answer = ")]}'\n\n421\n[[\"wrb.fr\",\"MkEWBc\",\"[[null,null,null,[[[0,[[[null,8]],[true]]]],8],null,null,[\\\"パエトーン強襲戦\\\",\\\"ja\\\",\\\"en\\\",true,null,1]],[[[null,null,null,null,null,[[\\\"Assault on Phaeton\\\",null,null,null,null,null,\\\"パエトーン強襲戦\\\",1]],null,null,null,[]]],\\\"en\\\",1,\\\"ja\\\",[\\\"パエトーン強襲戦\\\",\\\"ja\\\",\\\"en\\\",true,null,1]],\\\"ja\\\",null,null,null,null,[[[0],[[6,1]]]]]\",null,null,null,\"generic\"],[\"di\",382]]\n25\n[[\"e\",4,null,null,505]]\n";

@@ -180,6 +180,10 @@ async fn google_translate(State(state): State<Arc<AppState>>, Query(params): Que
         Err(response) => return response,
     };
 
+    if live == Live::Off {
+        return invalid("live=off is not available for Google Translate (it is asked when nothing is saved): diff or on");
+    }
+
     match engine.translate_google(&text, from, live).await {
         Ok((found, saved)) => {
             let to = from.other();
@@ -377,9 +381,8 @@ mod tests {
         // Google Translate: the same input rules, and `off` with nothing saved is no translation
         assert_eq!(get_from(state.clone(), "/google/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), "/auto/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(get_from(state.clone(), &format!("/auto/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY);
         // the translator of a search
         assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}", encode("姉弟"))).await;

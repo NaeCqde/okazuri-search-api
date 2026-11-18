@@ -143,18 +143,26 @@ A site that does not answer is a 502; no `q`, a `q` that is not Japanese or Engl
 
 ### `GET /google/translate?q=<text>`: the same from Google Translate
 
-The same rules for `q` (Japanese or English, the direction follows) and `live`, and the same tables: the translation is saved with the
-source `google` (kept for good: `diff` and `off` answer with it, `on` asks Google again; `off` with nothing saved is a 502). Google
-Translate is asked the way its web page asks (the RPC `MkEWBc` of `translate.google.com`, with the model that the page calls
-Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. A title of one line
-came back the same from the Advanced and the classic model when this was written.
+The same rules for `q` (Japanese or English, the direction follows), and the same tables: the translation is saved with the source
+`google` (kept for good). `live=diff` (default) answers with the saved one, and `live=on` asks Google again. There is **no
+`live=off`** for Google Translate (a 422): it is asked whenever nothing is saved (in `/auto/translate` and in the search, `off` is
+`diff` for the Google part). A translation that was saved for the other direction answers too, when its title is the whole text
+(`十` → `Ten` saved, so `Ten` → `十`). A translation from Japanese to English does not start with `The` (`The Phaethon Assault` →
+`Phaethon Assault`): it is taken off before it is saved; the translation of Hitomi.La is left as the site writes it.
+
+Google Translate is asked the way its web page asks (the RPC `MkEWBc` of `translate.google.com`, the request of the model that the
+page calls Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. **It is not known
+that this request gets the Gemini model**: for `パエトーン強襲戦` the page says `The Phaethon Assault` when it opens with the text
+in its address (the answer has `[[3],[[6,3]]]` at the end), and this request (the one the page sends when the text is typed, with
+the model 1 or 2) gets `Assault on Phaeton` from both models (`[[0],[[6,1]]]`); the page sends a `x-goog-batchexecute-bgr` token with
+the request, which this program cannot make. The test `gtranslate::tests::the_advanced_model_...` (`cargo test -- --ignored`, it asks
+Google) says whether the request gets the Advanced answer.
 
 ```json
 { "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "Assault on Phaeton", "saved": false }
 ```
 
-The saved rows of Hitomi.La and of Google are separate (`translations.source`); a translation of Hitomi.La for the other direction
-answers `/hitomila/translate`, one of Google does not (a machine translation does not go back).
+The saved rows of Hitomi.La and of Google are separate (`translations.source`).
 
 ### `GET /auto/translate?q=<text>`
 

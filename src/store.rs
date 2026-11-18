@@ -379,15 +379,17 @@ impl SearchStore {
             .await?)
     }
 
-    /// The saved translations that have the text (as `hitomi::squash` writes it) in their English title (`english`) or in
-    /// their Japanese title, whatever text they were asked for: a translation Japanese to English answers English to
-    /// Japanese too. The newest saved first; the caller puts the whole titles first.
-    pub async fn translations_with(&self, english: bool, key: &str, limit: u64) -> Result<Vec<translation::Model>> {
+    /// The saved translations of a source (`hitomi` or `google`) that have the text (as `hitomi::squash` writes it) in
+    /// their English title (`english`) or in their Japanese title, whatever text they were asked for: a translation
+    /// Japanese to English answers English to Japanese too. With `exact` the title is the whole text (a machine translation
+    /// is the whole text). The newest saved first; the caller puts the whole titles first.
+    pub async fn translations_with(&self, source: &str, english: bool, key: &str, exact: bool, limit: u64) -> Result<Vec<translation::Model>> {
         let column = if english { translation::Column::EnglishKey } else { translation::Column::JapaneseKey };
+        let condition = if exact { column.eq(key) } else { column.contains(key) };
 
         Ok(translation::Entity::find()
-            .filter(column.contains(key))
-            .filter(translation::Column::Source.eq("hitomi"))
+            .filter(condition)
+            .filter(translation::Column::Source.eq(source))
             .order_by_desc(translation::Column::GalleryId)
             .limit(limit)
             .all(&self.db)
@@ -665,9 +667,12 @@ mod tests {
         assert_eq!(store.translations("nihongo", "hitomi").await.unwrap().len(), 1);
 
         // found from the other side: by the English title and by the Japanese one, whatever text was asked
-        assert_eq!(store.translations_with(true, "three", 10).await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
-        assert_eq!(store.translations_with(false, "日本", 10).await.unwrap().len(), 2, "the one of nihongo (replaced) and the one of other");
-        assert!(store.translations_with(true, "zzz", 10).await.unwrap().is_empty());
+        assert_eq!(store.translations_with("hitomi", true, "three", false, 10).await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
+        assert_eq!(store.translations_with("hitomi", false, "日本", false, 10).await.unwrap().len(), 2, "the one of nihongo (replaced) and the one of other");
+        assert!(store.translations_with("hitomi", true, "zzz", false, 10).await.unwrap().is_empty());
+        // Google's row: found by the whole title only
+        assert_eq!(store.translations_with("google", true, "two (machine)", true, 10).await.unwrap().len(), 1);
+        assert!(store.translations_with("google", true, "two", true, 10).await.unwrap().is_empty());
 
         // nothing answered: the lookup is noted all the same
         store.save_translations("nothing", "hitomi", "なし", "ja", 300, &[]).await.unwrap();

@@ -77,6 +77,16 @@ impl Plan {
     }
 }
 
+/// `The Phaethon Assault` -> `Phaethon Assault`: the English of a title does not need the `The` that a translation puts in front.
+fn without_the(english: &str) -> String {
+    let trimmed = english.trim();
+
+    match trimmed.split_once(char::is_whitespace) {
+        Some((first, rest)) if first.eq_ignore_ascii_case("the") && !rest.trim().is_empty() => rest.trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
 /// The two languages that are translated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -845,7 +855,7 @@ impl Engine {
 
         // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
         if live != Live::On {
-            let others = self.store.translations_with(from == Lang::English, &key, 20).await?;
+            let others = self.store.translations_with("hitomi", from == Lang::English, &key, false, 20).await?;
 
             if !others.is_empty() {
                 let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english_key.clone() } else { row.japanese_key.clone() };
@@ -877,7 +887,9 @@ impl Engine {
     }
 
     /// The translation of Google Translate (`gtranslate.rs`), saved in the same tables (source `google`, kept for good):
-    /// the saved one is the answer unless `live` is `on`, and `off` never asks Google. An error when there is none.
+    /// the saved one is the answer unless `live` is `on`, and so is a saved translation of the other direction when its title
+    /// is the whole text. Google is always asked when nothing is saved (there is no `off` for it: `off` is `diff`). In
+    /// English a translation from Japanese does not start with `The`: it is taken off (Google puts it in front of a title).
     pub async fn translate_google(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
         let key = crate::hitomi::squash(text);
 
@@ -889,8 +901,10 @@ impl Engine {
             if let Some(row) = self.store.translations(&key, "google").await?.into_iter().next() {
                 return Ok((Translation::from(row), true));
             }
-            if live == Live::Off {
-                return Err("no saved translation from Google Translate".into());
+
+            // the other direction, asked before: its other side is the text
+            if let Some(row) = self.store.translations_with("google", from == Lang::English, &key, true, 1).await?.into_iter().next() {
+                return Ok((Translation { exact: true, ..Translation::from(row) }, true));
             }
         }
 
@@ -898,6 +912,7 @@ impl Engine {
         let translated = tokio::task::spawn_blocking(move || crate::gtranslate::translate(&agent, &asked, from, from.other()))
             .await
             .map_err(|e| format!("the request task died: {e}"))??;
+        let translated = if from == Lang::Japanese { without_the(&translated) } else { translated };
 
         let (english, japanese) = if from == Lang::English { (text.trim().to_string(), translated) } else { (translated, text.trim().to_string()) };
         let translation = Translation { id: 0, url: String::new(), english, japanese, exact: false, source: "google".into() };
@@ -1364,6 +1379,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_the_of_a_translated_title_is_taken_off() {
+        assert_eq!(without_the("The Phaethon Assault"), "Phaethon Assault");
+        assert_eq!(without_the("the sister"), "sister");
+        assert_eq!(without_the("Theory of Love"), "Theory of Love");
+        assert_eq!(without_the("The"), "The");
+        assert_eq!(without_the("  Then and Now "), "Then and Now");
+    }
+
+    #[test]
     fn the_language_of_a_text_is_japanese_or_english_only() {
         assert_eq!(Lang::of("姉弟でシたらいけません"), Some(Lang::Japanese));
         assert_eq!(Lang::of("COMIC 快楽天 2026"), Some(Lang::Japanese));
@@ -1420,8 +1444,10 @@ pub(crate) mod tests {
         store.save_translations("十", "google", "十", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 0, url: String::new(), english: "Ten".into(), japanese: "十".into(), english_key: "ten".into(), japanese_key: "十".into(), source: "google".into(), ..row.clone() }]).await.unwrap();
         let (translation, saved) = engine.translate_google("十", Lang::Japanese, Live::Diff).await.unwrap();
         assert_eq!((translation.english.as_str(), translation.source.as_str(), saved), ("Ten", "google", true));
-        assert_eq!(engine.translate_google("十", Lang::Japanese, Live::Off).await.unwrap().0.english, "Ten");
-        assert!(engine.translate_google("百", Lang::Japanese, Live::Off).await.is_err(), "nothing saved, and `off` does not ask");
+        assert_eq!(engine.translate_google("十", Lang::Japanese, Live::Off).await.unwrap().0.english, "Ten", "`off` is `diff` for Google");
+        // the other direction: Japanese to English was saved, so English to Japanese is the saved one (the whole text only)
+        let (back, saved) = engine.translate_google("Ten", Lang::English, Live::Diff).await.unwrap();
+        assert_eq!((back.japanese.as_str(), saved), ("十", true));
 
         // a text that found nothing is asked again (`diff`), not taken from the lookup; `off` never asks
         store.save_translations("八", "hitomi", "八", "ja", unix_now(), &[]).await.unwrap();
