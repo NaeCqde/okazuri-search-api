@@ -276,7 +276,7 @@ for them.
 `language.rs` reads the languages from the title: the flag a site puts first, the marks of a translation (`[中国翻訳]`, `[汉化]`) and the
 brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). The answer is the two-letter codes joined with `,` in the order the title
 names them (`zh`, `en,ja`, `zh,en,ja,ko`), and NULL when the title says none (most titles are Japanese and do not say so). The search
-answers it as `language` (null when there is none). A database from before this has the column added, and the titles read, when it is opened. The
+answers it as `language`, a list of the codes in that order (`["zh", "en"]`; `[]` when there is none). A database from before this has the column added, and the titles read, when it is opened. The
 file of `export` does not have it: `import` makes it (as it makes the romaji and the key). When the rules change,
 `okazuri-search-api relanguage` reads every title again and writes the works that came out different (`reromanize` also writes it for the works whose romaji changed).
 

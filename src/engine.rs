@@ -51,8 +51,9 @@ pub struct Hit {
     pub title: String,
     /// The romaji of the title: what the query was matched with.
     pub title_romaji: String,
-    /// The language the title says (`language.rs`): a two-letter code (`zh`, `en`, `ja`); null when the title says none.
-    pub language: Option<String>,
+    /// The languages the title names (`language.rs`), as two-letter codes in the order it names them (`["zh", "en"]`); `[]` when it
+    /// names none.
+    pub language: Vec<String>,
     /// This request found the work on a site and saved it: it was not in the database before.
     pub is_new: bool,
 }
@@ -722,7 +723,7 @@ impl Engine {
                     path: work.path,
                     title: work.title,
                     title_romaji: work.title_romaji,
-                    language: work.language,
+                    language: work.language.map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
                     is_new,
                 });
             }
@@ -1870,5 +1871,19 @@ pub(crate) mod tests {
         let _ = engine.get_page(failing, &engine.site(failing).search_url("x").unwrap()).await;
         let _ = engine.get_page(failing, &engine.site(failing).search_url("y").unwrap()).await;
         assert!(started.elapsed() < Duration::from_millis(400), "another site is not slowed: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_language_of_a_result_is_a_list_and_empty_when_the_title_names_none() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+
+        store.save_crawled("Good", 1, &[work("/work/1", "kanojo [CN,EN,JP,KR]"), work("/work/2", "kanojo plain")], None).await.unwrap();
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
+        let languages: Vec<_> = outcome.results.iter().map(|hit| (hit.path.as_str(), hit.language.clone())).collect();
+
+        assert!(languages.contains(&("/work/1", vec!["zh".to_string(), "en".to_string(), "ja".to_string(), "ko".to_string()])), "{languages:?}");
+        assert!(languages.contains(&("/work/2", Vec::new())), "{languages:?}");
+        assert_eq!(serde_json::to_value(&outcome.results[0]).unwrap()["language"].is_array(), true);
     }
 }
