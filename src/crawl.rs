@@ -487,6 +487,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn after_a_pause_the_next_walk_goes_back_to_the_first_known_page() {
+        let (port, hits) = server(2, 5).await;
+        let (crawler, store) = crawler(port, CrawlConfig::default()).await;
+        let (index, source) = crawler.sources[0].clone();
+
+        // the list was read to its end a while ago, when it was only page 4 and 5 (the works of pages 1 to 3 came after)
+        for n in [4, 5] {
+            let page = crawler.step(index, &source, &n.to_string(), (0, 1)).await.unwrap();
+            let works = crawler.engine.works_of(page.links).await.unwrap();
+            store.save_crawled("Listed", 1, &works, Some(("", true))).await.unwrap();
+        }
+        hits.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let walk = crawler.walk(index, &source).await.unwrap();
+        assert_eq!(walk, Walk { pages: 4, new: 6, finished: false }, "pages 1 to 3 are new, page 4 is known");
+        assert_eq!(store.counts().await.unwrap().1, 10);
+
+        // the safety limit stops it early, and the next walk goes on from the newest page again
+        let limited = CrawlConfig { refresh_pages: 2, ..CrawlConfig::default() };
+        let (crawler, store) = self::crawler(port, limited).await;
+        let page = crawler.step(index, &source, "5", (0, 1)).await.unwrap();
+        let works = crawler.engine.works_of(page.links).await.unwrap();
+        store.save_crawled("Listed", 1, &works, Some(("", true))).await.unwrap();
+        assert_eq!(crawler.walk(index, &source).await.unwrap().pages, 2);
+    }
+
+    #[tokio::test]
     async fn a_shard_reads_every_nth_page() {
         let (port, hits) = server(2, 4).await;
         let (crawler, store) = crawler(port, CrawlConfig { shard: "1/2".to_string(), ..CrawlConfig::default() }).await;

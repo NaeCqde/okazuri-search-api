@@ -184,7 +184,8 @@ pub struct CrawlConfig {
     pub hitomi_index: String,
     /// How many galleries of Hitomi.La are read before the walk is saved.
     pub hitomi_batch: usize,
-    /// The most pages that one reading of the newest works goes back; it stops earlier at a page it knows.
+    /// The most pages that one reading of the newest works goes back. It stops at the first page it knows (every work of it saved), so
+    /// after a long pause it goes back as far as the pause was; this is only the safety against a list that never shows a known page.
     pub refresh_pages: usize,
     /// The wait after a site failed, before it is tried again.
     pub retry_minutes: u64,
@@ -200,7 +201,7 @@ impl Default for CrawlConfig {
             shard: "0/1".to_string(),
             hitomi_index: "index-all.nozomi".to_string(),
             hitomi_batch: 100,
-            refresh_pages: 20,
+            refresh_pages: 1000,
             retry_minutes: 10,
         }
     }

@@ -142,5 +142,6 @@ shard = "0/1"
 # index-all.nozomi (every language) or index-japanese.nozomi.
 hitomi_index = "index-all.nozomi"
 hitomi_batch = 100
-refresh_pages = 20
+# The newest pages are read until one is known (so a long pause is caught up); this is only the most pages of one reading.
+refresh_pages = 1000
 retry_minutes = 10
