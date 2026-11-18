@@ -16,7 +16,7 @@
 use crate::config::SearchConfig;
 use crate::query::{has_japanese, normalize, restore_times, romaji, tidy, Terms};
 use crate::romanizer::Romanizer;
-use crate::sites::{self, is_challenge, Link, Site, Support};
+use crate::sites::{self, is_challenge, Format, Link, Site, Support};
 use crate::store::{NewWork, SearchStore, SiteState};
 use crate::utils::{unix_now, Result};
 use serde::Serialize;
@@ -571,6 +571,11 @@ impl Engine {
     /// The request to a site (blocking). Waits for its turn first.
     fn request(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
         let site = &self.sites[index];
+
+        if site.def.format == Format::Hitomi {
+            return self.request_hitomi(index, query);
+        }
+
         let url = site.search_url(query).ok_or_else(|| "the site has no search".to_string())?;
 
         let mut asked_again = false;
@@ -620,9 +625,49 @@ impl Engine {
         site.read(&page_url, &body, self.config.max_results_per_site)
     }
 
+    /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
+    fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
+        let mut fetch = |path: &str, range: Option<(u64, u64)>| -> std::result::Result<Vec<u8>, String> {
+            self.wait_turn(index);
+
+            // the version is asked with a changing number, so that no cache answers with an old one
+            let url = if path.ends_with("/version") {
+                format!("{}{path}?_={}", crate::hitomi::ORIGIN, unix_now() * 1000)
+            } else {
+                format!("{}{path}", crate::hitomi::ORIGIN)
+            };
+
+            let mut request = self.agent.get(&url).header("Referer", "https://hitomi.la/");
+            if let Some((from, to)) = range {
+                request = request.header("Range", format!("bytes={from}-{to}"));
+            }
+
+            let mut response = request.call().map_err(|e| format!("{path}: {e}"))?;
+            let status = response.status().as_u16();
+
+            if status != 200 && status != 206 {
+                return Err(format!("{path}: HTTP {status}"));
+            }
+            if range.is_some() && status == 200 {
+                // the whole file of an index is far too big to read
+                return Err(format!("{path}: the site does not answer a Range request"));
+            }
+
+            response.body_mut().read_to_vec().map_err(|e| format!("{path}: {e}"))
+        };
+
+        crate::hitomi::search(&mut fetch, query, self.config.max_results_per_site)
+    }
+
     /// Keeps `min_delay_ms` (or the longer delay of the site) between two requests to the same site.
     fn wait_turn(&self, index: usize) {
-        let delay = Duration::from_millis(self.config.min_delay_ms.max(self.sites[index].def.delay_ms));
+        let site = &self.sites[index];
+        // Hitomi.La is asked a few dozen small files for one query, on a static host: its own short delay, not `min_delay_ms`
+        let delay = if site.def.format == Format::Hitomi {
+            Duration::from_millis(site.def.delay_ms)
+        } else {
+            Duration::from_millis(self.config.min_delay_ms.max(site.def.delay_ms))
+        };
         let mut last = self.gates[index].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(at) = *last {
@@ -1107,7 +1152,7 @@ pub(crate) mod tests {
         assert_eq!(info.len(), 28);
         assert!(info.iter().filter(|s| s.active).all(|s| s.support == "ready" && s.has_search));
         assert!(info.iter().any(|s| s.name == "IMHentai" && !s.active && s.support == "cloudflare"));
-        assert!(!info.iter().find(|s| s.name == "Hitomi.La").unwrap().active);
+        assert!(info.iter().find(|s| s.name == "Hitomi.La").unwrap().active, "it is searched through its index files");
 
         let trying = Engine::new(
             &SearchConfig { try_unsupported: true, ..config() },

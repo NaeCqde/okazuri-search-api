@@ -62,6 +62,8 @@ pub enum Format {
     /// JSON with the cards of the results, as HTML, in the array of this key (RokuHentai: the page is drawn
     /// by JavaScript from this answer).
     JsonCards(&'static str),
+    /// No page: the answer is read from the index files of the site (`hitomi.rs`).
+    Hitomi,
 }
 
 /// Where the list page of a site keeps the title of a work. A link whose card has the price, the number of
@@ -178,15 +180,21 @@ pub const SITES: &[SiteDef] = &[
             "the pattern matches every page of the site, so only product pages of the book store count",
         )
     },
-    site(
-        "Hitomi.La",
-        false,
-        "https://hitomi.la",
-        r"^https://hitomi\.la/[a-z]+/.+",
-        None,
-        Support::JavaScript,
-        "analysed (2026-10): the search is JavaScript over binary index files (SHA-256 of each word, a B-tree read with Range requests on ltn.gold-usergeneratedcontent.net), which gives gallery ids; the titles are one more file per id. Possible, but dozens of requests for one query, so it is not done",
-    ),
+    SiteDef {
+        format: Format::Hitomi,
+        // the index files are on a static host: a short wait between two of them is enough (a query is some 20 requests)
+        delay_ms: 150,
+        ..site(
+            "Hitomi.La",
+            false,
+            "https://hitomi.la",
+            r"^https://hitomi\.la/[a-z]+/.+",
+            // the page of the site that has the search box; this program does not ask it (`hitomi.rs`)
+            Some("https://hitomi.la/search.html?{q}"),
+            Support::Ready,
+            "no search page: the words of the query are looked up in the index files that the site's JavaScript reads (SHA-256 of a word, a B-tree, Range requests), the ids are intersected and the title of each gallery is read. The words of Japanese titles and of English titles are in the same index, so a query in Japanese finds the English titles too; the work is kept with both titles",
+        )
+    },
     site(
         "Anime-Sharing",
         false,
@@ -524,6 +532,7 @@ impl Site {
     pub fn read(&self, page_url: &str, body: &str, limit: usize) -> Result<Vec<Link>, String> {
         match self.def.format {
             Format::Html => Ok(self.extract(page_url, body, limit)),
+            Format::Hitomi => Err("the answer of this site is not a page".to_string()),
             Format::JsonCards(key) => {
                 let json: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("the answer is not JSON: {e}"))?;
                 let cards = json.get(key).and_then(|cards| cards.as_array()).ok_or_else(|| format!("the answer has no \"{key}\""))?;

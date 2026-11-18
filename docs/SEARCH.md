@@ -92,9 +92,9 @@ The answer:
 
 | | Sites |
 |---|---|
-| Searched | DLsite, FANZA, momon:GA, Nya:Hentai (now nyahentai.one), 同人の森, JComic, R18Best, Sukebei, RokuHentai, HentaiEnvy, HentaiEra, 177Picyy, Wnacg, AsmHentai, EHentai (15; all in Japanese and romaji, but HentaiEra and EHentai in romaji only) |
+| Searched | DLsite, FANZA, momon:GA, Nya:Hentai (now nyahentai.one), 同人の森, JComic, R18Best, Sukebei, RokuHentai, HentaiEnvy, HentaiEra, 177Picyy, Wnacg, AsmHentai, EHentai, Hitomi.La (16; all in Japanese and romaji, but HentaiEra and EHentai in romaji only) |
 | Cloudflare challenge | IMHentai, HentaiOMG, HentaiCore, NijiGazo, NukiBooks, HentaiName, HentaiPaw: a browser is needed |
-| JavaScript | Hitomi.La, Anime-Sharing (analysed, see below) |
+| JavaScript | Anime-Sharing (analysed, see below) |
 | Closed | MasDr, JMwu, BatoTo, HentaiDesi |
 
 The ones that cannot be searched are left out (`try_unsupported = true` tries them, and they fail). A site is one entry
@@ -106,9 +106,17 @@ DLsite answers 403 to `%20` in a path), and, if the title is not the text of the
 - **RokuHentai**: the page is drawn by JavaScript, but from a JSON answer of the same address (`/_search?q=`: `manga-cards` holds
   the cards as HTML, `next` the next page). That answer is read, so the site is searched. The reader (`/id/0`) and the details
   (`/id`) are one work.
-- **Hitomi.La**: the search is JavaScript over binary index files on `ltn.gold-usergeneratedcontent.net`: the SHA-256 of a word
-  (first 4 bytes) is looked up in a B-tree read with Range requests, which gives gallery ids, and the title of each id is one more
-  file (`galleries/<id>.js`). It can be done without a browser, but it is dozens of requests for one query, so it is not.
+- **Hitomi.La** (`src/hitomi.rs`): the search is JavaScript over binary index files on `ltn.gold-usergeneratedcontent.net`, and the program reads
+  the same files, with no browser. The SHA-256 of a word (first 4 bytes) is looked up in a B-tree (`galleriesindex/galleries.<version>.index`,
+  nodes of 464 bytes read with Range requests; the version is in `galleriesindex/version`), which gives where the list of the
+  galleries that have the word in their title is (in the `.data` file); the ids of the words are intersected (the shortest list first;
+  a word that is in no title is left out, a word in more than 500,000 titles is too), the newest `[search] max_results_per_site`
+  are kept, and the title of each is read from `galleries/<id>.js`. One query is some 20 requests of the index plus one per gallery,
+  each 150 ms after the last (this site has its own delay, not `min_delay_ms`); the index is a static host that answers quickly.
+  The words of the Japanese titles and of the English titles are in the same index, so a query in Japanese finds the English titles
+  too, and the other way round. The work is saved as `/galleries/<id>.html` (the site redirects it to the page) with the title
+  `<title> | <Japanese title>`: the romaji of that title has the Japanese words and the English ones, so a query in Japanese, in
+  romaji or in English matches it.
 - **Anime-Sharing**: the search is a POST with a token (XenForo), and the site answers a guest with its own 503 page.
 - **A Cloudflare challenge** (7 sites) is not passed by asking again: it was tried 4 times for each of the 7 sites, and every
   answer was a challenge. A browser is needed.
@@ -162,6 +170,6 @@ for them.
 
 ## Not done
 
-- A site behind a Cloudflare challenge, Hitomi.La and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.
+- A site behind a Cloudflare challenge and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.
 - The `[d1]` calls were written from the API as wrangler uses it and tested against a mock of it; run
   `okazuri-search-api sync` once with the token to see them work.

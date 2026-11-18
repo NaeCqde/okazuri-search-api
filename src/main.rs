@@ -4,6 +4,7 @@ mod config;
 mod cron;
 mod d1;
 mod engine;
+mod hitomi;
 mod entity;
 mod mirror;
 mod prefetch;
