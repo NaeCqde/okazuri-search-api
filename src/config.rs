@@ -16,6 +16,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub d1: D1Config,
     pub prefetch: PrefetchConfig,
+    pub crawl: CrawlConfig,
     pub cron: CronConfig,
     /// Word (as UniDic splits it) to the romaji it is replaced by.
     pub exceptions: BTreeMap<String, String>,
@@ -157,6 +158,45 @@ impl Default for PrefetchConfig {
             query_delay_ms: 2000,
             max_queries_per_round: 0,
             round_interval_minutes: 60,
+        }
+    }
+}
+
+/// Reading every work of the sites that list them all, in the background of the server (`crawl.rs`). Off unless `enabled` is true.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CrawlConfig {
+    pub enabled: bool,
+    /// When the newest works are read again, once the whole list was read (five fields, as in `[cron]`; the clock is `utc_offset`).
+    pub schedule: String,
+    pub utc_offset: String,
+    /// The sites to crawl, by name; empty is every site that can be.
+    pub sites: Vec<String>,
+    /// `k/N`: this machine reads the pages whose number leaves k when divided by N, so N machines (each with its own IP address) read
+    /// every site together without any one of them being the only one a site sees. `0/1` is the whole list.
+    pub shard: String,
+    /// The index file of Hitomi.La that lists the galleries: `index-all.nozomi`, or `index-japanese.nozomi` for the Japanese ones only.
+    pub hitomi_index: String,
+    /// How many galleries of Hitomi.La are read before the walk is saved.
+    pub hitomi_batch: usize,
+    /// The most pages that one reading of the newest works goes back; it stops earlier at a page it knows.
+    pub refresh_pages: usize,
+    /// The wait after a site failed, before it is tried again.
+    pub retry_minutes: u64,
+}
+
+impl Default for CrawlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "17 * * * *".to_string(),
+            utc_offset: "UTC".to_string(),
+            sites: Vec::new(),
+            shard: "0/1".to_string(),
+            hitomi_index: "index-all.nozomi".to_string(),
+            hitomi_batch: 100,
+            refresh_pages: 20,
+            retry_minutes: 10,
         }
     }
 }

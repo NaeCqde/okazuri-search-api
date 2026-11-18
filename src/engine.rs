@@ -398,6 +398,32 @@ impl Engine {
         Ok(normalize(&romaji(&normalize(text), &self.romanizer)?))
     }
 
+    /// The index of a site by its name, searched or not (the crawl reads sites that have no search too).
+    pub(crate) fn site_named(&self, name: &str) -> Option<usize> {
+        self.sites.iter().position(|site| site.def.name == name)
+    }
+
+    pub(crate) fn site(&self, index: usize) -> &Site {
+        &self.sites[index]
+    }
+
+    pub(crate) fn store(&self) -> &Arc<SearchStore> {
+        &self.store
+    }
+
+    /// The files of the index host of Hitomi.La, each one read after the turn of the site (`site` is its index).
+    pub(crate) fn hitomi(&self, index: usize) -> HitomiFetch<'_> {
+        HitomiFetch { engine: self, index }
+    }
+
+    /// The links of a page as works, with the romaji of their titles. The romaji is CPU work (the dictionary), so it is done
+    /// on a thread of its own.
+    pub(crate) async fn works_of(self: &Arc<Self>, links: Vec<Link>) -> std::result::Result<Vec<NewWork>, String> {
+        let worker = self.clone();
+
+        tokio::task::spawn_blocking(move || worker.with_romaji(links)).await.map_err(|e| e.to_string())
+    }
+
     /// The works of a list page with the romaji of their titles, which is what a query is matched with. A title
     /// that cannot be converted is its own romaji.
     fn with_romaji(&self, links: Vec<Link>) -> Vec<NewWork> {
@@ -566,14 +592,29 @@ impl Engine {
 
     /// Is the query fetched from every site (in every form a site is asked), and not too long ago? (The prefetch
     /// skips such a query.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn is_fresh(&self, query: &str) -> Result<bool> {
+        self.is_fresh_without(query, &[]).await
+    }
+
+    /// Like `is_fresh`, without the sites in `exclude`.
+    pub async fn is_fresh_without(&self, query: &str, exclude: &[usize]) -> Result<bool> {
         let plan = self.plan(query)?;
 
-        Ok(self.due(&plan, false, false, &[]).await?.is_empty())
+        Ok(self.due(&plan, false, false, exclude).await?.is_empty())
+    }
+
+    /// The searched sites whose whole list the crawl has read: their works are saved already, so the prefetch leaves them out and
+    /// only asks the sites that have no list.
+    pub async fn crawled_sites(&self) -> Result<Vec<usize>> {
+        let done = self.store.crawl_done().await?;
+
+        Ok(self.active.iter().copied().filter(|&index| done.iter().any(|name| name == self.sites[index].def.name)).collect())
     }
 
     /// Asks `query` to the sites whose answer is missing or older than `ttl_hours` (a failure: `retry_failed_minutes`),
     /// and saves the works that are new. A request asks the slow sites too (`slow_too`), the prefetch does not.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn fetch(self: &Arc<Self>, query: &str, slow_too: bool) -> Result<Fetched> {
         self.fetch_with(query, slow_too, false, &[]).await
     }
@@ -787,12 +828,20 @@ impl Engine {
         }
 
         let url = site.search_url(query).ok_or_else(|| "the site has no search".to_string())?;
+        let (page_url, body) = self.get_page(index, &url).await?;
 
+        site.read(&page_url, &body, self.config.max_results_per_site)
+    }
+
+    /// A page of a site (the address it ended at, and its text), after the turn of the site. A 429 is waited for once. A
+    /// Cloudflare challenge and any status but 200 are errors.
+    pub(crate) async fn get_page(&self, index: usize, url: &str) -> std::result::Result<(String, String), String> {
+        let site = &self.sites[index];
         let mut asked_again = false;
         let (status, page_url, body) = loop {
             self.wait_turn(index).await;
 
-            let mut request = self.client.get(&url).header("Accept-Language", "ja,en;q=0.8").header(
+            let mut request = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             );
@@ -832,7 +881,7 @@ impl Engine {
             return Err(format!("HTTP {status}"));
         }
 
-        site.read(&page_url, &body, self.config.max_results_per_site)
+        Ok((page_url, body))
     }
 
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
@@ -1082,7 +1131,7 @@ impl Engine {
 }
 
 /// Reads the files of the index host of Hitomi.La (the whole answer, or a range of it), each one after the turn of the site.
-struct HitomiFetch<'a> {
+pub(crate) struct HitomiFetch<'a> {
     engine: &'a Engine,
     index: usize,
 }

@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod config;
+mod crawl;
 mod cron;
 mod d1;
 mod engine;

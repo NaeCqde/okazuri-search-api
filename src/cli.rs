@@ -8,6 +8,7 @@ use crate::config::{self, Config};
 use crate::cron::{expand, Scheduler};
 use crate::d1::D1Client;
 use crate::engine::{Engine, Live, Request};
+use crate::crawl::Crawler;
 use crate::prefetch::Prefetcher;
 use crate::romanizer::{Loanwords, Romanizer};
 use crate::store::SearchStore;
@@ -261,6 +262,7 @@ fn d1_client(config: &Config) -> Result<D1Client> {
 struct Background {
     d1: Option<Arc<D1Client>>,
     prefetch: bool,
+    crawl: bool,
 }
 
 impl Background {
@@ -276,7 +278,11 @@ impl Background {
             }
         }
 
-        Ok(Self { d1, prefetch: config.prefetch.enabled })
+        if config.crawl.enabled && !config.search.enabled {
+            return Err("[crawl] needs [search] enabled = true".into());
+        }
+
+        Ok(Self { d1, prefetch: config.prefetch.enabled, crawl: config.crawl.enabled })
     }
 }
 
@@ -325,10 +331,11 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     log::info!("listening on http://{}", listener.local_addr()?);
     log::info!(
-        "search: {}, d1: {}, prefetch: {}, cron: {}",
+        "search: {}, d1: {}, prefetch: {}, crawl: {}, cron: {}",
         on_off(config.search.enabled),
         on_off(config.d1.enabled),
         on_off(config.prefetch.enabled),
+        on_off(config.crawl.enabled),
         on_off(scheduler.is_some()),
     );
 
@@ -343,9 +350,13 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
 
         tasks.push(tokio::spawn(sync_loop(d1, config.d1.mirror_path.clone(), interval, wake.clone())));
     }
+    if let (true, Some(engine)) = (background.crawl, engine.clone()) {
+        // checked here, with the engine: a site that is not known or a shard that is wrong stops the server before it listens
+        tasks.push(tokio::spawn(Arc::new(Crawler::new(engine, config.crawl.clone())?).run()));
+    }
     if let (true, Some(engine)) = (background.prefetch, engine) {
         let prefetcher =
-            Arc::new(Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()));
+            Arc::new(Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled));
 
         tasks.push(tokio::spawn(prefetcher.run(wake)));
     }
@@ -460,7 +471,7 @@ async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
     }
 
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
-    let prefetcher = Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone());
+    let prefetcher = Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled);
     let round = prefetcher.round().await?;
 
     println!(

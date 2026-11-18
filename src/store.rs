@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{listing, search, translation, translation_lookup, work};
+use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work};
 use crate::query::title_key;
 use crate::sites::toggle_slash;
 use crate::utils::Result;
@@ -100,7 +100,9 @@ impl SearchStore {
         let mut translation_lookups = schema.create_table_from_entity(translation_lookup::Entity);
         let mut translations = schema.create_table_from_entity(translation::Entity);
         db.execute(backend.build(works.if_not_exists())).await?;
+        let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
         db.execute(backend.build(searches.if_not_exists())).await?;
+        db.execute(backend.build(crawls.if_not_exists())).await?;
         db.execute(backend.build(listings.if_not_exists())).await?;
         db.execute(backend.build(translation_lookups.if_not_exists())).await?;
         db.execute(backend.build(translations.if_not_exists())).await?;
@@ -402,6 +404,58 @@ impl SearchStore {
         if !added.is_empty() {
             work::Entity::insert_many(added).exec_without_returning(db).await?;
         }
+
+        Ok(new)
+    }
+
+    /// Where the crawl of a site stands (None: it never ran).
+    pub async fn crawl_state(&self, website: &str) -> Result<Option<crawl_state::Model>> {
+        Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?)
+    }
+
+    /// The sites whose crawl read the whole list (so the works they list are saved, and a query does not need to ask them).
+    pub async fn crawl_done(&self) -> Result<Vec<String>> {
+        Ok(crawl_state::Entity::find().filter(crawl_state::Column::Done.eq(true)).all(&self.db).await?.into_iter().map(|row| row.website).collect())
+    }
+
+    /// The paths among `paths` that are saved already.
+    pub async fn known_paths(&self, website: &str, paths: &[String]) -> Result<HashSet<String>> {
+        Ok(work::Entity::find()
+            .filter(work::Column::Website.eq(website))
+            .filter(work::Column::Path.is_in(paths.iter().map(String::as_str)))
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| row.path)
+            .collect())
+    }
+
+    /// Saves the works of a page of the crawl (no query listed them, so no query can take them away again), and, in the same
+    /// transaction, where the walk stands (`state`: the cursor and whether the list is read to its end; None leaves it as it is).
+    /// Returns how many of the works were new.
+    pub async fn save_crawled(&self, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>) -> Result<usize> {
+        let transaction = self.db.begin().await?;
+        let works = Self::same_pages(&transaction, website, works).await?;
+        let new = Self::save_works(&transaction, website, now, &works).await?.len();
+
+        let before = crawl_state::Entity::find_by_id(website.to_string()).one(&transaction).await?;
+        let saved = before.as_ref().map_or(0, |row| row.saved) + new as i64;
+        let (cursor, done) = match (state, &before) {
+            (Some((cursor, done)), _) => (cursor.to_string(), done),
+            (None, Some(row)) => (row.cursor.clone(), row.done),
+            (None, None) => (String::new(), false),
+        };
+        let row = crawl_state::ActiveModel { website: Set(website.to_string()), cursor: Set(cursor), done: Set(done), saved: Set(saved), updated_at: Set(now) };
+        crawl_state::Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(crawl_state::Column::Website)
+                    .update_columns([crawl_state::Column::Cursor, crawl_state::Column::Done, crawl_state::Column::Saved, crawl_state::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec_without_returning(&transaction)
+            .await?;
+
+        transaction.commit().await?;
 
         Ok(new)
     }

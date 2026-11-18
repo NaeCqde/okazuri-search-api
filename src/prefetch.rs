@@ -20,6 +20,8 @@ pub struct Prefetcher {
     engine: Arc<Engine>,
     mirror_path: PathBuf,
     config: PrefetchConfig,
+    /// The crawl (`crawl.rs`) is on: the sites whose list it has read are not searched, only the sites that have no list.
+    crawled: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -38,7 +40,22 @@ pub struct Round {
 
 impl Prefetcher {
     pub fn new(engine: Arc<Engine>, mirror_path: PathBuf, config: PrefetchConfig) -> Self {
-        Self { engine, mirror_path, config }
+        Self { engine, mirror_path, config, crawled: false }
+    }
+
+    /// Leaves out the sites the crawl has read to their end (their works are saved), so the prefetch goes on only for the others.
+    pub fn with_crawl(mut self, on: bool) -> Self {
+        self.crawled = on;
+        self
+    }
+
+    /// The sites a query is not asked to in this round.
+    async fn left_out(&self) -> Result<Vec<usize>> {
+        if self.crawled {
+            self.engine.crawled_sites().await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// The queries of the issues, the newest issue first, each once. The engine turns them into romaji.
@@ -65,13 +82,17 @@ impl Prefetcher {
         }
 
         let total = queries.len();
+        let left_out = self.left_out().await?;
+        if !left_out.is_empty() {
+            log::info!("prefetch: {} sites are read by the crawl, not searched", left_out.len());
+        }
 
         for (number, query) in queries.into_iter().enumerate() {
-            if self.engine.is_fresh(&query).await? {
+            if self.engine.is_fresh_without(&query, &left_out).await? {
                 round.skipped += 1;
                 // the English title is looked up once (it is saved): a query that was searched before this existed gets it too
                 if has_japanese(&query) {
-                    self.search_english(&query, &mut round).await;
+                    self.search_english(&query, &left_out, &mut round).await;
                 }
                 continue;
             }
@@ -80,7 +101,7 @@ impl Prefetcher {
                 break;
             }
 
-            match self.engine.fetch(&query, false).await {
+            match self.engine.fetch_with(&query, false, false, &left_out).await {
                 Ok(fetched) => {
                     round.searched += 1;
                     log::info!(
@@ -97,7 +118,7 @@ impl Prefetcher {
             }
 
             if has_japanese(&query) {
-                self.search_english(&query, &mut round).await;
+                self.search_english(&query, &left_out, &mut round).await;
             }
 
             tokio::time::sleep(Duration::from_millis(self.config.query_delay_ms)).await;
@@ -109,7 +130,7 @@ impl Prefetcher {
     /// A query in Japanese is searched in English too: Hitomi.La has the English title of a work (`Engine::translate`, saved,
     /// so a title that was asked is not asked again while it is young), and the sites are searched for that title as well
     /// (the Japanese title and its romaji were searched before). A failure here is a warning: the query itself is done.
-    async fn search_english(&self, query: &str, round: &mut Round) {
+    async fn search_english(&self, query: &str, left_out: &[usize], round: &mut Round) {
         if !self.engine.can_translate() || Lang::of(query) != Some(Lang::Japanese) {
             return;
         }
@@ -130,7 +151,7 @@ impl Prefetcher {
             if english.is_empty() || english == query || !asked.insert(english.to_lowercase()) {
                 continue;
             }
-            match self.engine.is_fresh(english).await {
+            match self.engine.is_fresh_without(english, left_out).await {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => {
@@ -139,7 +160,7 @@ impl Prefetcher {
                 }
             }
 
-            match self.engine.fetch(english, false).await {
+            match self.engine.fetch_with(english, false, false, left_out).await {
                 Ok(fetched) => {
                     round.english += 1;
                     log::info!("prefetch: {query:?} in English {english:?}: {} sites asked, {} new works", fetched.asked.len(), fetched.new.len());
