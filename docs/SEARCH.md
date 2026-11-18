@@ -113,11 +113,19 @@ English (its letters are all Latin) to Japanese. Any other text is a 422: only t
 }
 ```
 
-`translation` is the text of the first result in the other language (`null` when nothing answered). A gallery is a result when the
-text, without the spaces and the marks (case does not matter), is in its title in the language of the text, and it has a title in
-the other language too (a gallery with one title is no translation). `exact` says it is the whole title; those come first, the
-others are the newest first, at most `[search] max_results_per_site` (20 at most). The English title is what the site gives
-(English, or the romaji of the Japanese one).
+`translation` is the text of the first result in the other language (`null` when nothing answered). Hitomi.La has no gallery that
+carries both the English and the Japanese title, so the **romaji** links them: the Japanese gallery is `Kyoudai de Shitara Ikemasen`
+(with `japanese_title`), the English one is `Siblings Shouldn't Do It! | Kyoudai de Shitara Ikemasen`. The flow is two lookups:
+
+1. the text is looked up (at most `[search] max_results_per_site` galleries, 20 at most): Japanese to English finds the gallery whose
+   Japanese title has the text, and takes its romaji; English to Japanese finds the `English | romaji` galleries whose English has the
+   text, and takes the romaji;
+2. the romaji (up to 3 of them) is looked up, and the galleries with exactly that romaji give the other side: the English title in
+   front of `| romaji` (the bonus and the other languages are other romaji), or the Japanese title.
+
+A gallery with an English title and its Japanese title in one title (`English | 日本語`) answers at once. `exact` says the text is the
+whole title (spaces, marks and case aside); those come first. Romaji alone (`Kyoudai de Shitara Ikemasen`) is not Japanese: it is
+English, and is looked up as an English title, so it has no translation unless some gallery has it in front of `|`.
 
 The answer is **saved** in its own tables of the search database: `translation_lookups` (`key`: the text as it is compared, letters
 and digits in lower case; `text`; `from_lang`; `looked_at`; `count`, so a text that nothing answered is not asked every time) and
