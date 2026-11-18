@@ -4,13 +4,14 @@
 //!   `okazuri_bot` called when it was the romaji API alone (`src/romaji.ts`).
 //! - `GET /okazuri/search?q=` (`[search] enabled`): the works found on the sites for the query, as JSON.
 //! - `GET /okazuri/sites` (`[search] enabled`): the sites, and whether each can be searched.
-//! - `GET /okazuri/translate?q=` (`[search] enabled`): Japanese to English or English to Japanese, from the titles of Hitomi.La, as JSON.
+//! - `GET /hitomila/translate?q=` (`[search] enabled`): Japanese to English or English to Japanese, from the titles of Hitomi.La, as JSON.
+//! - `GET /google/translate?q=` (`[search] enabled`): the same, from Google Translate.
 //! - `GET /health`: `ok`.
 //!
 //! A function that is off has no route, so it answers 404. A bad request is a 422 with
 //! `{"detail": "..."}`, as the FastAPI server this started from answered.
 
-use crate::engine::{Engine, Lang, Live, Request};
+use crate::engine::{Engine, Lang, Live, Request, Translator};
 use crate::romanizer::{Loanwords, Romanizer};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -33,7 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new().route("/health", get(health)).route("/romaji", get(romaji));
 
     if state.search.is_some() {
-        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/okazuri/translate", get(translate));
+        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate));
     }
 
     router.with_state(state)
@@ -77,6 +78,8 @@ struct SearchQuery {
     q: Option<String>,
     live: Option<String>,
     limit: Option<usize>,
+    /// The English title of a query in Japanese is searched too: `auto` (default), `hitomi`, `google` or `none`.
+    translator: Option<String>,
 }
 
 async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQuery>) -> Response {
@@ -95,9 +98,13 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
         return invalid("live is off, diff or on");
     };
 
+    let Some(translator) = Translator::parse(params.translator.as_deref().unwrap_or("")) else {
+        return invalid("translator is auto, hitomi, google or none");
+    };
+
     let limit = params.limit.unwrap_or(engine.max_results()).clamp(1, engine.max_results().max(1));
     // the engine turns the query into romaji first (nothing is added to it), and searches for that
-    let request = Request { query: &text, live, limit };
+    let request = Request { query: &text, live, limit, translator };
 
     match engine.search(&request).await {
         Ok(outcome) => json(StatusCode::OK, &outcome),
@@ -114,30 +121,40 @@ struct TranslateQuery {
     live: Option<String>,
 }
 
-/// A translation, from Japanese to English or from English to Japanese (the language of `q` says which): the titles of
-/// the works of Hitomi.La, which has both. The translations are saved.
-async fn translate(State(state): State<Arc<AppState>>, Query(params): Query<TranslateQuery>) -> Response {
-    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
+/// The text of a translation request: not empty, not too long, in Japanese or English (the direction); and `live`.
+fn translate_input(engine: &Engine, params: TranslateQuery) -> std::result::Result<(String, Lang, Live), Response> {
     let text = params.q.unwrap_or_default();
     let length = text.trim().chars().count();
 
     if length == 0 {
-        return invalid("q is required (at least 1 character)");
+        return Err(invalid("q is required (at least 1 character)"));
     }
     if length > engine.max_query_chars() {
-        return invalid(&format!("q is too long (at most {} characters)", engine.max_query_chars()));
+        return Err(invalid(&format!("q is too long (at most {} characters)", engine.max_query_chars())));
     }
 
     let Some(from) = Lang::of(&text) else {
-        return invalid("q must be Japanese or English (only Japanese to English and English to Japanese are translated)");
+        return Err(invalid("q must be Japanese or English (only Japanese to English and English to Japanese are translated)"));
     };
 
-    // like the search: the saved answer when it is young (diff, the default), only the saved one (off), the site always (on)
+    // like the search: the saved answer (diff, the default), only the saved one (off), the source always (on)
     let Some(live) = Live::parse(params.live.as_deref().unwrap_or("")) else {
-        return invalid("live is off, diff or on");
+        return Err(invalid("live is off, diff or on"));
     };
 
-    match engine.translate(&text, from, live, true).await {
+    Ok((text, from, live))
+}
+
+/// A translation, from Japanese to English or from English to Japanese (the language of `q` says which): the titles of
+/// the works of Hitomi.La, which has both. The translations are saved.
+async fn hitomila_translate(State(state): State<Arc<AppState>>, Query(params): Query<TranslateQuery>) -> Response {
+    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
+    let (text, from, live) = match translate_input(engine, params) {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+
+    match engine.translate_hitomi(&text, from, live).await {
         Ok((results, saved)) => {
             let to = from.other();
             let translation = results.first().map(|best| best.text(to));
@@ -148,8 +165,32 @@ async fn translate(State(state): State<Arc<AppState>>, Query(params): Query<Tran
             )
         }
         Err(e) => {
-            log::warn!("cannot translate {:?}: {}", text, e);
+            log::warn!("cannot translate {:?} with Hitomi.La: {}", text, e);
             json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Hitomi.La did not answer" }))
+        }
+    }
+}
+
+/// The same from Google Translate (the model of its page that is Gemini). The translation is saved: `live=on` asks again.
+async fn google_translate(State(state): State<Arc<AppState>>, Query(params): Query<TranslateQuery>) -> Response {
+    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
+    let (text, from, live) = match translate_input(engine, params) {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+
+    match engine.translate_google(&text, from, live).await {
+        Ok((found, saved)) => {
+            let to = from.other();
+
+            json(
+                StatusCode::OK,
+                &serde_json::json!({ "input": text.trim(), "from": from.code(), "to": to.code(), "translation": found.text(to), "saved": saved }),
+            )
+        }
+        Err(e) => {
+            log::warn!("cannot translate {:?} with Google Translate: {}", text, e);
+            json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Google Translate did not answer" }))
         }
     }
 }
@@ -290,7 +331,7 @@ mod tests {
         // the search is off in the state of the romaji tests
         assert_eq!(get_path("/okazuri/search?q=a").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/okazuri/sites").await.0, StatusCode::NOT_FOUND);
-        assert_eq!(get_path("/okazuri/translate?q=a").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_path("/hitomila/translate?q=a").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/romaji?q=a").await.0, StatusCode::OK);
     }
 
@@ -299,16 +340,22 @@ mod tests {
         // the engine of the tests has no Hitomi.La among its sites
         let (state, _) = search_state().await;
 
-        assert_eq!(get_from(state.clone(), "/okazuri/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(get_from(state.clone(), "/okazuri/translate?q=%20").await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(get_from(state.clone(), &format!("/okazuri/translate?q={}&live=maybe", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), "/hitomila/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), "/hitomila/translate?q=%20").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=maybe", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // only Japanese and English
-        assert_eq!(get_from(state.clone(), &format!("/okazuri/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // only the saved answers: nothing is saved, so nothing, and no request to the site
-        let (status, _, body) = get_from(state.clone(), &format!("/okazuri/translate?q={}&live=off", encode("姉弟"))).await;
+        let (status, _, body) = get_from(state.clone(), &format!("/hitomila/translate?q={}&live=off", encode("姉弟"))).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"saved\":true") && body.contains("\"results\":[]") && body.contains("\"from\":\"ja\"") && body.contains("\"translation\":null"), "{body}");
-        let (status, content_type, body) = get_from(state, &format!("/okazuri/translate?q={}", encode("姉弟"))).await;
+        // Google Translate: the same input rules, and `off` with nothing saved is no translation
+        assert_eq!(get_from(state.clone(), "/google/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY);
+        // the translator of a search
+        assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}", encode("姉弟"))).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(content_type.starts_with("application/json"));
         assert!(body.contains("did not answer"), "{body}");

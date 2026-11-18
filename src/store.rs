@@ -369,10 +369,11 @@ impl SearchStore {
         Ok(new)
     }
 
-    /// The translations that were saved for a text, in the order of the answer.
-    pub async fn translations(&self, key: &str) -> Result<Vec<translation::Model>> {
+    /// The translations of a source (`hitomi` or `google`) that were saved for a text, in the order of the answer.
+    pub async fn translations(&self, key: &str, source: &str) -> Result<Vec<translation::Model>> {
         Ok(translation::Entity::find()
             .filter(translation::Column::Key.eq(key))
+            .filter(translation::Column::Source.eq(source))
             .order_by_asc(translation::Column::Position)
             .all(&self.db)
             .await?)
@@ -395,19 +396,24 @@ impl SearchStore {
 
     /// Saves the answer for a text: the rows of an earlier answer are replaced (a gallery that is gone is gone), and the
     /// lookup is noted, also when nothing answered. `from` is the language of the text (`ja` or `en`).
-    pub async fn save_translations(&self, key: &str, text: &str, from: &str, now: i64, rows: &[translation::Model]) -> Result<()> {
+    pub async fn save_translations(&self, key: &str, source: &str, text: &str, from: &str, now: i64, rows: &[translation::Model]) -> Result<()> {
         let transaction = self.db.begin().await?;
 
-        translation::Entity::delete_many().filter(translation::Column::Key.eq(key)).exec(&transaction).await?;
+        translation::Entity::delete_many()
+            .filter(translation::Column::Key.eq(key))
+            .filter(translation::Column::Source.eq(source))
+            .exec(&transaction)
+            .await?;
 
         if !rows.is_empty() {
-            let active: Vec<translation::ActiveModel> = rows.iter().cloned().map(|row| translation::Model { key: key.to_string(), ..row }.into_active_model()).collect();
+            let active: Vec<translation::ActiveModel> = rows.iter().cloned().map(|row| translation::Model { key: key.to_string(), source: source.to_string(), ..row }.into_active_model()).collect();
 
             translation::Entity::insert_many(active).exec_without_returning(&transaction).await?;
         }
 
         let noted = translation_lookup::ActiveModel {
             key: Set(key.to_string()),
+            source: Set(source.to_string()),
             text: Set(text.to_string()),
             from_lang: Set(from.to_string()),
             looked_at: Set(now),
@@ -415,7 +421,7 @@ impl SearchStore {
         };
         translation_lookup::Entity::insert(noted)
             .on_conflict(
-                OnConflict::column(translation_lookup::Column::Key)
+                OnConflict::columns([translation_lookup::Column::Key, translation_lookup::Column::Source])
                     .update_columns([
                         translation_lookup::Column::Text,
                         translation_lookup::Column::FromLang,
@@ -641,15 +647,22 @@ mod tests {
             source: "hitomi".into(),
         };
 
-        store.save_translations("nihongo", "日本語", "ja", 100, &[row(2, 0, "Two"), row(1, 1, "One")]).await.unwrap();
-        let saved = store.translations("nihongo").await.unwrap();
+        store.save_translations("nihongo", "hitomi", "日本語", "ja", 100, &[row(2, 0, "Two"), row(1, 1, "One")]).await.unwrap();
+        let saved = store.translations("nihongo", "hitomi").await.unwrap();
         assert_eq!(saved.iter().map(|r| (r.gallery_id, r.english.as_str(), r.key.as_str())).collect::<Vec<_>>(), [(2, "Two", "nihongo"), (1, "One", "nihongo")]);
 
         // a later answer replaces the rows; another text is left alone
-        store.save_translations("other", "他", "ja", 100, &[row(9, 0, "Nine")]).await.unwrap();
-        store.save_translations("nihongo", "日本語", "ja", 200, &[row(3, 0, "Three")]).await.unwrap();
-        assert_eq!(store.translations("nihongo").await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
-        assert_eq!(store.translations("other").await.unwrap().len(), 1);
+        store.save_translations("other", "hitomi", "他", "ja", 100, &[row(9, 0, "Nine")]).await.unwrap();
+        store.save_translations("nihongo", "hitomi", "日本語", "ja", 200, &[row(3, 0, "Three")]).await.unwrap();
+        assert_eq!(store.translations("nihongo", "hitomi").await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
+        assert_eq!(store.translations("other", "hitomi").await.unwrap().len(), 1);
+
+        // Google Translate is another source: its row of the same text stays when the rows of Hitomi.La are replaced
+        let google = translation::Model { source: "google".into(), gallery_id: 0, ..row(0, 0, "Two (machine)") };
+        store.save_translations("nihongo", "google", "日本語", "ja", 250, &[google]).await.unwrap();
+        store.save_translations("nihongo", "hitomi", "日本語", "ja", 260, &[row(3, 0, "Three")]).await.unwrap();
+        assert_eq!(store.translations("nihongo", "google").await.unwrap().len(), 1);
+        assert_eq!(store.translations("nihongo", "hitomi").await.unwrap().len(), 1);
 
         // found from the other side: by the English title and by the Japanese one, whatever text was asked
         assert_eq!(store.translations_with(true, "three", 10).await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
@@ -657,8 +670,8 @@ mod tests {
         assert!(store.translations_with(true, "zzz", 10).await.unwrap().is_empty());
 
         // nothing answered: the lookup is noted all the same
-        store.save_translations("nothing", "なし", "ja", 300, &[]).await.unwrap();
-        assert!(store.translations("nothing").await.unwrap().is_empty());
+        store.save_translations("nothing", "hitomi", "なし", "ja", 300, &[]).await.unwrap();
+        assert!(store.translations("nothing", "hitomi").await.unwrap().is_empty());
     }
 
     #[tokio::test]
