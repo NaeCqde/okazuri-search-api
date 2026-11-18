@@ -759,13 +759,11 @@ impl Engine {
             return Ok((Vec::new(), false));
         }
 
-        let looked_at = self.store.translation_looked_at(&key).await?;
-        // a saved translation never gets old: only `live=on` asks the site again
-        let known = looked_at.is_some();
+        // a saved translation never gets old: only `live=on` asks the site again. But a text that found nothing is asked
+        // again every time (`diff`): the site may have the work now
+        let saved = self.store.translations(&key).await?;
 
-        if live == Live::Off || (live == Live::Diff && known) {
-            let saved = self.store.translations(&key).await?;
-
+        if live == Live::Off || (live == Live::Diff && !saved.is_empty()) {
             return Ok((saved.into_iter().map(Translation::from).collect(), true));
         }
 
@@ -1234,6 +1232,11 @@ pub(crate) mod tests {
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 1);
         assert!(engine.translate("七", Lang::Japanese, Live::On).await.is_err());
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
+
+        // a text that found nothing is asked again (`diff`), not taken from the lookup; `off` never asks
+        store.save_translations("八", "八", "ja", unix_now(), &[]).await.unwrap();
+        assert!(engine.translate("八", Lang::Japanese, Live::Diff).await.is_err());
+        assert_eq!(engine.translate("八", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
     }
 
     #[tokio::test]

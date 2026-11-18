@@ -128,10 +128,10 @@ A gallery with neither an artist nor a group is never the same work as another. 
 marks and case aside); those come first.
 
 The answer is **saved** in its own tables of the search database: `translation_lookups` (`key`: the text as it is compared, letters
-and digits in lower case; `text`; `from_lang`; `looked_at`; `count`, so a text that nothing answered is not asked every time) and
+and digits in lower case; `text`; `from_lang`; `looked_at`; `count`: a note of the last time the text was asked) and
 `translations` (`key`, `gallery_id`, `position`, `url`, `english`, `japanese`, `exact`). `live` is the one of the search: `diff`
-(default) answers with the saved translations, **however old** (they are kept for good, also a text that nothing answered), and asks the
-site only for a text that was never asked; `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
+(default) answers with the saved translations, **however old** (they are kept for good), and asks the site for a text that has none saved: a text
+that was never asked, and a text that nothing answered (it is asked every time, the site may have the work now); `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
 A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not off, diff or on is a
 422. The route is there when `[search]` is on.
 

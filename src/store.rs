@@ -369,12 +369,6 @@ impl SearchStore {
         Ok(new)
     }
 
-    /// When a text was asked to Hitomi.La for its translation (`key` is the text as `hitomi::squash` writes it). None when
-    /// it was not.
-    pub async fn translation_looked_at(&self, key: &str) -> Result<Option<i64>> {
-        Ok(translation_lookup::Entity::find_by_id(key.to_string()).one(&self.db).await?.map(|row| row.looked_at))
-    }
-
     /// The translations that were saved for a text, in the order of the answer.
     pub async fn translations(&self, key: &str) -> Result<Vec<translation::Model>> {
         Ok(translation::Entity::find()
@@ -629,10 +623,7 @@ mod tests {
             exact: position == 0,
         };
 
-        assert_eq!(store.translation_looked_at("nihongo").await.unwrap(), None);
-
         store.save_translations("nihongo", "日本語", "ja", 100, &[row(2, 0, "Two"), row(1, 1, "One")]).await.unwrap();
-        assert_eq!(store.translation_looked_at("nihongo").await.unwrap(), Some(100));
         let saved = store.translations("nihongo").await.unwrap();
         assert_eq!(saved.iter().map(|r| (r.gallery_id, r.english.as_str(), r.key.as_str())).collect::<Vec<_>>(), [(2, "Two", "nihongo"), (1, "One", "nihongo")]);
 
@@ -644,7 +635,6 @@ mod tests {
 
         // nothing answered: the lookup is noted all the same
         store.save_translations("nothing", "なし", "ja", 300, &[]).await.unwrap();
-        assert_eq!(store.translation_looked_at("nothing").await.unwrap(), Some(300));
         assert!(store.translations("nothing").await.unwrap().is_empty());
     }
 
