@@ -57,6 +57,9 @@ pub fn sources() -> Vec<(&'static str, Source)> {
     ]
 }
 
+/// A list of pages goes on past empty pages at its very start, up to this many of them (the first pages of DLsite have no work that is out yet).
+const EMPTY_PAGES_AT_START: usize = 20;
+
 /// The most links one page of a list is read for.
 const MOST_LINKS: usize = 1000;
 
@@ -231,11 +234,16 @@ impl Crawler {
     async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool) -> std::result::Result<Walk, String> {
         let name = self.engine.site(index).def.name;
         let mut walk = Walk::default();
+        let mut seen = !cursor.is_empty();
 
         loop {
             let step = self.step(index, source, &cursor, shard).await?;
-            let next = step.next.clone();
+            let mut next = step.next.clone();
             let listed = step.links.len();
+            seen |= listed > 0;
+            if next.is_none() && !seen && matches!(source, Source::Pages(_)) && walk.pages < EMPTY_PAGES_AT_START {
+                next = Some((page_number(&cursor, shard) + shard.1).to_string());
+            }
             let works = self.engine.works_of(step.links).await?;
             let finished = next.is_none();
             let position = if first { Some((next.as_deref().unwrap_or(""), finished)) } else { None };
@@ -255,7 +263,7 @@ impl Crawler {
                 }
                 Some(next) => cursor = next,
             }
-            if !first && (new == 0 || walk.pages >= self.config.refresh_pages.max(1)) {
+            if !first && ((new == 0 && listed > 0) || walk.pages >= self.config.refresh_pages.max(1)) {
                 return Ok(walk);
             }
         }
