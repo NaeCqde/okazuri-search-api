@@ -748,8 +748,8 @@ impl Engine {
     }
 
     /// The translation of a text, Japanese to English or English to Japanese, from the titles of Hitomi.La (a work has both).
-    /// The answer is saved in the tables `translation_lookups` and `translations`: `live` is the one of the search, a young
-    /// saved answer is the one that is given unless it is `on`, `off` never asks the site. Returns the language of the text,
+    /// The answer is saved in the tables `translation_lookups` and `translations`: `live` is the one of the search, a saved
+    /// answer (it is kept for good, also when nothing answered) is the one that is given unless it is `on`, `off` never asks the site. Returns the language of the text,
     /// the translations (the ones that are the whole title first) and whether they are the saved ones. A text that is not
     /// Japanese or English is an error of the caller (`Lang::of`).
     pub async fn translate(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
@@ -760,9 +760,10 @@ impl Engine {
         }
 
         let looked_at = self.store.translation_looked_at(&key).await?;
-        let young = looked_at.is_some_and(|at| unix_now().saturating_sub(at) < (self.config.ttl_hours * 3600) as i64);
+        // a saved translation never gets old: only `live=on` asks the site again
+        let known = looked_at.is_some();
 
-        if live == Live::Off || (live == Live::Diff && young) {
+        if live == Live::Off || (live == Live::Diff && known) {
             let saved = self.store.translations(&key).await?;
 
             return Ok((saved.into_iter().map(Translation::from).collect(), true));
@@ -1204,7 +1205,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_translations_are_the_saved_ones_while_they_are_young() {
+    async fn the_translations_are_saved_for_good() {
         let (engine, _, store) = setup(&config()).await;
         let row = crate::entity::translation::Model {
             key: String::new(),
@@ -1221,16 +1222,16 @@ pub(crate) mod tests {
         // punctuation alone is nothing to look for
         assert_eq!(engine.translate(" !? ", Lang::Japanese, Live::On).await.unwrap(), (vec![], false));
 
-        // a young answer is the one that is saved, whatever `live` says unless it is `on`
+        // a saved answer is the one that is given, whatever `live` says unless it is `on`
         store.save_translations("七", "七", "ja", unix_now(), &[row.clone()]).await.unwrap();
         let (found, saved) = engine.translate("七", Lang::Japanese, Live::Diff).await.unwrap();
         assert!(saved);
         assert_eq!((found[0].id, found[0].text(Lang::English), found[0].text(Lang::Japanese), found[0].exact), (7, "Seven", "七", true));
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
 
-        // an old one is asked again (the engine of the tests has no Hitomi.La: that is an error), and `off` still answers it
+        // a saved answer never gets old: only `on` asks the site again (the engine of the tests has no Hitomi.La: that is an error)
         store.save_translations("七", "七", "ja", 1, &[row]).await.unwrap();
-        assert!(engine.translate("七", Lang::Japanese, Live::Diff).await.is_err());
+        assert_eq!(engine.translate("七", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 1);
         assert!(engine.translate("七", Lang::Japanese, Live::On).await.is_err());
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
     }

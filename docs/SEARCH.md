@@ -130,8 +130,8 @@ marks and case aside); those come first.
 The answer is **saved** in its own tables of the search database: `translation_lookups` (`key`: the text as it is compared, letters
 and digits in lower case; `text`; `from_lang`; `looked_at`; `count`, so a text that nothing answered is not asked every time) and
 `translations` (`key`, `gallery_id`, `position`, `url`, `english`, `japanese`, `exact`). `live` is the one of the search: `diff`
-(default) answers with the saved translations while they are younger than `[search] ttl_hours` and asks the site otherwise (the old
-rows are replaced); `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
+(default) answers with the saved translations, **however old** (they are kept for good, also a text that nothing answered), and asks the
+site only for a text that was never asked; `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
 A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not off, diff or on is a
 422. The route is there when `[search]` is on.
 
@@ -206,7 +206,7 @@ only the sites that are missing or old are asked), so a restart of the program, 
 says `prefetch: n/total "query"` for each query. A slow site (177Picyy: one request in 20 seconds) is left out of the prefetch,
 because every query would wait for it; a request to `/okazuri/search` asks it, with one form of the query.
 
-A query with Japanese in it is searched three ways: as written, in romaji (both by the search itself), and **in English**: when Hitomi.La is one of the sites, the prefetch asks `/okazuri/translate` for the query (Japanese to English; saved, so it is asked once per `ttl_hours`), and searches the sites for the English titles it gives (3 at most), saving the works. This is also done for a query that was searched before, so the works of the English titles come after the update too. The log says `prefetch: "query" in English "title"`. A failure of the translation is a warning; the query itself is done.
+A query with Japanese in it is searched three ways: as written, in romaji (both by the search itself), and **in English**: when Hitomi.La is one of the sites, the prefetch asks `/okazuri/translate` for the query (Japanese to English; saved for good), and searches the sites for the English titles it gives (3 at most), saving the works. This is also done for a query that was searched before, so the works of the English titles come after the update too. The log says `prefetch: "query" in English "title"`. A failure of the translation is a warning; the query itself is done.
 
 ### After the rules of the romaji changed (`reromanize`)
 
