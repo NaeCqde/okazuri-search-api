@@ -42,8 +42,23 @@ pub fn parse(body: &str) -> Option<String> {
     None
 }
 
+/// The least time between two requests to Google Translate (the server is open: `live=force` must not make it a relay).
+const MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn wait_turn() {
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(wait) = last.and_then(|at| MIN_DELAY.checked_sub(at.elapsed())) {
+        std::thread::sleep(wait);
+    }
+    *last = Some(std::time::Instant::now());
+}
+
 /// Asks Google Translate.
 pub fn translate(agent: &ureq::Agent, text: &str, from: Lang, to: Lang) -> Result<String, String> {
+    wait_turn();
     let mut response = agent
         .post(URL)
         .send_form([("f.req", request(text, from, to).as_str())])

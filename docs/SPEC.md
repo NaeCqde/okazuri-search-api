@@ -37,7 +37,7 @@
 
 - 不正なリクエストは 422 と `{"detail": "..."}`。
 - JSON の応答は `Content-Type: application/json; charset=utf-8`。
-- `live` は `off`(サイトに問い合わせない)、`diff`(既定。未取得か `ttl_hours` を過ぎた組み合わせだけ問い合わせる)、`on`(すべて問い合わせる)。
+- `live` は `off`(サイトに問い合わせない)、`diff`(既定。未取得か `ttl_hours` を過ぎた組み合わせだけ問い合わせる)、`force`(すべて問い合わせる)。
 - 検索では、同時に問い合わせるが、1 つのサイトには `min_delay_ms` より近い間隔で問い合わせない。429 は `Retry-After`(なければ 5 秒、最大 30 秒)の後に 1 回やり直す。Cloudflare のチャレンジが返ったサイトは失敗として扱う。
 
 ## サブコマンド
@@ -45,7 +45,7 @@
 ```
 okazuri-search-api                       127.0.0.1:8000 でサーバーを起動
 okazuri-search-api serve --port 9000     --config <パス> --host <アドレス> --port <ポート>
-okazuri-search-api search <語>...        1 回検索(サーバーなし)。--live off|diff|on --limit <n>
+okazuri-search-api search <語>...        1 回検索(サーバーなし)。--live off|diff|force --limit <n>
 okazuri-search-api sync                  D1 の雑誌のテーブルを今すぐ写す
 okazuri-search-api prefetch              写しの号を 1 周、事前検索する。--limit <n>
 okazuri-search-api convert "文"...       ローマ字を表示。文がなければ標準入力の各行
@@ -68,6 +68,6 @@ okazuri-search-api convert "文"...       ローマ字を表示。文がなけ�
 ## セキュリティ上の注意
 
 - 既定は `127.0.0.1`。外に出すときはリバースプロキシを前に置く。認証はない。
-- `live=force` のリクエストは、外部サイトへの問い合わせを起こす。サイトごとの最小間隔とクエリの長さの上限がある。公開するときは、前段でレート制限を付けること。
+- `live=force` のリクエストは、外部サイトへの問い合わせを起こす。サイト(Google Translate を含む)ごとの最小間隔とクエリの長さの上限がある。公開するときは、前段でレート制限を付けること。
 - `CLOUDFLARE_API_TOKEN` と cron のヘッダー(`CRON_SECRET` など)は環境変数だけに置き、`config.toml` に書かない(`config.toml` は `.gitignore`)。
 - サイトの応答の本文は、`read_to_vec` の上限で読み、リンクは各サイトの正規表現に合うものだけ作品として保存する。
