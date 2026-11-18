@@ -14,7 +14,7 @@ use sea_orm::sea_query::{Expr, Index, OnConflict};
 use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Schema, Set, SqlxSqliteConnector, TransactionTrait,
+    QueryOrder, QuerySelect, Schema, Set, SqlxSqliteConnector, Statement, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -112,6 +112,44 @@ impl SearchStore {
             .if_not_exists()
             .to_owned();
         db.execute(backend.build(&by_update)).await?;
+
+        Self::create_word_index(db).await
+    }
+
+    /// The index of the title keys (`works_fts`): FTS5 with the trigram tokenizer, which finds the works whose key has a
+    /// piece of text in it (3 characters or more) without reading every row. It has no copy of the keys (the table `works` is its
+    /// content: only the pieces of 3 characters are kept in it), and three triggers keep it up to date. It is made again
+    /// when it has not as many works as the table (a new index, an older database).
+    async fn create_word_index(db: &DatabaseConnection) -> Result<()> {
+        for sql in [
+            "CREATE VIRTUAL TABLE IF NOT EXISTS works_fts USING fts5(title_key, content='works', content_rowid='rowid', tokenize='trigram')",
+            "CREATE TRIGGER IF NOT EXISTS works_fts_insert AFTER INSERT ON works BEGIN
+                INSERT INTO works_fts(rowid, title_key) VALUES (new.rowid, new.title_key);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS works_fts_delete AFTER DELETE ON works BEGIN
+                INSERT INTO works_fts(works_fts, rowid, title_key) VALUES ('delete', old.rowid, old.title_key);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS works_fts_update AFTER UPDATE OF title_key ON works BEGIN
+                INSERT INTO works_fts(works_fts, rowid, title_key) VALUES ('delete', old.rowid, old.title_key);
+                INSERT INTO works_fts(rowid, title_key) VALUES (new.rowid, new.title_key);
+            END",
+        ] {
+            db.execute_unprepared(sql).await?;
+        }
+
+        let counts = db
+            .query_one(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT (SELECT count(*) FROM works) AS works, (SELECT count(*) FROM works_fts_docsize) AS indexed",
+            ))
+            .await?
+            .ok_or("no count")?;
+        let (works, indexed): (i64, i64) = (counts.try_get("", "works")?, counts.try_get("", "indexed")?);
+
+        if works != indexed {
+            log::info!("works_fts: indexing {works} works ({indexed} were indexed)");
+            db.execute_unprepared("INSERT INTO works_fts(works_fts) VALUES ('rebuild')").await?;
+        }
 
         Ok(())
     }
@@ -489,22 +527,53 @@ impl SearchStore {
         Ok(forgotten)
     }
 
-    /// The works whose title key has `prefilter` in it (all works without one), the most recently saved first.
-    /// This only narrows the rows; the caller still matches every word of its query.
+    /// The works whose title key has `prefilter` in it (all works without one), the most recently saved first, at most
+    /// `MAX_CANDIDATES`. This only narrows the rows; the caller still matches every word of its query.
     pub async fn candidates(&self, prefilter: Option<&str>) -> Result<Vec<Work>> {
+        self.candidates_up_to(prefilter, MAX_CANDIDATES).await
+    }
+
+    async fn candidates_up_to(&self, prefilter: Option<&str>, most: u64) -> Result<Vec<Work>> {
         let mut query = work::Entity::find();
 
         if let Some(part) = prefilter {
-            query = query.filter(Expr::cust_with_values("instr(title_key, ?) > 0", [part]));
+            query = query.filter(match self.indexed(part, most).await? {
+                Some(filter) => filter,
+                None => Expr::cust_with_values("instr(title_key, ?) > 0", [part]),
+            });
         }
 
         Ok(query
             .order_by_desc(work::Column::UpdatedAt)
             // works saved at the same second keep the order they were saved in
             .order_by_asc(Expr::cust("rowid"))
-            .limit(MAX_CANDIDATES)
+            .limit(most)
             .all(&self.db)
             .await?)
+    }
+
+    /// The condition "the key has `part`" by the index of the keys, when that is the quick way: the piece has 3 characters or more
+    /// (the index is made of pieces of 3), and no more than `most` works have it. A piece that most works have is better read by
+    /// walking the works from the newest, which stops after `most`: None, and the caller uses `instr`.
+    async fn indexed(&self, part: &str, most: u64) -> Result<Option<sea_orm::sea_query::SimpleExpr>> {
+        if part.chars().count() < 3 {
+            return Ok(None);
+        }
+
+        // a phrase: the piece as it is, whatever characters it has
+        let phrase = format!("\"{}\"", part.replace('"', "\"\""));
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "SELECT count(*) AS n FROM (SELECT 1 FROM works_fts WHERE works_fts MATCH ? LIMIT ?)",
+                [phrase.clone().into(), (most + 1).into()],
+            ))
+            .await?
+            .ok_or("no count")?;
+        let found: i64 = row.try_get("", "n")?;
+
+        Ok((found as u64 <= most).then(|| Expr::cust_with_values("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)", [phrase])))
     }
 
     /// How many queries and works are saved (for the tests).
@@ -825,5 +894,105 @@ mod tests {
         drop(again);
 
         let _ = fs::remove_dir_all(dir);
+    }
+    /// What `instr` says: the works (the newest first) whose key has the piece.
+    async fn by_instr(store: &SearchStore, part: &str, most: usize) -> Vec<String> {
+        store.candidates(None).await.unwrap().into_iter().filter(|w| w.title_key.contains(part)).take(most).map(|w| w.path).collect()
+    }
+
+    async fn paths(works: Vec<Work>) -> Vec<String> {
+        works.into_iter().map(|w| w.path).collect()
+    }
+
+    async fn some_works() -> SearchStore {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store
+            .save(
+                "q",
+                "A",
+                100,
+                &Ok(vec![
+                    link("/g/1/", "Kyoudai de Shitara Ikemasen"),
+                    link("/g/2/", "COMIC Kyoudai"),
+                    link("/g/3/", "Ane to Otouto (2nd)"),
+                    link("/g/4/", "Comic Shitara"),
+                    link("/g/5/", "ab"),
+                ]),
+                false,
+            )
+            .await
+            .unwrap();
+        store.save("q2", "A", 200, &Ok(vec![link("/g/6/", "Newest Kyoudai Comic")]), false).await.unwrap();
+
+        store
+    }
+
+    #[tokio::test]
+    async fn the_index_finds_the_same_works_as_instr() {
+        let store = some_works().await;
+
+        // 3 characters or more: by the index; 2 or fewer: by instr; with a character that is not a letter
+        for part in ["kyoudai", "comic", "shitara", "deshi", "idai", "kyo", "ane", "(2nd)", "de", "ab", "k", "nothere", "\"", "kyoudai\""] {
+            let found = paths(store.candidates(Some(part)).await.unwrap()).await;
+
+            assert_eq!(found, by_instr(&store, part, usize::MAX).await, "{part}");
+        }
+        // the newest first
+        assert_eq!(paths(store.candidates(Some("kyoudai")).await.unwrap()).await, ["/g/6/", "/g/1/", "/g/2/"]);
+    }
+
+    #[tokio::test]
+    async fn a_piece_that_too_many_works_have_is_read_from_the_newest_up_to_the_most() {
+        let store = some_works().await;
+
+        // "kyoudai" is in 3 works: with at most 2 it is the newest 2 (by instr, which stops there); with 3 it is all of them (by the index)
+        assert_eq!(paths(store.candidates_up_to(Some("kyoudai"), 2).await.unwrap()).await, by_instr(&store, "kyoudai", 2).await);
+        assert_eq!(paths(store.candidates_up_to(Some("kyoudai"), 3).await.unwrap()).await, by_instr(&store, "kyoudai", 3).await);
+        assert_eq!(store.candidates_up_to(Some("kyoudai"), 3).await.unwrap().len(), 3);
+        assert!(store.indexed("kyoudai", 3).await.unwrap().is_some());
+        assert!(store.indexed("kyoudai", 2).await.unwrap().is_none(), "3 works have it, and 2 is the most");
+        assert!(store.indexed("de", 100).await.unwrap().is_none(), "2 characters are not in the index");
+    }
+
+    #[tokio::test]
+    async fn the_index_follows_a_new_title_and_a_removed_work() {
+        let store = some_works().await;
+
+        // a new romaji of /g/2/ (the same row, another key)
+        let work = store.candidates(Some("comic")).await.unwrap().into_iter().find(|w| w.path == "/g/2/").unwrap();
+        store.rewrite_romaji(&[(work, "totally different".into())]).await.unwrap();
+        assert_eq!(paths(store.candidates(Some("kyoudai")).await.unwrap()).await, ["/g/6/", "/g/1/"]);
+        assert_eq!(paths(store.candidates(Some("different")).await.unwrap()).await, ["/g/2/"]);
+
+        // a removed work
+        store.db.execute_unprepared("DELETE FROM works WHERE path = '/g/1/'").await.unwrap();
+        assert_eq!(paths(store.candidates(Some("kyoudai")).await.unwrap()).await, ["/g/6/"]);
+        assert_eq!(paths(store.candidates(Some("shitara")).await.unwrap()).await, ["/g/4/"]);
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_index_gets_it_when_it_is_opened() {
+        let dir = std::env::temp_dir().join(format!("okazuri-fts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("search.db");
+
+        let store = SearchStore::open(&path).await.unwrap();
+        // the database of a version that had no index: the works are there, the index is not
+        for sql in ["DROP TRIGGER works_fts_insert", "DROP TRIGGER works_fts_delete", "DROP TRIGGER works_fts_update", "DROP TABLE works_fts"] {
+            store.db.execute_unprepared(sql).await.unwrap();
+        }
+        store
+            .db
+            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2)")
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = SearchStore::open(&path).await.unwrap();
+        assert_eq!(paths(store.candidates(Some("kyoudai")).await.unwrap()).await, ["/g/1/"]);
+        assert_eq!(paths(store.candidates(Some("other")).await.unwrap()).await, ["/g/2/"]);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

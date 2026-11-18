@@ -231,7 +231,7 @@ migrate. The entities of `magazine` and `number` list only the columns that are 
 
 | File | Setting | Content |
 |---|---|---|
-| `search.db` | `[search] db_path` | `works` (site, path, **title** as the site writes it, **title_romaji** its romaji, title_key the romaji folded to narrow the search, when it was first saved and last changed) and `searches` (when each query was asked to each site, and whether it worked) |
+| `search.db` | `[search] db_path` | `works` (site, path, **title** as the site writes it, **title_romaji** its romaji, title_key the romaji folded to narrow the search, when it was first saved and last changed), `works_fts` (an FTS5 index with the trigram tokenizer over title_key: it finds the works whose key has a piece of 3 characters or more without reading every row; the table `works` is its content, and triggers keep it up to date; it is made again at the start when it has not as many works as the table) and `searches` (when each query was asked to each site, and whether it worked) |
 | `d1-mirror.db` | `[d1] mirror_path` | the `magazines` and `numbers` tables of the Worker's D1 database, and the bookmark of the data they were copied from |
 
 ## The copy of D1 (`[d1]`)
@@ -276,3 +276,11 @@ for them.
 - A site behind a Cloudflare challenge and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.
 - The `[d1]` calls were written from the API as wrangler uses it and tested against a mock of it; run
   `okazuri-search-api sync` once with the token to see them work.
+
+### How the works are narrowed (`SearchStore::candidates`)
+
+The engine reads the works that have the longest word of the query (a number is not one) in their title key, and matches every word of the
+query with them in the program. The word is looked up in `works_fts` (FTS5, trigram) when it has 3 characters or more and no more than
+50 000 works have it; the works are then the ones of the index, the newest first. A word that is shorter, and a word that more than 50 000
+works have, is read with `instr(title_key, word)` by walking the works from the newest, which stops after 50 000. The answer is the same
+either way. (Measured on 5 million works: a rare word 12 to 80 ms instead of 2 to 3.4 s; a word that most works have 30 ms as before.)
