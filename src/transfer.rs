@@ -2,18 +2,22 @@
 //!
 //! The crawl of N machines (`[crawl] shard = "k/N"`) fills one database on each machine. The works of all of them are put in the database
 //! of the server by exporting each one and importing the files there. The file is JSON Lines (a work a line) compressed with
-//! brotli, which is what the titles of one site are good for: the files are about a fifth of the size of the text.
+//! brotli. A line has only what the sites gave (the site, the path of the page, the title) and when the work was saved; the romaji and the
+//! key of the title are made again when the file is read, with the rules of the program that reads it.
 //!
 //! A work that is saved already is left as it is (the shards do not overlap, and a work does not change when it is read again).
 //! The queries and the translations are not moved: only the works, which is what the crawl made.
 
 use crate::entity::work;
+use crate::query::romaji;
+use crate::romanizer::Romanizer;
 use crate::store::SearchStore;
 use crate::utils::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 /// The works read from the table at a time.
 const PAGE: u64 = 5_000;
@@ -29,14 +33,13 @@ struct Line {
     website: String,
     path: String,
     title: String,
-    romaji: String,
     first_seen: i64,
     updated_at: i64,
 }
 
 impl From<work::Model> for Line {
     fn from(row: work::Model) -> Self {
-        Self { website: row.website, path: row.path, title: row.title, romaji: row.title_romaji, first_seen: row.first_seen, updated_at: row.updated_at }
+        Self { website: row.website, path: row.path, title: row.title, first_seen: row.first_seen, updated_at: row.updated_at }
     }
 }
 
@@ -83,11 +86,11 @@ pub async fn export(store: &SearchStore, out: &Path, sites: &[String], since: i6
 }
 
 /// Reads the works of a file into the database.
-pub async fn import(store: &SearchStore, file: &Path) -> Result<Moved> {
+pub async fn import(store: &SearchStore, file: &Path, romanizer: &Arc<Romanizer>) -> Result<Moved> {
     let opened = std::fs::File::open(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     let reader = BufReader::new(brotli::Decompressor::new(opened, 64 * 1024));
     let mut moved = Moved::default();
-    let mut batch = Vec::with_capacity(BATCH);
+    let mut batch: Vec<Line> = Vec::with_capacity(BATCH);
 
     for (number, text) in reader.lines().enumerate() {
         let text = text.map_err(|e| format!("{}: {e}", file.display()))?;
@@ -98,23 +101,41 @@ pub async fn import(store: &SearchStore, file: &Path) -> Result<Moved> {
 
         moved.works += 1;
         moved.sites.insert(line.website.clone());
-        batch.push(work::Model {
-            website: line.website,
-            path: line.path,
-            title: line.title,
-            title_romaji: line.romaji.clone(),
-            title_key: crate::query::title_key(&line.romaji),
-            first_seen: line.first_seen,
-            updated_at: line.updated_at,
-        });
+        batch.push(line);
 
         if batch.len() >= BATCH {
-            moved.new += store.import_works(std::mem::take(&mut batch)).await?;
+            moved.new += save(store, std::mem::take(&mut batch), romanizer).await?;
         }
     }
-    moved.new += store.import_works(batch).await?;
+        moved.new += save(store, batch, romanizer).await?;
 
     Ok(moved)
+}
+
+/// Makes the romaji and the key of the titles (CPU work, so on a thread of its own) and writes the works.
+async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>) -> Result<usize> {
+    let romanizer = romanizer.clone();
+    let works = tokio::task::spawn_blocking(move || {
+        lines
+            .into_iter()
+            .map(|line| {
+                let converted = romaji(&line.title, &romanizer).unwrap_or_else(|_| line.title.clone());
+
+                work::Model {
+                    website: line.website,
+                    path: line.path,
+                    title_key: crate::query::title_key(&converted),
+                    title_romaji: converted,
+                    title: line.title,
+                    first_seen: line.first_seen,
+                    updated_at: line.updated_at,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    store.import_works(works).await
 }
 
 #[cfg(test)]
@@ -148,13 +169,13 @@ mod tests {
         assert_eq!(exported.works, 3);
 
         let to = SearchStore::in_memory().await.unwrap();
-        let imported = import(&to, &file).await.unwrap();
+        let imported = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();
         assert_eq!((imported.works, imported.new), (3, 3));
         assert_eq!(to.counts().await.unwrap().1, 3);
         assert_eq!(to.candidates(Some("alphatwo")).await.unwrap().len(), 1, "the index follows the imported works");
 
         // the same file again changes nothing
-        let again = import(&to, &file).await.unwrap();
+        let again = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();
         assert_eq!((again.works, again.new), (3, 0));
         assert_eq!(to.counts().await.unwrap().1, 3);
 
@@ -180,7 +201,7 @@ mod tests {
         let file = scratch("bad.jsonl.br");
         std::fs::write(&file, b"not brotli at all").unwrap();
 
-        assert!(import(&SearchStore::in_memory().await.unwrap(), &file).await.is_err());
+        assert!(import(&SearchStore::in_memory().await.unwrap(), &file, &crate::testing::romanizer_arc()).await.is_err());
 
         let _ = std::fs::remove_file(file);
     }

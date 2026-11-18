@@ -531,9 +531,11 @@ async fn export(file: PathBuf, sites: Vec<String>, since: i64, config: Option<Pa
 async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
     let store = SearchStore::open(&config.search.db_path).await?;
+    // the romaji of the titles is made here, with the rules of this program
+    let romanizer = load_romanizer(&config)?;
 
     for file in &files {
-        let moved = crate::transfer::import(&store, file).await?;
+        let moved = crate::transfer::import(&store, file, &romanizer).await?;
 
         println!("{}: {} works read, {} of them new", file.display(), moved.works, moved.new);
     }
