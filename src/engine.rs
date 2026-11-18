@@ -1098,10 +1098,10 @@ impl crate::hitomi::Fetch for HitomiFetch<'_> {
             format!("{}{path}", crate::hitomi::ORIGIN)
         };
 
-        // a range of a file is read as it is: no compression of it
-        let mut request = self.engine.client.get(&url).header("Referer", "https://hitomi.la/").header("Accept-Encoding", "identity");
+        let mut request = self.engine.client.get(&url).header("Referer", "https://hitomi.la/");
         if let Some((from, to)) = range {
-            request = request.header("Range", format!("bytes={from}-{to}"));
+            // a range of a file is read as it is: the bytes are counted in the file, and a compressed answer would not be them
+            request = request.header("Range", format!("bytes={from}-{to}")).header("Accept-Encoding", "identity");
         }
 
         let response = request.send().await.map_err(|e| format!("{path}: {e}"))?;
