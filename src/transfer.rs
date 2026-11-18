@@ -175,7 +175,7 @@ mod tests {
         let imported = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();
         assert_eq!((imported.works, imported.new), (3, 3));
         assert_eq!(to.counts().await.unwrap().1, 3);
-        assert_eq!(to.candidates(Some("alphatwo")).await.unwrap().len(), 1, "the index follows the imported works");
+        assert_eq!(to.candidates(&["alphatwo"]).await.unwrap().len(), 1, "the index follows the imported works");
 
         let languages: Vec<_> = to.works_after(None, 10).await.unwrap().into_iter().map(|w| (w.path, w.language)).collect();
         assert_eq!(languages, [("/a/1".to_string(), None), ("/a/2".to_string(), None), ("/b/1".to_string(), Some("en".to_string()))], "the language is made on import: it is not in the file");

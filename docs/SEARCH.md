@@ -302,8 +302,9 @@ sites are walked at the same time, each one page after page, newest first.
 
 ### How the works are narrowed (`SearchStore::candidates`)
 
-The engine reads the works that have the longest word of the query (a number is not one) in their title key, and matches every word of the
-query with them in the program. The word is looked up in `works_fts` (FTS5, trigram) when it has 3 characters or more and no more than
-50 000 works have it; the works are then the ones of the index, the newest first. A word that is shorter, and a word that more than 50 000
-works have, is read with `instr(title_key, word)` by walking the works from the newest, which stops after 50 000. The answer is the same
-either way. (Measured on 5 million works: a rare word 12 to 80 ms instead of 2 to 3.4 s; a word that most works have 30 ms as before.)
+The engine reads the works that have **every** word of the query (a number is not one: it is matched by value) in their title key, and
+matches the words again with them in the program. The words of 3 characters or more go into one `works_fts` query (FTS5, trigram: `"a" AND "b"`),
+when no more than 50 000 works have all of them; so two words that are common alone find the few works that have both. The works are then the
+ones of the index, the newest first, and a word shorter than 3 characters is looked for (`instr`) in those. When more than 50 000 works have all
+the words, or no word has 3 characters, the works are read with `instr(title_key, word)` for every word by walking them from the newest, which
+stops after 50 000. The answer is the same either way. (Measured on 5 million works: a rare word 12 to 80 ms instead of 2 to 3.4 s; a word that most works have 30 ms as before.)

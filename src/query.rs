@@ -222,14 +222,18 @@ impl Terms {
         self.0.iter().map(|term| term.key.as_str()).collect()
     }
 
-    /// A word that every matching title has in its key, to narrow the rows read from the database: the
-    /// longest one that is not a number (a number is also matched by value). `None` when all are numbers.
-    pub fn prefilter(&self) -> Option<&str> {
-        self.0
-            .iter()
-            .filter(|term| term.number.is_none())
-            .map(|term| term.key.as_str())
-            .max_by_key(|key| key.chars().count())
+    /// The words that every matching title has in its key, to narrow the rows read from the database: all the words that are not numbers
+    /// (a number is also matched by value, so it does not narrow), each once. Empty when all are numbers.
+    pub fn prefilters(&self) -> Vec<&str> {
+        let mut words: Vec<&str> = Vec::new();
+
+        for term in self.0.iter().filter(|term| term.number.is_none()) {
+            if !words.contains(&term.key.as_str()) {
+                words.push(term.key.as_str());
+            }
+        }
+
+        words
     }
 
     /// Does the title have every word? `key` is `title_key(title)`.
@@ -380,11 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn the_prefilter_is_the_longest_word_that_is_not_a_number() {
-        assert_eq!(Terms::new("COMIC快楽天 2026 07").prefilter(), Some("comic快楽天"));
-        assert_eq!(Terms::new("a abc ab").prefilter(), Some("abc"));
-        assert_eq!(Terms::new("2026 07").prefilter(), None, "all numbers: nothing to narrow by");
-        assert_eq!(Terms::new("").prefilter(), None);
+    fn the_prefilters_are_the_words_that_are_not_numbers() {
+        assert_eq!(Terms::new("COMIC快楽天 2026 07").prefilters(), ["comic快楽天"]);
+        assert_eq!(Terms::new("a abc ab abc").prefilters(), ["a", "abc", "ab"], "each once");
+        assert!(Terms::new("2026 07").prefilters().is_empty(), "all numbers: nothing to narrow by");
+        assert!(Terms::new("").prefilters().is_empty());
         assert_eq!(Terms::new("COMIC E×E").keys(), ["comic", "exe"]);
     }
 }

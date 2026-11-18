@@ -704,7 +704,7 @@ impl Engine {
         };
 
         let mut hits: Vec<Hit> = Vec::new();
-        for work in self.store.candidates(terms.prefilter()).await? {
+        for work in self.store.candidates(&terms.prefilters()).await? {
             // a site that is left out does not answer, whatever was saved of it
             let Some(&index) = self.active.iter().find(|&&i| self.sites[i].def.name == work.website) else { continue };
             if request.exclude.contains(&index) {
@@ -1448,7 +1448,7 @@ pub(crate) mod tests {
         let done = engine.reromanize_works().await.unwrap();
 
         assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
-        let saved = store.candidates(None).await.unwrap();
+        let saved = store.candidates(&[]).await.unwrap();
         let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
         assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
         assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
@@ -1726,7 +1726,7 @@ pub(crate) mod tests {
         // whatever the query, this site lists the same work
         engine.search(&Request::new("anything")).await.unwrap();
 
-        let saved = store.candidates(None).await.unwrap();
+        let saved = store.candidates(&[]).await.unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].title, "COMIC快楽天 2026年7月号", "the title as the site writes it");
         assert!(saved[0].title_romaji.contains("kairakuten"), "{}", saved[0].title_romaji);
