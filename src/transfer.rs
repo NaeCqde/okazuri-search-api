@@ -121,7 +121,7 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
             .map(|line| {
                 let converted = romaji(&line.title, &romanizer).unwrap_or_else(|_| line.title.clone());
 
-                let language = crate::language::detect(&line.title).map(str::to_string);
+                let language = crate::language::detect(&line.title);
 
                 work::Model {
                     website: line.website,

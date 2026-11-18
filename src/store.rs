@@ -431,14 +431,14 @@ impl SearchStore {
                     title_key: Set(title_key(&item.romaji)),
                     first_seen: Set(now),
                     updated_at: Set(now),
-                    language: Set(language::detect(&item.title).map(str::to_string)),
+                    language: Set(language::detect(&item.title)),
                 }),
                 Some(known) if known.title != item.title || known.title_romaji != item.romaji => {
                     let mut changed = known.clone().into_active_model();
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
                     changed.title_key = Set(title_key(&item.romaji));
-                    changed.language = Set(language::detect(&item.title).map(str::to_string));
+                    changed.language = Set(language::detect(&item.title));
                     changed.updated_at = Set(now);
                     changed.update(db).await?;
                 }
@@ -477,7 +477,7 @@ impl SearchStore {
             for row in page {
                 let now = language::detect(&row.title);
 
-                if now != row.language.as_deref() {
+                if now != row.language {
                     work::Entity::update_many()
                         .col_expr(work::Column::Language, Expr::value(now))
                         .filter(work::Column::Website.eq(row.website.as_str()))
@@ -680,7 +680,7 @@ impl SearchStore {
             let mut changed = known.clone().into_active_model();
             changed.title_romaji = Set(romaji.clone());
             changed.title_key = Set(title_key(romaji));
-            changed.language = Set(language::detect(&known.title).map(str::to_string));
+            changed.language = Set(language::detect(&known.title));
             changed.update(&transaction).await?;
 
             for row in listing::Entity::find()

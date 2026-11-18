@@ -2,9 +2,8 @@
 //! brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). It is a guess from the title, so it is kept apart from
 //! the title (`works.language`) and made again by `import` and `reromanize`.
 //!
-//! A work has one language: a two-letter code (`zh`, `en`, `ja`), or None when the title says nothing (most titles are Japanese and do not say
-//! so). A title that names several languages (`[CN,EN,JP,KR]`) is a pack: the first language that is not Japanese is the one; Japanese
-//! is the answer only when it is the only one named.
+//! The answer is the two-letter codes of the languages the title names, joined with `,` in the order it names them (`zh`, `en,ko`; a pack
+//! `[CN,EN,JP,KR]` is `zh,en,ja,ko`), or None when the title says nothing (most titles are Japanese and do not say so).
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -86,11 +85,11 @@ fn add(found: &mut Vec<&'static str>, code: &'static str) {
     }
 }
 
-/// The language code of a title; None when it says none.
-pub fn detect(title: &str) -> Option<&'static str> {
+/// The language codes of a title, joined with `,`; None when it names none.
+pub fn detect(title: &str) -> Option<String> {
     let found = detect_all(title);
 
-    found.iter().copied().find(|code| *code != "ja").or(found.first().copied())
+    (!found.is_empty()).then(|| found.join(","))
 }
 
 /// Every language the title names, in the order it names them.
@@ -147,40 +146,45 @@ pub fn detect_all(title: &str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    fn is(title: &str, expected: &str) {
+        assert_eq!(detect(title).as_deref(), Some(expected), "{title}");
+    }
+
     #[test]
     fn marks_of_chinese() {
-        assert_eq!(detect("[A] B [Chinese] [Digital]"), Some("zh"));
-        assert_eq!(detect("[A] B [RanaMycin个人汉化] [DL版]"), Some("zh"));
-        assert_eq!(detect("[A] B [中国翻訳] [DL版]"), Some("zh"));
-        assert_eq!(detect("[A] B [無邪気漢化組]"), Some("zh"));
+        is("[A] B [Chinese] [Digital]", "zh");
+        is("[A] B [RanaMycin个人汉化] [DL版]", "zh");
+        is("[A] B [中国翻訳] [DL版]", "zh");
+        is("[A] B [無邪気漢化組]", "zh");
     }
 
     #[test]
     fn codes_and_names_in_brackets() {
-        assert_eq!(detect("x [EN]"), Some("en"));
-        assert_eq!(detect("x [en]"), Some("en"));
-        assert_eq!(detect("x (JP)"), Some("ja"));
-        assert_eq!(detect("x 【KR】"), Some("ko"));
-        assert_eq!(detect("x [English - EN] [Digital]"), Some("en"));
-        assert_eq!(detect("x [French][Italian]"), Some("fr"));
-        assert_eq!(detect("x [Japanese]"), Some("ja"));
+        is("x [EN]", "en");
+        is("x [en]", "en");
+        is("x (JP)", "ja");
+        is("x 【KR】", "ko");
+        is("x [English - EN] [Digital]", "en");
+        is("x [French][Italian]", "fr,it");
+        is("x [Japanese]", "ja");
     }
 
     #[test]
-    fn a_pack_of_languages_is_the_first_one_that_is_not_japanese() {
-        assert_eq!(detect("x [CN,EN,JP,KR]"), Some("zh"));
-        assert_eq!(detect("x [jap / eng / rus]"), Some("en"));
-        assert_eq!(detect("x [JP,EN]"), Some("en"));
-        assert_eq!(detect("x [JP,JA]"), Some("ja"));
+    fn a_title_that_names_several_languages_has_them_all_in_the_order_it_names_them() {
+        is("x [CN,EN,JP,KR]", "zh,en,ja,ko");
+        is("x [jap / eng / rus]", "ja,en,ru");
+        is("x [English, Japanese]", "en,ja");
+        is("x [ENG VIE RUS subs]", "en,vi,ru");
+        is("[A] B [English] [無邪気漢化組]", "zh,en");
     }
 
     #[test]
     fn a_flag_that_the_site_put_first_counts_once() {
-        assert_eq!(detect("🇨🇳 [Hamao] Fallin' [Chinese]"), Some("zh"));
-        assert_eq!(detect("🇯🇵 A [EN]"), Some("en"), "the title says it is English");
-        assert_eq!(detect("🇯🇵 A"), Some("ja"));
-        assert_eq!(detect("🇺🇸🇰🇷 A"), Some("en"));
-        assert_eq!(detect("🇹🇼 A"), Some("zh"));
+        is("🇨🇳 [Hamao] Fallin' [Chinese]", "zh");
+        is("🇯🇵 A [EN]", "ja,en");
+        is("🇯🇵 A", "ja");
+        is("🇺🇸🇰🇷 A", "en,ko");
+        is("🇹🇼 A", "zh");
     }
 
     #[test]
