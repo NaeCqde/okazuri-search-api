@@ -90,7 +90,7 @@ The answer:
 
 ### `GET /okazuri/hitomi?q=<title>`: the English title of a work
 
-Asks Hitomi.La (now, nothing is saved) for the works whose **title** has the text, and answers their English titles. Hitomi.La
+Asks Hitomi.La for the works whose **title** has the text, and answers their English titles. Hitomi.La
 keeps the words of the Japanese title and of the English title in one index, so the Japanese title of a work finds its English
 one.
 
@@ -105,15 +105,22 @@ one.
       "japaneseTitle": "姉弟でシたらいけません",
       "exact": true
     }
-  ]
+  ],
+  "saved": false
 }
 ```
+
+The answer is **saved** in its own tables of the search database: `english_lookups` (`key`: the text as it is compared, letters and
+digits in lower case; `text`; `looked_at`; `count`, so a title that nothing answered is not asked every time) and `english_titles`
+(`key`, `gallery_id`, `position`, `url`, `title`, `japanese_title`, `exact`). `live` is the one of the search: `diff` (default) answers
+with the saved titles while they are younger than `[search] ttl_hours` and asks the site otherwise (the old rows are replaced);
+`off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
 
 A gallery is an answer when the text, without the spaces and the marks (case does not matter), is in its Japanese title or in its
 title; `exact` says it is the whole title. The ones with `exact: true` come first, the others are the newest first, at most
 `[search] max_results_per_site` (20 at most). `title` is what the site gives: English, or the romaji (a gallery in another
 language has both the English title and the title of its language). `results` is empty when no gallery has the title. A site that
-does not answer is a 502; no `q` is a 422. The route is there when `[search]` is on.
+does not answer is a 502; no `q` (or a `live` that is not off, diff or on) is a 422. The route is there when `[search]` is on.
 
 `GET /okazuri/sites` lists them. Checked in 2026-10 from a home connection:
 

@@ -90,6 +90,33 @@ pub struct HitomiTitle {
     pub exact: bool,
 }
 
+impl HitomiTitle {
+    /// The row of the table `english_titles` (the key is put when it is saved).
+    fn row(&self, position: i64) -> crate::entity::english_title::Model {
+        crate::entity::english_title::Model {
+            key: String::new(),
+            gallery_id: i64::from(self.id),
+            position,
+            url: self.url.clone(),
+            title: self.title.clone(),
+            japanese_title: self.japanese_title.clone(),
+            exact: self.exact,
+        }
+    }
+}
+
+impl From<crate::entity::english_title::Model> for HitomiTitle {
+    fn from(row: crate::entity::english_title::Model) -> Self {
+        HitomiTitle {
+            id: row.gallery_id as u32,
+            url: row.url,
+            title: row.title,
+            japanese_title: row.japanese_title,
+            exact: row.exact,
+        }
+    }
+}
+
 /// What `reromanize_works` did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Reromanized {
@@ -679,10 +706,37 @@ impl Engine {
         }
     }
 
-    /// The English titles of the works of Hitomi.La whose title (the Japanese one, or the English one) has the text. Only
-    /// the title is looked at: a gallery counts when the text, without the spaces and the marks, is in its title. The
-    /// ones that are the same title come first, then the newest. Asks the site now (nothing is saved).
-    pub async fn hitomi_english(self: &Arc<Self>, text: &str) -> Result<Vec<HitomiTitle>> {
+    /// The English titles of the works of Hitomi.La whose title has the text, from the table `english_titles` (saved by an
+    /// earlier answer) or, when there is none or it is older than `ttl_hours` (or with `Live::On`), from the site, and
+    /// saved. `Live::Off` never asks the site. The flag says that the answer is the saved one.
+    pub async fn hitomi_english(self: &Arc<Self>, text: &str, live: Live) -> Result<(Vec<HitomiTitle>, bool)> {
+        let key = crate::hitomi::squash(text);
+
+        if key.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        let looked_at = self.store.english_looked_at(&key).await?;
+        let young = looked_at.is_some_and(|at| unix_now().saturating_sub(at) < (self.config.ttl_hours * 3600) as i64);
+
+        if live == Live::Off || (live == Live::Diff && young) {
+            let saved = self.store.english_titles(&key).await?;
+
+            return Ok((saved.into_iter().map(HitomiTitle::from).collect(), true));
+        }
+
+        let found = self.ask_hitomi_english(text).await?;
+        let rows: Vec<_> = found.iter().enumerate().map(|(place, title)| title.row(place as i64)).collect();
+
+        self.store.save_english(&key, text.trim(), unix_now(), &rows).await?;
+
+        Ok((found, false))
+    }
+
+    /// Asks the site: the galleries whose title (the Japanese one, or the English one) has the text. Only the title is
+    /// looked at: a gallery counts when the text, without the spaces and the marks, is in its title. The ones that are the
+    /// same title come first, then the newest.
+    async fn ask_hitomi_english(self: &Arc<Self>, text: &str) -> Result<Vec<HitomiTitle>> {
         let Some(index) = self.sites.iter().position(|site| site.def.format == Format::Hitomi) else {
             return Err("Hitomi.La is not one of the sites".into());
         };
@@ -1041,6 +1095,38 @@ pub(crate) mod tests {
         assert_eq!(titles.len(), 0, "the paths are the same for every query, so a page keeps the last title the site gave");
         assert_eq!(outcome.sites[0].status, "not searched");
         assert_eq!(requests(&hits), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn the_english_titles_are_the_saved_ones_while_they_are_young() {
+        let (engine, _, store) = setup(&config()).await;
+        let row = crate::entity::english_title::Model {
+            key: String::new(),
+            gallery_id: 7,
+            position: 0,
+            url: "https://hitomi.la/galleries/7.html".into(),
+            title: "Seven".into(),
+            japanese_title: Some("七".into()),
+            exact: true,
+        };
+
+        // never asked, and the site is not to be asked: nothing
+        assert_eq!(engine.hitomi_english("七", Live::Off).await.unwrap(), (vec![], true));
+        // punctuation alone is nothing to look for
+        assert_eq!(engine.hitomi_english(" !? ", Live::On).await.unwrap(), (vec![], false));
+
+        // a young answer is the one that is saved, whatever `live` says unless it is `on`
+        store.save_english("七", "七", unix_now(), &[row.clone()]).await.unwrap();
+        let (titles, saved) = engine.hitomi_english("七", Live::Diff).await.unwrap();
+        assert!(saved);
+        assert_eq!((titles[0].id, titles[0].title.as_str(), titles[0].exact), (7, "Seven", true));
+        assert_eq!(engine.hitomi_english("七", Live::Off).await.unwrap().0.len(), 1);
+
+        // an old one is asked again (the engine of the tests has no Hitomi.La: that is an error), and `off` still answers it
+        store.save_english("七", "七", 1, &[row]).await.unwrap();
+        assert!(engine.hitomi_english("七", Live::Diff).await.is_err());
+        assert!(engine.hitomi_english("七", Live::On).await.is_err());
+        assert_eq!(engine.hitomi_english("七", Live::Off).await.unwrap().0.len(), 1);
     }
 
     #[tokio::test]

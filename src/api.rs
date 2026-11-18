@@ -111,6 +111,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
 #[derive(Debug, Deserialize)]
 struct HitomiQuery {
     q: Option<String>,
+    live: Option<String>,
 }
 
 /// The title of a work (in Japanese, as a site writes it) asked to Hitomi.La, which has the English title of it too.
@@ -127,8 +128,13 @@ async fn hitomi(State(state): State<Arc<AppState>>, Query(params): Query<HitomiQ
         return invalid(&format!("q is too long (at most {} characters)", engine.max_query_chars()));
     }
 
-    match engine.hitomi_english(&text).await {
-        Ok(results) => json(StatusCode::OK, &serde_json::json!({ "input": text.trim(), "results": results })),
+    // like the search: the saved answer when it is young (diff, the default), only the saved one (off), the site always (on)
+    let Some(live) = Live::parse(params.live.as_deref().unwrap_or("")) else {
+        return invalid("live is off, diff or on");
+    };
+
+    match engine.hitomi_english(&text, live).await {
+        Ok((results, saved)) => json(StatusCode::OK, &serde_json::json!({ "input": text.trim(), "saved": saved, "results": results })),
         Err(e) => {
             log::warn!("cannot ask Hitomi.La for {:?}: {}", text, e);
             json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Hitomi.La did not answer" }))
@@ -283,6 +289,11 @@ mod tests {
 
         assert_eq!(get_from(state.clone(), "/okazuri/hitomi").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), "/okazuri/hitomi?q=%20").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/okazuri/hitomi?q={}&live=maybe", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        // only the saved answers: nothing is saved, so nothing, and no request to the site
+        let (status, _, body) = get_from(state.clone(), &format!("/okazuri/hitomi?q={}&live=off", encode("姉弟"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"saved\":true") && body.contains("\"results\":[]"), "{body}");
         let (status, content_type, body) = get_from(state, &format!("/okazuri/hitomi?q={}", encode("姉弟"))).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(content_type.starts_with("application/json"));
