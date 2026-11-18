@@ -19,7 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
 
 # The HTTP client of the sites, Google Translate, D1 and the `[cron]` jobs: async, with rustls, so no OpenSSL is needed, also for musl.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli"] }
 
 # The search engine (`[search]`): the two SQLite files (a copy of the D1 tables and the cache of the results), through
 # SeaORM (sqlx; the SQLite library is compiled into the executable), the patterns of the result links, and JSON for the
