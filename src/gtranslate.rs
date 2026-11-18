@@ -89,16 +89,16 @@ mod tests {
 
     /// Asks Google Translate (the network): `cargo test -- --ignored`.
     ///
-    /// The title of a work that was translated by hand is the proof of the model: the Advanced (Gemini) model of the page says
-    /// `The Phaethon Assault`, and the classic model says `The Battle of Phaeton`.
+    /// Only the Advanced (Gemini) model is used, and this is how it is known to work: it says `The Phaethon Assault` for this title
+    /// (the classic model says `The Battle of Phaeton`). Any other answer means the page changed (the request, the model, or what the
+    /// model says), and the code of this file has to be looked at again.
     #[tokio::test]
     #[ignore = "asks Google Translate"]
     async fn the_advanced_model_translates_paeton_kyoushuusen_the_way_gemini_does() {
         let client = reqwest::Client::new();
         let translated = translate(&client, "パエトーン強襲戦", Lang::Japanese, Lang::English).await.unwrap();
 
-        assert_ne!(translated, "The Battle of Phaeton", "this is the classic model");
-        assert_eq!(translated, "The Phaethon Assault", "the Advanced (Gemini) model says this; the classic one says The Battle of Phaeton");
+        assert_eq!(translated, "The Phaethon Assault", "Google Translate changed: it is not the answer of the Advanced (Gemini) model any more");
     }
 
     #[test]

@@ -160,12 +160,12 @@ The same rules for `q` (Japanese or English, the direction follows), and the sam
 `Phaethon Assault`): it is taken off before it is saved; the translation of Hitomi.La is left as the site writes it.
 
 Google Translate is asked the way its web page asks (the RPC `MkEWBc` of `translate.google.com`, the request of the model that the
-page calls Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. **It is not known
-that this request gets the Gemini model**: for `パエトーン強襲戦` the page says `The Phaethon Assault` when it opens with the text
-in its address (the answer has `[[3],[[6,3]]]` at the end), and this request (the one the page sends when the text is typed, with
-the model 1 or 2) gets `Assault on Phaeton` from both models (`[[0],[[6,1]]]`); the page sends a `x-goog-batchexecute-bgr` token with
-the request, which this program cannot make. The test `gtranslate::tests::the_advanced_model_...` (`cargo test -- --ignored`, it asks
-Google) says whether the request gets the Advanced answer.
+page calls Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. Only the Advanced model is used, and the test
+`gtranslate::tests::the_advanced_model_...` (`cargo test -- --ignored`, it asks Google) is how a change is noticed: the request works when
+`パエトーン強襲戦` comes back as `The Phaethon Assault` (the classic model says `The Battle of Phaeton`), and any other answer means that
+Google changed. **At the moment the test fails**: the request that this program sends (the one the page sends when the text is typed) gets
+`Assault on Phaeton` (`[[0],[[6,1]]]`), and the page says `The Phaethon Assault` only when it opens with the text in its address (`[[3],[[6,3]]]`);
+the page sends a `x-goog-batchexecute-bgr` token with the request, which this program cannot make.
 
 ```json
 { "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "Assault on Phaeton", "saved": false }
