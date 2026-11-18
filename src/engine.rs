@@ -271,12 +271,12 @@ pub enum Live {
 }
 
 impl Live {
-    /// `off`, `diff` and `force`; `0`, `false`, `no` are off, `1`, `true`, `yes` are force. `None` for anything else.
+    /// `off`, `diff` and `force`; `0`, `false`, `no` are off, `on`, `1`, `true`, `yes` are force (`on` is the old name). `None` for anything else.
     pub fn parse(text: &str) -> Option<Live> {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" | "0" | "false" | "no" => Some(Live::Off),
             "diff" | "" => Some(Live::Diff),
-            "force" | "1" | "true" | "yes" => Some(Live::Force),
+            "force" | "on" | "1" | "true" | "yes" => Some(Live::Force),
             _ => None,
         }
     }
@@ -294,12 +294,15 @@ pub struct Request<'a> {
     pub limit: usize,
     /// Where the English title of a query in Japanese comes from; the sites are searched for it too.
     pub translator: Translator,
+    /// The sites (their indexes, `Engine::site_indexes`) that are left out: not asked, and their saved works are not in the
+    /// answer.
+    pub exclude: &'a [usize],
 }
 
 #[cfg(test)]
 impl<'a> Request<'a> {
     pub fn new(query: &'a str) -> Self {
-        Self { query, live: Live::Diff, limit: 100, translator: Translator::None }
+        Self { query, live: Live::Diff, limit: 100, translator: Translator::None, exclude: &[] }
     }
 }
 
@@ -443,6 +446,27 @@ impl Engine {
         Ok(done)
     }
 
+    /// The indexes of the sites with these names (case does not matter), for `Request::exclude`. The name that is no site is
+    /// the error.
+    pub fn site_indexes(&self, names: &[String]) -> std::result::Result<Vec<usize>, String> {
+        names
+            .iter()
+            .map(|name| {
+                self.sites
+                    .iter()
+                    .position(|site| site.def.name.eq_ignore_ascii_case(name.trim()))
+                    .ok_or_else(|| name.trim().to_string())
+            })
+            .collect()
+    }
+
+    /// The indexes of every site but Hitomi.La, and whether Hitomi.La is searched at all (`GET /hitomila/search`).
+    pub fn all_but_hitomi(&self) -> Option<Vec<usize>> {
+        let hitomi = self.sites.iter().position(|site| site.def.format == Format::Hitomi)?;
+
+        self.active.contains(&hitomi).then(|| (0..self.sites.len()).filter(|&index| index != hitomi).collect())
+    }
+
     pub fn sites_info(&self) -> Vec<SiteInfo> {
         self.sites
             .iter()
@@ -499,12 +523,17 @@ impl Engine {
 
     /// The sites to ask, each with the queries that are missing or old (all of them with `refresh`). A slow site is left
     /// out unless `slow_too`.
-    async fn due(&self, plan: &Plan, slow_too: bool, refresh: bool) -> Result<Vec<(usize, Vec<String>)>> {
+    async fn due(&self, plan: &Plan, slow_too: bool, refresh: bool, exclude: &[usize]) -> Result<Vec<(usize, Vec<String>)>> {
         let now = unix_now();
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut due = Vec::new();
 
         for &index in &self.active {
+            // a site that the request leaves out is neither asked nor looked up
+            if exclude.contains(&index) {
+                continue;
+            }
+
             let site = &self.sites[index];
             let mut missing = Vec::new();
 
@@ -537,17 +566,17 @@ impl Engine {
     pub async fn is_fresh(&self, query: &str) -> Result<bool> {
         let plan = self.plan(query)?;
 
-        Ok(self.due(&plan, false, false).await?.is_empty())
+        Ok(self.due(&plan, false, false, &[]).await?.is_empty())
     }
 
     /// Asks `query` to the sites whose answer is missing or older than `ttl_hours` (a failure: `retry_failed_minutes`),
     /// and saves the works that are new. A request asks the slow sites too (`slow_too`), the prefetch does not.
     pub async fn fetch(self: &Arc<Self>, query: &str, slow_too: bool) -> Result<Fetched> {
-        self.fetch_with(query, slow_too, false).await
+        self.fetch_with(query, slow_too, false, &[]).await
     }
 
     /// Like `fetch`; with `refresh` every site is asked, whether its answer is up to date or not.
-    pub async fn fetch_with(self: &Arc<Self>, query: &str, slow_too: bool, refresh: bool) -> Result<Fetched> {
+    pub async fn fetch_with(self: &Arc<Self>, query: &str, slow_too: bool, refresh: bool, exclude: &[usize]) -> Result<Fetched> {
         let plan = self.plan(query)?;
 
         if plan.query.is_empty() {
@@ -557,7 +586,7 @@ impl Engine {
         let mut fetched = Fetched::default();
         let mut tasks = tokio::task::JoinSet::new();
 
-        for (index, texts) in self.due(&plan, slow_too, refresh).await? {
+        for (index, texts) in self.due(&plan, slow_too, refresh, exclude).await? {
             fetched.asked.insert(index);
 
             let engine = self.clone();
@@ -618,14 +647,17 @@ impl Engine {
 
         let fetched = match request.live {
             Live::Off => Fetched::default(),
-            Live::Diff => self.fetch_with(request.query, true, false).await?,
-            Live::Force => self.fetch_with(request.query, true, true).await?,
+            Live::Diff => self.fetch_with(request.query, true, false, request.exclude).await?,
+            Live::Force => self.fetch_with(request.query, true, true, request.exclude).await?,
         };
 
         let mut hits: Vec<Hit> = Vec::new();
         for work in self.store.candidates(terms.prefilter()).await? {
             // a site that is left out does not answer, whatever was saved of it
             let Some(&index) = self.active.iter().find(|&&i| self.sites[i].def.name == work.website) else { continue };
+            if request.exclude.contains(&index) {
+                continue;
+            }
 
             // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
             if terms.matches_title(&work.title_romaji) {
@@ -653,7 +685,7 @@ impl Engine {
         hits.truncate(request.limit.max(1));
 
         Ok(Outcome {
-            sites: self.reports(&plan, &fetched.asked, request.live != Live::Off).await?,
+            sites: self.reports(&plan, &fetched.asked, request.live != Live::Off, request.exclude).await?,
             input: plan.input,
             terms: terms.keys().into_iter().map(str::to_string).collect(),
             total,
@@ -663,11 +695,15 @@ impl Engine {
         })
     }
 
-    async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool) -> Result<Vec<SiteReport>> {
+    async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool, exclude: &[usize]) -> Result<Vec<SiteReport>> {
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut reports = Vec::new();
 
         for &index in &self.active {
+            if exclude.contains(&index) {
+                continue;
+            }
+
             let site = &self.sites[index];
             let name = site.def.name;
             let queries = self.queries_for(site, plan);
@@ -1217,6 +1253,29 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_excluded_site_is_not_asked_not_looked_up_and_not_reported() {
+        let (engine, hits, _) = setup(&config()).await;
+        let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();
+        assert_eq!(leave_out.len(), 1, "the names are matched without regard to case");
+        assert_eq!(engine.site_indexes(&["Nowhere".to_string()]), Err("Nowhere".to_string()));
+
+        // the other two sites are asked, the good one is not, and its works are not in the answer
+        let outcome = engine.search(&Request { exclude: &leave_out, ..Request::new("q") }).await.unwrap();
+        assert_eq!(requests(&hits), (0, 1, 1));
+        assert_eq!(outcome.sites.iter().map(|s| s.website.as_str()).collect::<Vec<_>>(), ["Failing", "Blocked"]);
+        assert!(outcome.results.is_empty());
+
+        // asked later without the exclusion, the site is asked (nothing was saved for it), and it answers
+        let all = engine.search(&Request::new("q")).await.unwrap();
+        assert_eq!(all.results.len(), 2);
+        assert_eq!(requests(&hits).0, 1);
+
+        // its saved works stay out of the answer while it is excluded: nothing is looked up
+        let again = engine.search(&Request { live: Live::Off, exclude: &leave_out, ..Request::new("q") }).await.unwrap();
+        assert!(again.results.is_empty());
+    }
+
+    #[tokio::test]
     async fn the_multiplication_sign_stays_only_for_the_sites_that_need_it() {
         let (port, _) = server().await;
         let work = format!(r"^http://127\.0\.0\.1:{port}/work/\d+");
@@ -1226,7 +1285,7 @@ pub(crate) mod tests {
         let store = Arc::new(SearchStore::in_memory().await.unwrap());
         let engine = Engine::with_sites(sites, &config(), store.clone(), crate::testing::romanizer_arc());
 
-        let outcome = engine.search(&Request { query: "COMIC  E×E 11", live: Live::Diff, limit: 10, translator: Translator::None }).await.unwrap();
+        let outcome = engine.search(&Request { query: "COMIC  E×E 11", live: Live::Diff, limit: 10, translator: Translator::None, exclude: &[] }).await.unwrap();
 
         assert_eq!(outcome.query, "COMIC ExE 11", "the answer is written with x");
         assert_eq!(store.states("COMIC ExE 11").await.unwrap().keys().collect::<Vec<_>>(), ["Plain"]);
@@ -1237,7 +1296,7 @@ pub(crate) mod tests {
         assert_eq!(outcome.total, 2);
 
         // the bot writes the sign as x already: between capitals it is put back for the site
-        let outcome = engine.search(&Request { query: "COMIC ExE 12", live: Live::Diff, limit: 10, translator: Translator::None }).await.unwrap();
+        let outcome = engine.search(&Request { query: "COMIC ExE 12", live: Live::Diff, limit: 10, translator: Translator::None, exclude: &[] }).await.unwrap();
         let asked: Vec<_> = outcome.sites.iter().map(|site| site.queries.clone()).collect();
         assert_eq!(asked, [vec!["COMIC ExE 12".to_string()], vec!["COMIC E×E 12".to_string()]]);
     }

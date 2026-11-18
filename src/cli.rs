@@ -396,7 +396,7 @@ async fn search(
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
 
     let limit = limit.unwrap_or(config.search.max_results);
-    let outcome = engine.search(&Request { query: &text, live, limit, translator: crate::engine::Translator::None }).await?;
+    let outcome = engine.search(&Request { query: &text, live, limit, translator: crate::engine::Translator::None, exclude: &[] }).await?;
 
     for site in &outcome.sites {
         println!(

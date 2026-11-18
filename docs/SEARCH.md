@@ -61,8 +61,9 @@ is missing may just be beyond the cut, so it stays. A failed try changes nothing
 | `q` | The words. Required, at most `[search] max_query_chars` characters. |
 | `live=off` | Ask no site: answer from the database alone, even when what it has is out of date. |
 | `live=diff` (default) | Ask only the combinations of query and site that are missing or older than `ttl_hours` (a month); for the others the database answers (`cached`). |
-| `live=force` | Ask every site, cached or not (`searched`; a failure of an earlier try is asked again). |
+| `live=force` | Ask every site, cached or not (`searched`; a failure of an earlier try is asked again). `on` (the old name), `1`, `true` and `yes` mean the same. |
 | `limit=n` | The most works in the answer (at most `[search] max_results`). |
+| `exclude=A,B` | The sites (names as `GET /okazuri/sites` lists them, case does not matter, separated by commas) that are left out: they are not asked, their saved works are not in the answer, and they are not in `sites`. A name that is no site is a 422. The translation is not affected: `translator` says where it comes from. |
 | `translator=auto` (default) | A query with Japanese in it is searched in English too: the English title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translation` says the title (`{"text", "source"}`). |
 | `translator=hitomi` | Hitomi.La only: when it fails or has nothing, the English search is left out (`translation` is `null`). |
 | `translator=google` | Google Translate only. |
@@ -91,6 +92,12 @@ The answer:
 
 `status` is `searched` (asked now), `failed` (the `error` says why) or `not searched` (`live=0`); `queries` are the queries the site is asked
 (one or two, see above) and `count` the works they listed together. A site that fails does not stop the others. `total` is the number of works that have all the words; `results` may be shorter. A page is one work in the database and one result: a page that a site writes with and without the slash at the end (`/g/1/`, `/g/1`) is saved once. A page saved with the slash that the site lists without it later is **renamed** to the path without (the same row, so `first_seen` stays, and the lists that name it follow); one listed in both forms at once is saved without the slash (a site that writes it that way does not need it); one that is saved without the slash stays so; one that is only ever listed with the slash keeps it, and works with the same address (also with or without the `/` at the end, or the `#` part, in lower case) are one, the first stays, and it is `isNew` when any of them is.
+
+## The same search on Hitomi.La: `GET /hitomila/search`
+
+`GET /hitomila/search?q=…` is `/okazuri/search` with every other site left out (`exclude`): the same parameters (`live`, `limit`,
+`translator`) and the same answer (`input`, `query`, `terms`, `total`, `results`, `sites` with Hitomi.La alone, `translation`). It has no route (404)
+when Hitomi.La is left out of `[search]`.
 
 ## The sites
 
