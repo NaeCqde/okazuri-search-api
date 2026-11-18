@@ -3,7 +3,9 @@
 //! the title (`works.language`) and made again by `import` and `reromanize`.
 //!
 //! The answer is the two-letter codes of the languages the title names, joined with `,` in the order it names them (`zh`, `en,ko`; a pack
-//! `[CN,EN,JP,KR]` is `zh,en,ja,ko`), or None when the title says nothing (most titles are Japanese and do not say so).
+//! `[CN,EN,JP,KR]` is `zh,en,ko`), or None when the title says nothing (most titles are Japanese and do not say so). Japanese is
+//! named only when it is the only language: a title that names Japanese and another language (`[Japanese, Chinese]`, a flag of Japan and `[EN]`)
+//! is a work in the other language.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -87,7 +89,12 @@ fn add(found: &mut Vec<&'static str>, code: &'static str) {
 
 /// The language codes of a title, joined with `,`; None when it names none.
 pub fn detect(title: &str) -> Option<String> {
-    let found = detect_all(title);
+    let mut found = detect_all(title);
+
+    // Japanese next to another language is the original that the other one translates, or the flag a site puts on everything
+    if found.len() > 1 {
+        found.retain(|code| *code != "ja");
+    }
 
     (!found.is_empty()).then(|| found.join(","))
 }
@@ -170,10 +177,12 @@ mod tests {
     }
 
     #[test]
-    fn a_title_that_names_several_languages_has_them_all_in_the_order_it_names_them() {
-        is("x [CN,EN,JP,KR]", "zh,en,ja,ko");
-        is("x [jap / eng / rus]", "ja,en,ru");
-        is("x [English, Japanese]", "en,ja");
+    fn a_title_that_names_several_languages_has_them_all_in_the_order_it_names_them_without_japanese() {
+        is("x [CN,EN,JP,KR]", "zh,en,ko");
+        is("x [jap / eng / rus]", "en,ru");
+        is("x [jap / rus / eng]", "ru,en");
+        is("x [English, Japanese]", "en");
+        is("x [Japanese, Chinese]", "zh");
         is("x [ENG VIE RUS subs]", "en,vi,ru");
         is("[A] B [English] [無邪気漢化組]", "zh,en");
     }
@@ -181,7 +190,9 @@ mod tests {
     #[test]
     fn a_flag_that_the_site_put_first_counts_once() {
         is("🇨🇳 [Hamao] Fallin' [Chinese]", "zh");
-        is("🇯🇵 A [EN]", "ja,en");
+        is("🇯🇵 A [EN]", "en");
+        is("🇯🇵 【EN】Kosuzu-Chan", "en");
+        is("🇯🇵 [KR] U", "ko");
         is("🇯🇵 A", "ja");
         is("🇺🇸🇰🇷 A", "en,ko");
         is("🇹🇼 A", "zh");
