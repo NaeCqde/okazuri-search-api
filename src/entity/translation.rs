@@ -18,6 +18,9 @@ pub struct Model {
     pub url: String,
     pub english: String,
     pub japanese: String,
+    /// `english` and `japanese` as they are compared (`hitomi::squash`), to find a translation from the other side.
+    pub english_key: String,
+    pub japanese_key: String,
     /// The text was the whole title.
     pub exact: bool,
 }

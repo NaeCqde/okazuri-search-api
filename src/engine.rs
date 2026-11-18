@@ -142,6 +142,8 @@ impl Translation {
             url: self.url.clone(),
             english: self.english.clone(),
             japanese: self.japanese.clone(),
+            english_key: crate::hitomi::squash(&self.english),
+            japanese_key: crate::hitomi::squash(&self.japanese),
             exact: self.exact,
         }
     }
@@ -763,8 +765,34 @@ impl Engine {
         // again every time (`diff`): the site may have the work now
         let saved = self.store.translations(&key).await?;
 
-        if live == Live::Off || (live == Live::Diff && !saved.is_empty()) {
+        if live != Live::On && !saved.is_empty() {
             return Ok((saved.into_iter().map(Translation::from).collect(), true));
+        }
+
+        // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
+        if live != Live::On {
+            let others = self.store.translations_with(from == Lang::English, &key, 20).await?;
+
+            if !others.is_empty() {
+                let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english_key.clone() } else { row.japanese_key.clone() };
+                let mut found: Vec<Translation> = others
+                    .into_iter()
+                    .map(|row| {
+                        let exact = side(&row) == key;
+
+                        Translation { exact, ..Translation::from(row) }
+                    })
+                    .collect();
+
+                found.sort_by_key(|translation| !translation.exact);
+
+                return Ok((found, true));
+            }
+        }
+
+        // `off` never asks the site
+        if live == Live::Off {
+            return Ok((Vec::new(), true));
         }
 
         let found = self.ask_translations(text, from).await?;
@@ -1212,6 +1240,8 @@ pub(crate) mod tests {
             url: "https://hitomi.la/galleries/7.html".into(),
             english: "Seven".into(),
             japanese: "七".into(),
+            english_key: "seven".into(),
+            japanese_key: "七".into(),
             exact: true,
         };
 
@@ -1228,10 +1258,18 @@ pub(crate) mod tests {
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
 
         // a saved answer never gets old: only `on` asks the site again (the engine of the tests has no Hitomi.La: that is an error)
-        store.save_translations("七", "七", "ja", 1, &[row]).await.unwrap();
+        store.save_translations("七", "七", "ja", 1, &[row.clone()]).await.unwrap();
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 1);
         assert!(engine.translate("七", Lang::Japanese, Live::On).await.is_err());
         assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
+
+        // a translation that was asked from the other side answers too: Japanese to English saved, English to Japanese asked
+        store.save_translations("九", "九", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 9, english: "Nine Lives".into(), japanese: "九つの命".into(), english_key: "ninelives".into(), japanese_key: "九つの命".into(), ..row.clone() }]).await.unwrap();
+        let (found, saved) = engine.translate("Nine", Lang::English, Live::Diff).await.unwrap();
+        assert!(saved);
+        assert_eq!((found[0].japanese.as_str(), found[0].exact), ("九つの命", false));
+        assert_eq!(engine.translate("九つの命", Lang::Japanese, Live::On).await.is_err(), true, "`on` asks the site");
+        assert_eq!(engine.translate("Nine Lives", Lang::English, Live::Off).await.unwrap().0[0].exact, true);
 
         // a text that found nothing is asked again (`diff`), not taken from the lookup; `off` never asks
         store.save_translations("八", "八", "ja", unix_now(), &[]).await.unwrap();

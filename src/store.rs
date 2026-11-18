@@ -378,6 +378,20 @@ impl SearchStore {
             .await?)
     }
 
+    /// The saved translations that have the text (as `hitomi::squash` writes it) in their English title (`english`) or in
+    /// their Japanese title, whatever text they were asked for: a translation Japanese to English answers English to
+    /// Japanese too. The newest saved first; the caller puts the whole titles first.
+    pub async fn translations_with(&self, english: bool, key: &str, limit: u64) -> Result<Vec<translation::Model>> {
+        let column = if english { translation::Column::EnglishKey } else { translation::Column::JapaneseKey };
+
+        Ok(translation::Entity::find()
+            .filter(column.contains(key))
+            .order_by_desc(translation::Column::GalleryId)
+            .limit(limit)
+            .all(&self.db)
+            .await?)
+    }
+
     /// Saves the answer for a text: the rows of an earlier answer are replaced (a gallery that is gone is gone), and the
     /// lookup is noted, also when nothing answered. `from` is the language of the text (`ja` or `en`).
     pub async fn save_translations(&self, key: &str, text: &str, from: &str, now: i64, rows: &[translation::Model]) -> Result<()> {
@@ -620,6 +634,8 @@ mod tests {
             url: format!("https://hitomi.la/galleries/{id}.html"),
             english: english.into(),
             japanese: "日本語".into(),
+            english_key: english.to_lowercase(),
+            japanese_key: "日本語".into(),
             exact: position == 0,
         };
 
@@ -632,6 +648,11 @@ mod tests {
         store.save_translations("nihongo", "日本語", "ja", 200, &[row(3, 0, "Three")]).await.unwrap();
         assert_eq!(store.translations("nihongo").await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
         assert_eq!(store.translations("other").await.unwrap().len(), 1);
+
+        // found from the other side: by the English title and by the Japanese one, whatever text was asked
+        assert_eq!(store.translations_with(true, "three", 10).await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
+        assert_eq!(store.translations_with(false, "日本", 10).await.unwrap().len(), 2, "the one of nihongo (replaced) and the one of other");
+        assert!(store.translations_with(true, "zzz", 10).await.unwrap().is_empty());
 
         // nothing answered: the lookup is noted all the same
         store.save_translations("nothing", "なし", "ja", 300, &[]).await.unwrap();
