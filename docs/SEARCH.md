@@ -63,6 +63,12 @@ is missing may just be beyond the cut, so it stays. A failed try changes nothing
 | `live=diff` (default) | Ask only the combinations of query and site that are missing or older than `ttl_hours` (a month); for the others the database answers (`cached`). |
 | `live=on` | Ask every site, cached or not (`searched`; a failure of an earlier try is asked again). |
 | `limit=n` | The most works in the answer (at most `[search] max_results`). |
+| `translator=auto` (default) | A query with Japanese in it is searched in English too: the English title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translation` says the title (`{"text", "source"}`). |
+| `translator=hitomi` | Hitomi.La only: when it fails or has nothing, the English search is left out (`translation` is `null`). |
+| `translator=google` | Google Translate only. |
+| `translator=none` | No English search. |
+
+`live` also tells the translation what to do: the saved translation is used (`diff`), only the saved one (`off`), or the source is asked again (`on`).
 
 The answer:
 
@@ -88,7 +94,7 @@ The answer:
 
 ## The sites
 
-### `GET /okazuri/translate?q=<text>`: Japanese to English, English to Japanese
+### `GET /hitomila/translate?q=<text>`: Japanese to English, English to Japanese
 
 A translation of the title of a work, from the titles of Hitomi.La: a gallery has its title in English and in Japanese, and the
 site keeps the words of both in one index. The language of `q` says the direction: Japanese (it has kana or kanji) to English, or
@@ -134,6 +140,21 @@ and digits in lower case; `text`; `from_lang`; `looked_at`; `count`: a note of t
 that was never asked, and a text that nothing answered (it is asked every time, the site may have the work now); `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
 A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not off, diff or on is a
 422. The route is there when `[search]` is on.
+
+### `GET /google/translate?q=<text>`: the same from Google Translate
+
+The same rules for `q` (Japanese or English, the direction follows) and `live`, and the same tables: the translation is saved with the
+source `google` (kept for good: `diff` and `off` answer with it, `on` asks Google again; `off` with nothing saved is a 502). Google
+Translate is asked the way its web page asks (the RPC `MkEWBc` of `translate.google.com`, with the model that the page calls
+Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. A title of one line
+came back the same from the Advanced and the classic model when this was written.
+
+```json
+{ "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "Assault on Phaeton", "saved": false }
+```
+
+The saved rows of Hitomi.La and of Google are separate (`translations.source`); a translation of Hitomi.La for the other direction
+answers `/hitomila/translate`, one of Google does not (a machine translation does not go back).
 
 `GET /okazuri/sites` lists them. Checked in 2026-10 from a home connection:
 
@@ -206,7 +227,7 @@ only the sites that are missing or old are asked), so a restart of the program, 
 says `prefetch: n/total "query"` for each query. A slow site (177Picyy: one request in 20 seconds) is left out of the prefetch,
 because every query would wait for it; a request to `/okazuri/search` asks it, with one form of the query.
 
-A query with Japanese in it is searched three ways: as written, in romaji (both by the search itself), and **in English**: when Hitomi.La is one of the sites, the prefetch asks `/okazuri/translate` for the query (Japanese to English; saved for good), and searches the sites for the English titles it gives (3 at most), saving the works. This is also done for a query that was searched before, so the works of the English titles come after the update too. The log says `prefetch: "query" in English "title"`. A failure of the translation is a warning; the query itself is done.
+A query with Japanese in it is searched three ways: as written, in romaji (both by the search itself), and **in English**: when Hitomi.La is one of the sites, the prefetch asks Hitomi.La (as `/hitomila/translate` does; saved for good; never Google Translate), and searches the sites for the English titles it gives (3 at most), saving the works. This is also done for a query that was searched before, so the works of the English titles come after the update too. The log says `prefetch: "query" in English "title"`. A failure of the translation is a warning; the query itself is done.
 
 ### After the rules of the romaji changed (`reromanize`)
 
