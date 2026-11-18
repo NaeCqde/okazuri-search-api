@@ -114,7 +114,7 @@ impl Prefetcher {
             return;
         }
 
-        let found = match self.engine.translate(query, Lang::Japanese, Live::Diff).await {
+        let found = match self.engine.translate(query, Lang::Japanese, Live::Diff, false).await {
             Ok((found, _)) => found,
             Err(e) => {
                 log::warn!("prefetch: no English title for {query:?}: {e}");

@@ -386,6 +386,7 @@ impl SearchStore {
 
         Ok(translation::Entity::find()
             .filter(column.contains(key))
+            .filter(translation::Column::Source.eq("hitomi"))
             .order_by_desc(translation::Column::GalleryId)
             .limit(limit)
             .all(&self.db)
@@ -637,6 +638,7 @@ mod tests {
             english_key: english.to_lowercase(),
             japanese_key: "日本語".into(),
             exact: position == 0,
+            source: "hitomi".into(),
         };
 
         store.save_translations("nihongo", "日本語", "ja", 100, &[row(2, 0, "Two"), row(1, 1, "One")]).await.unwrap();

@@ -137,7 +137,7 @@ async fn translate(State(state): State<Arc<AppState>>, Query(params): Query<Tran
         return invalid("live is off, diff or on");
     };
 
-    match engine.translate(&text, from, live).await {
+    match engine.translate(&text, from, live, true).await {
         Ok((results, saved)) => {
             let to = from.other();
             let translation = results.first().map(|best| best.text(to));

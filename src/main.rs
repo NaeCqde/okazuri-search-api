@@ -6,6 +6,7 @@ mod d1;
 mod engine;
 mod hitomi;
 mod entity;
+mod gtranslate;
 mod mirror;
 mod prefetch;
 mod query;

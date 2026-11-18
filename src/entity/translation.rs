@@ -23,6 +23,8 @@ pub struct Model {
     pub japanese_key: String,
     /// The text was the whole title.
     pub exact: bool,
+    /// Where it comes from: `hitomi` (the titles of a work) or `google` (Google Translate: no gallery, `gallery_id` 0).
+    pub source: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
