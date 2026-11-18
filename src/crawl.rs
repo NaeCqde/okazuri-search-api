@@ -234,14 +234,14 @@ impl Crawler {
     async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool) -> std::result::Result<Walk, String> {
         let name = self.engine.site(index).def.name;
         let mut walk = Walk::default();
-        let mut seen = !cursor.is_empty();
+        // the first pages of DLsite are sparse (a few works among the ones not out yet), so a page of this machine may be empty after a work
+        let leading_empty = if name == "DLsite" && cursor.is_empty() { EMPTY_PAGES_AT_START } else { 0 };
 
         loop {
             let step = self.step(index, source, &cursor, shard).await?;
             let mut next = step.next.clone();
             let listed = step.links.len();
-            seen |= listed > 0;
-            if next.is_none() && !seen && matches!(source, Source::Pages(_)) && walk.pages < EMPTY_PAGES_AT_START {
+            if next.is_none() && matches!(source, Source::Pages(_)) && walk.pages < leading_empty {
                 next = Some((page_number(&cursor, shard) + shard.1).to_string());
             }
             let works = self.engine.works_of(step.links).await?;
