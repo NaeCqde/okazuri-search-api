@@ -205,16 +205,38 @@ impl Crawler {
         let name = site.def.name;
         let state = self.engine.store().crawl_state(name).await.map_err(|e| e.to_string())?;
         let first = !state.as_ref().is_some_and(|row| row.done);
-        let (shard, shards) = if first { self.shard } else { (0, 1) };
-        let mut cursor = if first { state.map(|row| row.cursor).unwrap_or_default() } else { String::new() };
+        let cursor = if first { state.map(|row| row.cursor).unwrap_or_default() } else { String::new() };
+        let mut walk = Walk::default();
+
+        // a first walk that is taken up again: the list moved while it was stopped (new works are on the first pages, and what was
+        // read is further down than the cursor says), so the newest pages are read again up to a page that is known, as every later
+        // walk does, and then the walk goes on from its cursor
+        if first && !cursor.is_empty() {
+            let caught_up = self.pages(index, source, String::new(), (0, 1), false).await?;
+            log::info!("crawl {name}: {} pages read again from the newest, {} new works, before the walk goes on", caught_up.pages, caught_up.new);
+            walk.pages += caught_up.pages;
+            walk.new += caught_up.new;
+        }
+
+        let rest = self.pages(index, source, cursor, if first { self.shard } else { (0, 1) }, first).await?;
+        walk.pages += rest.pages;
+        walk.new += rest.new;
+        walk.finished = rest.finished;
+
+        Ok(walk)
+    }
+
+    /// Reads pages from `cursor`. A first walk (`first`) goes to the end of the list and saves where it is after each page; any
+    /// other stops at the first page with nothing new in it (or after `refresh_pages`) and leaves the saved place as it is.
+    async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool) -> std::result::Result<Walk, String> {
+        let name = self.engine.site(index).def.name;
         let mut walk = Walk::default();
 
         loop {
-            let step = self.step(index, source, &cursor, (shard, shards)).await?;
+            let step = self.step(index, source, &cursor, shard).await?;
             let next = step.next.clone();
             let listed = step.links.len();
             let works = self.engine.works_of(step.links).await?;
-            // the first walk goes on to the next page, whatever this one had; the next walks do not go past a page of known works
             let finished = next.is_none();
             let position = if first { Some((next.as_deref().unwrap_or(""), finished)) } else { None };
             let new = self.engine.store().save_crawled(name, unix_now(), &works, position).await.map_err(|e| e.to_string())?;
@@ -481,8 +503,8 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let rest = crawler.walk(index, &source).await.unwrap();
-        assert_eq!(rest, Walk { pages: 3, new: 4, finished: true });
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4, "page 1 was not read again");
+        assert_eq!(rest, Walk { pages: 4, new: 4, finished: true });
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5, "page 1 is read again (it is known: one request), then pages 2, 3 and the empty 4");
         assert_eq!(store.counts().await.unwrap().1, 6);
     }
 
@@ -511,6 +533,28 @@ mod tests {
         let works = crawler.engine.works_of(page.links).await.unwrap();
         store.save_crawled("Listed", 1, &works, Some(("", true))).await.unwrap();
         assert_eq!(crawler.walk(index, &source).await.unwrap().pages, 2);
+    }
+
+    #[tokio::test]
+    async fn a_first_walk_that_is_taken_up_again_first_reads_the_newest_pages_up_to_a_known_one() {
+        let (port, hits) = server(2, 5).await;
+        let (crawler, store) = crawler(port, CrawlConfig::default()).await;
+        let (index, source) = crawler.sources[0].clone();
+
+        // pages 2 and 3 were read, the cursor is at 4; page 1 is what came to the list while the walk was stopped
+        for n in [2, 3] {
+            let page = crawler.step(index, &source, &n.to_string(), (0, 1)).await.unwrap();
+            let works = crawler.engine.works_of(page.links).await.unwrap();
+            store.save_crawled("Listed", 1, &works, Some(("4", false))).await.unwrap();
+        }
+        hits.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let walk = crawler.walk(index, &source).await.unwrap();
+
+        assert_eq!(walk, Walk { pages: 5, new: 6, finished: true }, "page 1 and the known page 2, then pages 4, 5 and the empty 6");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(store.counts().await.unwrap().1, 10);
+        assert!(store.crawl_state("Listed").await.unwrap().unwrap().done);
     }
 
     #[tokio::test]
