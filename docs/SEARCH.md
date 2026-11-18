@@ -145,8 +145,7 @@ A site that does not answer is a 502; no `q`, a `q` that is not Japanese or Engl
 
 The same rules for `q` (Japanese or English, the direction follows), and the same tables: the translation is saved with the source
 `google` (kept for good). `live=diff` (default) answers with the saved one, and `live=on` asks Google again. There is **no
-`live=off`** for Google Translate (a 422): it is asked whenever nothing is saved (in `/auto/translate` and in the search, `off` is
-`diff` for the Google part). A translation that was saved for the other direction answers too, when its title is the whole text
+`live=off`** for Google Translate (a 422): it is asked whenever nothing is saved (in the search, `off` is `diff` for the Google part; `/auto/translate` refuses it too). A translation that was saved for the other direction answers too, when its title is the whole text
 (`十` → `Ten` saved, so `Ten` → `十`). A translation from Japanese to English does not start with `The` (`The Phaethon Assault` →
 `Phaethon Assault`): it is taken off before it is saved; the translation of Hitomi.La is left as the site writes it.
 
@@ -173,7 +172,7 @@ rules for `q` and `live`; the answer is the first translation, and `source` says
 { "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "ZenZero Gyaku Ra Goudou \"Phaethon Assault\"", "source": "hitomi", "saved": false }
 ```
 
-Both are saved as above; a 502 when neither has a translation. This is what `translator=auto` of the search uses.
+Both are saved as above; a 502 when neither has a translation. `live=off` is a 422 here too (Google is asked when nothing is saved). This is what `translator=auto` of the search uses.
 
 `GET /okazuri/sites` lists them. Checked in 2026-10 from a home connection:
 
