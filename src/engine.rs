@@ -77,43 +77,87 @@ impl Plan {
     }
 }
 
-/// A work of Hitomi.La for a title (`hitomi_english`).
+/// The two languages that are translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Japanese,
+    English,
+}
+
+impl Lang {
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::Japanese => "ja",
+            Lang::English => "en",
+        }
+    }
+
+    pub fn other(self) -> Lang {
+        match self {
+            Lang::Japanese => Lang::English,
+            Lang::English => Lang::Japanese,
+        }
+    }
+
+    /// The language of a text: Japanese when it has kana or kanji, English when its letters are all Latin (and it has some).
+    /// Any other text (Korean, Cyrillic, a text of marks and digits) is not translated.
+    pub fn of(text: &str) -> Option<Lang> {
+        if crate::query::has_japanese(text) {
+            return Some(Lang::Japanese);
+        }
+
+        let mut letters = text.chars().filter(|c| c.is_alphabetic()).peekable();
+
+        (letters.peek().is_some() && letters.all(|c| c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c))).then_some(Lang::English)
+    }
+}
+
+/// A translation of a text: the title of a work of Hitomi.La in English and in Japanese (`translate`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct HitomiTitle {
+pub struct Translation {
     pub id: u32,
     pub url: String,
-    /// The title the site gives: English, or the romaji (some galleries have the English title and the title of their language).
-    pub title: String,
-    pub japanese_title: Option<String>,
+    pub english: String,
+    pub japanese: String,
     /// The text is the whole title.
     pub exact: bool,
 }
 
-impl HitomiTitle {
-    /// The row of the table `english_titles` (the key is put when it is saved).
-    fn row(&self, position: i64) -> crate::entity::english_title::Model {
-        crate::entity::english_title::Model {
+impl Translation {
+    /// The text in the language that is asked for.
+    pub fn text(&self, lang: Lang) -> &str {
+        match lang {
+            Lang::Japanese => &self.japanese,
+            Lang::English => &self.english,
+        }
+    }
+
+    /// The row of the table `translations` (the key is put when it is saved).
+    fn row(&self, position: i64) -> crate::entity::translation::Model {
+        crate::entity::translation::Model {
             key: String::new(),
             gallery_id: i64::from(self.id),
             position,
             url: self.url.clone(),
-            title: self.title.clone(),
-            japanese_title: self.japanese_title.clone(),
+            english: self.english.clone(),
+            japanese: self.japanese.clone(),
             exact: self.exact,
         }
     }
 }
 
-impl From<crate::entity::english_title::Model> for HitomiTitle {
-    fn from(row: crate::entity::english_title::Model) -> Self {
-        HitomiTitle {
-            id: row.gallery_id as u32,
-            url: row.url,
-            title: row.title,
-            japanese_title: row.japanese_title,
-            exact: row.exact,
-        }
+impl From<crate::entity::translation::Model> for Translation {
+    fn from(row: crate::entity::translation::Model) -> Self {
+        Translation { id: row.gallery_id as u32, url: row.url, english: row.english, japanese: row.japanese, exact: row.exact }
+    }
+}
+
+/// The English title of a gallery: some have `English | 日本語` in the title (`hitomi::Gallery::link`).
+fn english_part(title: &str) -> &str {
+    match title.rsplit_once(" | ") {
+        Some((head, tail)) if crate::query::has_japanese(tail) && !head.trim().is_empty() => head.trim(),
+        _ => title.trim(),
     }
 }
 
@@ -706,37 +750,39 @@ impl Engine {
         }
     }
 
-    /// The English titles of the works of Hitomi.La whose title has the text, from the table `english_titles` (saved by an
-    /// earlier answer) or, when there is none or it is older than `ttl_hours` (or with `Live::On`), from the site, and
-    /// saved. `Live::Off` never asks the site. The flag says that the answer is the saved one.
-    pub async fn hitomi_english(self: &Arc<Self>, text: &str, live: Live) -> Result<(Vec<HitomiTitle>, bool)> {
+    /// The translation of a text, Japanese to English or English to Japanese, from the titles of Hitomi.La (a work has both).
+    /// The answer is saved in the tables `translation_lookups` and `translations`: `live` is the one of the search, a young
+    /// saved answer is the one that is given unless it is `on`, `off` never asks the site. Returns the language of the text,
+    /// the translations (the ones that are the whole title first) and whether they are the saved ones. A text that is not
+    /// Japanese or English is an error of the caller (`Lang::of`).
+    pub async fn translate(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
         let key = crate::hitomi::squash(text);
 
         if key.is_empty() {
             return Ok((Vec::new(), false));
         }
 
-        let looked_at = self.store.english_looked_at(&key).await?;
+        let looked_at = self.store.translation_looked_at(&key).await?;
         let young = looked_at.is_some_and(|at| unix_now().saturating_sub(at) < (self.config.ttl_hours * 3600) as i64);
 
         if live == Live::Off || (live == Live::Diff && young) {
-            let saved = self.store.english_titles(&key).await?;
+            let saved = self.store.translations(&key).await?;
 
-            return Ok((saved.into_iter().map(HitomiTitle::from).collect(), true));
+            return Ok((saved.into_iter().map(Translation::from).collect(), true));
         }
 
-        let found = self.ask_hitomi_english(text).await?;
-        let rows: Vec<_> = found.iter().enumerate().map(|(place, title)| title.row(place as i64)).collect();
+        let found = self.ask_translations(text, from).await?;
+        let rows: Vec<_> = found.iter().enumerate().map(|(place, found)| found.row(place as i64)).collect();
 
-        self.store.save_english(&key, text.trim(), unix_now(), &rows).await?;
+        self.store.save_translations(&key, text.trim(), from.code(), unix_now(), &rows).await?;
 
         Ok((found, false))
     }
 
-    /// Asks the site: the galleries whose title (the Japanese one, or the English one) has the text. Only the title is
-    /// looked at: a gallery counts when the text, without the spaces and the marks, is in its title. The ones that are the
-    /// same title come first, then the newest.
-    async fn ask_hitomi_english(self: &Arc<Self>, text: &str) -> Result<Vec<HitomiTitle>> {
+    /// Asks the site: the galleries whose title in the language of the text has the text, without the spaces and the marks.
+    /// A gallery that has no title in the other language is no translation. The ones that are the same title come first,
+    /// then the newest.
+    async fn ask_translations(self: &Arc<Self>, text: &str, from: Lang) -> Result<Vec<Translation>> {
         let Some(index) = self.sites.iter().position(|site| site.def.format == Format::Hitomi) else {
             return Err("Hitomi.La is not one of the sites".into());
         };
@@ -754,24 +800,30 @@ impl Engine {
         .map_err(|e| format!("the request task died: {e}"))??;
 
         let wanted = crate::hitomi::squash(text);
-        let mut found: Vec<HitomiTitle> = galleries
+        let mut found: Vec<Translation> = galleries
             .into_iter()
             .filter_map(|gallery| {
-                let japanese = gallery.japanese_title.clone().unwrap_or_default();
-                let (in_japanese, in_title) = (crate::hitomi::squash(&japanese), crate::hitomi::squash(&gallery.title));
+                let japanese = gallery.japanese_title.as_deref().map(str::trim).filter(|t| !t.is_empty())?.to_string();
+                let english = english_part(&gallery.title).to_string();
 
-                (!wanted.is_empty() && (in_japanese.contains(&wanted) || in_title.contains(&wanted))).then(|| HitomiTitle {
+                if english.is_empty() || (from == Lang::English && crate::query::has_japanese(&english)) {
+                    return None;
+                }
+
+                let title = crate::hitomi::squash(if from == Lang::Japanese { &japanese } else { &english });
+
+                (!wanted.is_empty() && title.contains(&wanted)).then(|| Translation {
                     id: gallery.id,
                     url: self.sites[index].address(&gallery.path()),
-                    exact: in_japanese == wanted || in_title == wanted,
-                    title: gallery.title,
-                    japanese_title: gallery.japanese_title,
+                    exact: title == wanted,
+                    english,
+                    japanese,
                 })
             })
             .collect();
 
         // the same title first; the order of the galleries (the newest first) otherwise
-        found.sort_by_key(|title| !title.exact);
+        found.sort_by_key(|translation| !translation.exact);
 
         Ok(found)
     }
@@ -1097,36 +1149,49 @@ pub(crate) mod tests {
         assert_eq!(requests(&hits), (2, 2, 2));
     }
 
+    #[test]
+    fn the_language_of_a_text_is_japanese_or_english_only() {
+        assert_eq!(Lang::of("姉弟でシたらいけません"), Some(Lang::Japanese));
+        assert_eq!(Lang::of("COMIC 快楽天 2026"), Some(Lang::Japanese));
+        assert_eq!(Lang::of("Siblings Shouldn't Do It 2"), Some(Lang::English));
+        assert_eq!(Lang::of("Café"), Some(Lang::English));
+        assert_eq!(Lang::of("형제"), None);
+        assert_eq!(Lang::of("Привет"), None);
+        assert_eq!(Lang::of("123 !?"), None);
+        assert_eq!(english_part("Ane to Otouto | 姉弟"), "Ane to Otouto");
+        assert_eq!(english_part("A | B"), "A | B");
+    }
+
     #[tokio::test]
-    async fn the_english_titles_are_the_saved_ones_while_they_are_young() {
+    async fn the_translations_are_the_saved_ones_while_they_are_young() {
         let (engine, _, store) = setup(&config()).await;
-        let row = crate::entity::english_title::Model {
+        let row = crate::entity::translation::Model {
             key: String::new(),
             gallery_id: 7,
             position: 0,
             url: "https://hitomi.la/galleries/7.html".into(),
-            title: "Seven".into(),
-            japanese_title: Some("七".into()),
+            english: "Seven".into(),
+            japanese: "七".into(),
             exact: true,
         };
 
         // never asked, and the site is not to be asked: nothing
-        assert_eq!(engine.hitomi_english("七", Live::Off).await.unwrap(), (vec![], true));
+        assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
         // punctuation alone is nothing to look for
-        assert_eq!(engine.hitomi_english(" !? ", Live::On).await.unwrap(), (vec![], false));
+        assert_eq!(engine.translate(" !? ", Lang::Japanese, Live::On).await.unwrap(), (vec![], false));
 
         // a young answer is the one that is saved, whatever `live` says unless it is `on`
-        store.save_english("七", "七", unix_now(), &[row.clone()]).await.unwrap();
-        let (titles, saved) = engine.hitomi_english("七", Live::Diff).await.unwrap();
+        store.save_translations("七", "七", "ja", unix_now(), &[row.clone()]).await.unwrap();
+        let (found, saved) = engine.translate("七", Lang::Japanese, Live::Diff).await.unwrap();
         assert!(saved);
-        assert_eq!((titles[0].id, titles[0].title.as_str(), titles[0].exact), (7, "Seven", true));
-        assert_eq!(engine.hitomi_english("七", Live::Off).await.unwrap().0.len(), 1);
+        assert_eq!((found[0].id, found[0].text(Lang::English), found[0].text(Lang::Japanese), found[0].exact), (7, "Seven", "七", true));
+        assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
 
         // an old one is asked again (the engine of the tests has no Hitomi.La: that is an error), and `off` still answers it
-        store.save_english("七", "七", 1, &[row]).await.unwrap();
-        assert!(engine.hitomi_english("七", Live::Diff).await.is_err());
-        assert!(engine.hitomi_english("七", Live::On).await.is_err());
-        assert_eq!(engine.hitomi_english("七", Live::Off).await.unwrap().0.len(), 1);
+        store.save_translations("七", "七", "ja", 1, &[row]).await.unwrap();
+        assert!(engine.translate("七", Lang::Japanese, Live::Diff).await.is_err());
+        assert!(engine.translate("七", Lang::Japanese, Live::On).await.is_err());
+        assert_eq!(engine.translate("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
     }
 
     #[tokio::test]

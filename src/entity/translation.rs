@@ -1,11 +1,12 @@
-//! An English title that Hitomi.La has for a title: one row for a gallery that answered a title (`english_lookups`).
+//! A translation that Hitomi.La has for a text: one row for a gallery that answered it (`translation_lookups`).
+//! The gallery has its title in English and in Japanese, so the pair is the translation, in both directions.
 
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(table_name = "english_titles")]
+#[sea_orm(table_name = "translations")]
 pub struct Model {
-    /// The title that was asked (`english_lookups.key`).
+    /// The text that was asked (`translation_lookups.key`).
     #[sea_orm(primary_key, auto_increment = false)]
     pub key: String,
     /// The id of the gallery on Hitomi.La.
@@ -15,9 +16,8 @@ pub struct Model {
     pub position: i64,
     /// The address of the gallery's page.
     pub url: String,
-    /// The title the site gives: English, or the romaji.
-    pub title: String,
-    pub japanese_title: Option<String>,
+    pub english: String,
+    pub japanese: String,
     /// The text was the whole title.
     pub exact: bool,
 }

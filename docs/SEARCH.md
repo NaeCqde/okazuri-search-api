@@ -88,21 +88,24 @@ The answer:
 
 ## The sites
 
-### `GET /okazuri/hitomi?q=<title>`: the English title of a work
+### `GET /okazuri/translate?q=<text>`: Japanese to English, English to Japanese
 
-Asks Hitomi.La for the works whose **title** has the text, and answers their English titles. Hitomi.La
-keeps the words of the Japanese title and of the English title in one index, so the Japanese title of a work finds its English
-one.
+A translation of the title of a work, from the titles of Hitomi.La: a gallery has its title in English and in Japanese, and the
+site keeps the words of both in one index. The language of `q` says the direction: Japanese (it has kana or kanji) to English, or
+English (its letters are all Latin) to Japanese. Any other text is a 422: only these two are translated.
 
 ```json
 {
   "input": "姉弟でシたらいけません",
+  "from": "ja",
+  "to": "en",
+  "translation": "Kyoudai de Shitara Ikemasen",
   "results": [
     {
       "id": 3863504,
       "url": "https://hitomi.la/galleries/3863504.html",
-      "title": "Kyoudai de Shitara Ikemasen",
-      "japaneseTitle": "姉弟でシたらいけません",
+      "english": "Kyoudai de Shitara Ikemasen",
+      "japanese": "姉弟でシたらいけません",
       "exact": true
     }
   ],
@@ -110,17 +113,19 @@ one.
 }
 ```
 
-The answer is **saved** in its own tables of the search database: `english_lookups` (`key`: the text as it is compared, letters and
-digits in lower case; `text`; `looked_at`; `count`, so a title that nothing answered is not asked every time) and `english_titles`
-(`key`, `gallery_id`, `position`, `url`, `title`, `japanese_title`, `exact`). `live` is the one of the search: `diff` (default) answers
-with the saved titles while they are younger than `[search] ttl_hours` and asks the site otherwise (the old rows are replaced);
-`off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
+`translation` is the text of the first result in the other language (`null` when nothing answered). A gallery is a result when the
+text, without the spaces and the marks (case does not matter), is in its title in the language of the text, and it has a title in
+the other language too (a gallery with one title is no translation). `exact` says it is the whole title; those come first, the
+others are the newest first, at most `[search] max_results_per_site` (20 at most). The English title is what the site gives
+(English, or the romaji of the Japanese one).
 
-A gallery is an answer when the text, without the spaces and the marks (case does not matter), is in its Japanese title or in its
-title; `exact` says it is the whole title. The ones with `exact: true` come first, the others are the newest first, at most
-`[search] max_results_per_site` (20 at most). `title` is what the site gives: English, or the romaji (a gallery in another
-language has both the English title and the title of its language). `results` is empty when no gallery has the title. A site that
-does not answer is a 502; no `q` (or a `live` that is not off, diff or on) is a 422. The route is there when `[search]` is on.
+The answer is **saved** in its own tables of the search database: `translation_lookups` (`key`: the text as it is compared, letters
+and digits in lower case; `text`; `from_lang`; `looked_at`; `count`, so a text that nothing answered is not asked every time) and
+`translations` (`key`, `gallery_id`, `position`, `url`, `english`, `japanese`, `exact`). `live` is the one of the search: `diff`
+(default) answers with the saved translations while they are younger than `[search] ttl_hours` and asks the site otherwise (the old
+rows are replaced); `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
+A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not off, diff or on is a
+422. The route is there when `[search]` is on.
 
 `GET /okazuri/sites` lists them. Checked in 2026-10 from a home connection:
 

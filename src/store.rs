@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{english_lookup, english_title, listing, search, work};
+use crate::entity::{listing, search, translation, translation_lookup, work};
 use crate::query::title_key;
 use crate::sites::toggle_slash;
 use crate::utils::Result;
@@ -98,13 +98,13 @@ impl SearchStore {
         let mut works = schema.create_table_from_entity(work::Entity);
         let mut searches = schema.create_table_from_entity(search::Entity);
         let mut listings = schema.create_table_from_entity(listing::Entity);
-        let mut english_lookups = schema.create_table_from_entity(english_lookup::Entity);
-        let mut english_titles = schema.create_table_from_entity(english_title::Entity);
+        let mut translation_lookups = schema.create_table_from_entity(translation_lookup::Entity);
+        let mut translations = schema.create_table_from_entity(translation::Entity);
         db.execute(backend.build(works.if_not_exists())).await?;
         db.execute(backend.build(searches.if_not_exists())).await?;
         db.execute(backend.build(listings.if_not_exists())).await?;
-        db.execute(backend.build(english_lookups.if_not_exists())).await?;
-        db.execute(backend.build(english_titles.if_not_exists())).await?;
+        db.execute(backend.build(translation_lookups.if_not_exists())).await?;
+        db.execute(backend.build(translations.if_not_exists())).await?;
 
         let by_update = Index::create()
             .name("works_updated_at")
@@ -369,44 +369,50 @@ impl SearchStore {
         Ok(new)
     }
 
-    /// When a title was asked to Hitomi.La for its English titles (`key` is the title as `hitomi::squash` writes it). None
-    /// when it was not.
-    pub async fn english_looked_at(&self, key: &str) -> Result<Option<i64>> {
-        Ok(english_lookup::Entity::find_by_id(key.to_string()).one(&self.db).await?.map(|row| row.looked_at))
+    /// When a text was asked to Hitomi.La for its translation (`key` is the text as `hitomi::squash` writes it). None when
+    /// it was not.
+    pub async fn translation_looked_at(&self, key: &str) -> Result<Option<i64>> {
+        Ok(translation_lookup::Entity::find_by_id(key.to_string()).one(&self.db).await?.map(|row| row.looked_at))
     }
 
-    /// The English titles that were saved for a title, in the order of the answer.
-    pub async fn english_titles(&self, key: &str) -> Result<Vec<english_title::Model>> {
-        Ok(english_title::Entity::find()
-            .filter(english_title::Column::Key.eq(key))
-            .order_by_asc(english_title::Column::Position)
+    /// The translations that were saved for a text, in the order of the answer.
+    pub async fn translations(&self, key: &str) -> Result<Vec<translation::Model>> {
+        Ok(translation::Entity::find()
+            .filter(translation::Column::Key.eq(key))
+            .order_by_asc(translation::Column::Position)
             .all(&self.db)
             .await?)
     }
 
-    /// Saves the answer for a title: the rows of an earlier answer are replaced (a gallery that is gone is gone), and the
-    /// lookup is noted, also when nothing answered.
-    pub async fn save_english(&self, key: &str, text: &str, now: i64, titles: &[english_title::Model]) -> Result<()> {
+    /// Saves the answer for a text: the rows of an earlier answer are replaced (a gallery that is gone is gone), and the
+    /// lookup is noted, also when nothing answered. `from` is the language of the text (`ja` or `en`).
+    pub async fn save_translations(&self, key: &str, text: &str, from: &str, now: i64, rows: &[translation::Model]) -> Result<()> {
         let transaction = self.db.begin().await?;
 
-        english_title::Entity::delete_many().filter(english_title::Column::Key.eq(key)).exec(&transaction).await?;
+        translation::Entity::delete_many().filter(translation::Column::Key.eq(key)).exec(&transaction).await?;
 
-        if !titles.is_empty() {
-            let rows: Vec<english_title::ActiveModel> = titles.iter().cloned().map(|row| english_title::Model { key: key.to_string(), ..row }.into_active_model()).collect();
+        if !rows.is_empty() {
+            let active: Vec<translation::ActiveModel> = rows.iter().cloned().map(|row| translation::Model { key: key.to_string(), ..row }.into_active_model()).collect();
 
-            english_title::Entity::insert_many(rows).exec_without_returning(&transaction).await?;
+            translation::Entity::insert_many(active).exec_without_returning(&transaction).await?;
         }
 
-        let noted = english_lookup::ActiveModel {
+        let noted = translation_lookup::ActiveModel {
             key: Set(key.to_string()),
             text: Set(text.to_string()),
+            from_lang: Set(from.to_string()),
             looked_at: Set(now),
-            count: Set(titles.len() as i64),
+            count: Set(rows.len() as i64),
         };
-        english_lookup::Entity::insert(noted)
+        translation_lookup::Entity::insert(noted)
             .on_conflict(
-                OnConflict::column(english_lookup::Column::Key)
-                    .update_columns([english_lookup::Column::Text, english_lookup::Column::LookedAt, english_lookup::Column::Count])
+                OnConflict::column(translation_lookup::Column::Key)
+                    .update_columns([
+                        translation_lookup::Column::Text,
+                        translation_lookup::Column::FromLang,
+                        translation_lookup::Column::LookedAt,
+                        translation_lookup::Column::Count,
+                    ])
                     .to_owned(),
             )
             .exec_without_returning(&transaction)
@@ -611,35 +617,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_english_titles_of_a_title_are_saved_and_replaced() {
+    async fn the_translations_of_a_text_are_saved_and_replaced() {
         let store = SearchStore::in_memory().await.unwrap();
-        let row = |id: i64, position: i64, title: &str| english_title::Model {
+        let row = |id: i64, position: i64, english: &str| translation::Model {
             key: String::new(),
             gallery_id: id,
             position,
             url: format!("https://hitomi.la/galleries/{id}.html"),
-            title: title.into(),
-            japanese_title: Some("日本語".into()),
+            english: english.into(),
+            japanese: "日本語".into(),
             exact: position == 0,
         };
 
-        assert_eq!(store.english_looked_at("nihongo").await.unwrap(), None);
+        assert_eq!(store.translation_looked_at("nihongo").await.unwrap(), None);
 
-        store.save_english("nihongo", "日本語", 100, &[row(2, 0, "Two"), row(1, 1, "One")]).await.unwrap();
-        assert_eq!(store.english_looked_at("nihongo").await.unwrap(), Some(100));
-        let saved = store.english_titles("nihongo").await.unwrap();
-        assert_eq!(saved.iter().map(|r| (r.gallery_id, r.title.as_str(), r.key.as_str())).collect::<Vec<_>>(), [(2, "Two", "nihongo"), (1, "One", "nihongo")]);
+        store.save_translations("nihongo", "日本語", "ja", 100, &[row(2, 0, "Two"), row(1, 1, "One")]).await.unwrap();
+        assert_eq!(store.translation_looked_at("nihongo").await.unwrap(), Some(100));
+        let saved = store.translations("nihongo").await.unwrap();
+        assert_eq!(saved.iter().map(|r| (r.gallery_id, r.english.as_str(), r.key.as_str())).collect::<Vec<_>>(), [(2, "Two", "nihongo"), (1, "One", "nihongo")]);
 
-        // a later answer replaces the rows; another title is left alone
-        store.save_english("other", "他", 100, &[row(9, 0, "Nine")]).await.unwrap();
-        store.save_english("nihongo", "日本語", 200, &[row(3, 0, "Three")]).await.unwrap();
-        assert_eq!(store.english_titles("nihongo").await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
-        assert_eq!(store.english_titles("other").await.unwrap().len(), 1);
+        // a later answer replaces the rows; another text is left alone
+        store.save_translations("other", "他", "ja", 100, &[row(9, 0, "Nine")]).await.unwrap();
+        store.save_translations("nihongo", "日本語", "ja", 200, &[row(3, 0, "Three")]).await.unwrap();
+        assert_eq!(store.translations("nihongo").await.unwrap().iter().map(|r| r.gallery_id).collect::<Vec<_>>(), [3]);
+        assert_eq!(store.translations("other").await.unwrap().len(), 1);
 
         // nothing answered: the lookup is noted all the same
-        store.save_english("nothing", "なし", 300, &[]).await.unwrap();
-        assert_eq!(store.english_looked_at("nothing").await.unwrap(), Some(300));
-        assert!(store.english_titles("nothing").await.unwrap().is_empty());
+        store.save_translations("nothing", "なし", "ja", 300, &[]).await.unwrap();
+        assert_eq!(store.translation_looked_at("nothing").await.unwrap(), Some(300));
+        assert!(store.translations("nothing").await.unwrap().is_empty());
     }
 
     #[tokio::test]
