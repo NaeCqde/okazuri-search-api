@@ -113,19 +113,19 @@ English (its letters are all Latin) to Japanese. Any other text is a 422: only t
 }
 ```
 
-`translation` is the text of the first result in the other language (`null` when nothing answered). Hitomi.La has no gallery that
-carries both the English and the Japanese title, so the **romaji** links them: the Japanese gallery is `Kyoudai de Shitara Ikemasen`
-(with `japanese_title`), the English one is `Siblings Shouldn't Do It! | Kyoudai de Shitara Ikemasen`. The flow is two lookups:
+`translation` is the text of the first result in the other language (`null` when nothing answered). The Japanese gallery has the
+Japanese title, the galleries in English have the English one (the site has the Japanese words in the index of the galleries of
+the other languages too, so a text in Japanese finds them all). The galleries are **the same work** when their artists, groups,
+parodies and kind are the same and the pages are about as many (3 at most apart: a translation can add a page of credits); the
+tags (`big ass`, `paizuri`...) are not compared, they differ from one upload to another, and the romaji in the titles is not
+needed. So:
 
-1. the text is looked up (at most `[search] max_results_per_site` galleries, 20 at most): Japanese to English finds the gallery whose
-   Japanese title has the text, and takes its romaji; English to Japanese finds the `English | romaji` galleries whose English has the
-   text, and takes the romaji;
-2. the romaji (up to 3 of them) is looked up, and the galleries with exactly that romaji give the other side: the English title in
-   front of `| romaji` (the bonus and the other languages are other romaji), or the Japanese title.
+- Japanese to English: the gallery whose Japanese title has the text, and the galleries in English that are the same work;
+- English to Japanese: the galleries in English whose title has the text, and the Japanese gallery that is the same work (when the
+  first search does not have it, the romaji after the bar of `English | romaji` is looked up).
 
-A gallery with an English title and its Japanese title in one title (`English | 日本語`) answers at once. `exact` says the text is the
-whole title (spaces, marks and case aside); those come first. Romaji alone (`Kyoudai de Shitara Ikemasen`) is not Japanese: it is
-English, and is looked up as an English title, so it has no translation unless some gallery has it in front of `|`.
+A gallery with neither an artist nor a group is never the same work as another. `exact` says the text is the whole title (spaces,
+marks and case aside); those come first.
 
 The answer is **saved** in its own tables of the search database: `translation_lookups` (`key`: the text as it is compared, letters
 and digits in lower case; `text`; `from_lang`; `looked_at`; `count`, so a text that nothing answered is not asked every time) and

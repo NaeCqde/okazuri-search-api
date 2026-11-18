@@ -219,9 +219,32 @@ pub struct Gallery {
     pub id: u32,
     pub title: String,
     pub japanese_title: Option<String>,
+    /// The language of the gallery: `japanese`, `english`, `chinese`... (none when the site does not say).
+    pub language: Option<String>,
+    /// `doujinshi`, `manga`... (none when the site does not say).
+    pub kind: Option<String>,
+    /// The artists, the groups and the parodies (the series), in lower case, as the site names them.
+    pub artists: Vec<String>,
+    pub groups: Vec<String>,
+    pub parodies: Vec<String>,
+    /// The number of pages.
+    pub pages: usize,
 }
 
 impl Gallery {
+    /// Whether the two are the same work in two languages: the same artists, groups, parodies and kind, and about the same
+    /// number of pages (a translation can add a page of credits). A gallery with neither an artist nor a group is never the same.
+    pub fn same_work(&self, other: &Gallery) -> bool {
+        let set = |names: &[String]| names.iter().cloned().collect::<HashSet<String>>();
+
+        (!self.artists.is_empty() || !self.groups.is_empty())
+            && set(&self.artists) == set(&other.artists)
+            && set(&self.groups) == set(&other.groups)
+            && set(&self.parodies) == set(&other.parodies)
+            && self.kind == other.kind
+            && self.pages.abs_diff(other.pages) <= 3
+    }
+
     /// The path of the page of the gallery (the site redirects it to the page with the title in its address).
     pub fn path(&self) -> String {
         format!("/galleries/{}.html", self.id)
@@ -245,7 +268,25 @@ pub fn parse_gallery(id: u32, body: &str) -> Option<Gallery> {
 
     let text = |key: &str| info.get(key).and_then(|value| value.as_str()).map(str::trim).filter(|text| !text.is_empty());
 
-    Some(Gallery { id, title: text("title")?.to_string(), japanese_title: text("japanese_title").map(str::to_string) })
+    // the names of a list like `"artists": [{"artist": "kujiran", "url": "..."}]`
+    let names = |list: &str, key: &str| -> Vec<String> {
+        info.get(list)
+            .and_then(|value| value.as_array())
+            .map(|items| items.iter().filter_map(|item| item.get(key)?.as_str()).map(|name| name.trim().to_lowercase()).collect())
+            .unwrap_or_default()
+    };
+
+    Some(Gallery {
+        id,
+        title: text("title")?.to_string(),
+        japanese_title: text("japanese_title").map(str::to_string),
+        language: text("language").map(str::to_lowercase),
+        kind: text("type").map(str::to_lowercase),
+        artists: names("artists", "artist"),
+        groups: names("groups", "group"),
+        parodies: names("parodys", "parody"),
+        pages: info.get("files").and_then(|files| files.as_array()).map_or(0, Vec::len),
+    })
 }
 
 /// The galleries for a query: at most `limit`, the newest first. A gallery whose file is gone is left out; when none of

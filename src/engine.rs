@@ -786,139 +786,87 @@ impl Engine {
         .map_err(|e| format!("the request task died: {e}"))??)
     }
 
-    /// Asks the site. A gallery has the title of its language and, for the translations, `English | romaji` (the English
-    /// one) or `romaji` with the Japanese title in `japanese_title` (the Japanese one). The romaji is what links the two, so:
-    /// 1. the text is looked up in the galleries, which gives the romaji of the work (for an English text: the tail of an
-    ///    `English | romaji` title whose English has the text; for a Japanese text: the title of a gallery whose Japanese
-    ///    title has the text);
-    /// 2. the romaji is looked up, and the galleries with exactly that romaji give the other side: the English title in front
-    ///    of it, or the Japanese title.
-    /// A gallery whose two titles are given (English and Japanese) answers at once. The ones that are the same title come
-    /// first, then the newest.
+    /// Asks the site. The galleries are the same work in different languages when their artists, groups, parodies and kind are
+    /// the same and the pages are about as many (`Gallery::same_work`); the romaji in the titles is not needed. The Japanese
+    /// gallery has the Japanese title, and the galleries in English have the English one (the site keeps the Japanese words in
+    /// the index of the galleries of the other languages too, so the text in Japanese finds them all):
+    /// - Japanese to English: the gallery whose Japanese title has the text, and the English galleries that are the same work;
+    /// - English to Japanese: the English galleries whose title has the text, and the Japanese gallery that is the same work (when
+    ///   the first search does not have it, the romaji after the bar of the title is looked up).
+    /// The ones that are the same title come first, then the newest.
     async fn ask_translations(self: &Arc<Self>, text: &str, from: Lang) -> Result<Vec<Translation>> {
+        use crate::hitomi::{squash, Gallery};
+
         let Some(index) = self.sites.iter().position(|site| site.def.format == Format::Hitomi) else {
             return Err("Hitomi.La is not one of the sites".into());
         };
 
-        let wanted = crate::hitomi::squash(text);
+        let wanted = squash(text);
 
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
 
-        let first = self.hitomi_galleries(index, text).await?;
+        // the English title of a gallery in English: `English | romaji` is the English before the bar
+        let english_of = |gallery: &Gallery| -> String {
+            match gallery.title.rsplit_once(" | ") {
+                Some((head, tail)) if Lang::of(head) == Some(Lang::English) && Lang::of(tail) == Some(Lang::English) => head.trim().to_string(),
+                _ => gallery.title.trim().to_string(),
+            }
+        };
+        let is_english = |gallery: &Gallery| gallery.language.as_deref() == Some("english");
+        let japanese_of = |gallery: &Gallery| gallery.japanese_title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+
+        let mut pool = self.hitomi_galleries(index, text).await?;
         let mut found: Vec<Translation> = Vec::new();
-        let mut romaji: Vec<(String, bool, String)> = Vec::new(); // (romaji, exact, the Japanese title or "")
 
-        for gallery in &first {
-            let japanese = gallery.japanese_title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
-            let title = gallery.title.trim().to_string();
-            let (head, tail) = match title.rsplit_once(" | ") {
-                Some((head, tail)) if !head.trim().is_empty() => (head.trim().to_string(), Some(tail.trim().to_string())),
-                _ => (title.clone(), None),
-            };
-
-            match (from, &japanese) {
-                // the Japanese gallery: its title is the romaji
-                (Lang::Japanese, Some(japanese)) => {
-                    let squashed = crate::hitomi::squash(japanese);
-
-                    if squashed.contains(&wanted) {
-                        romaji.push((head.clone(), squashed == wanted, japanese.clone()));
-                    }
-                }
-                // an English gallery: `English | romaji`
-                (Lang::English, _) => {
-                    if let Some(tail) = tail.filter(|tail| Lang::of(tail) == Some(Lang::English) && Lang::of(&head) == Some(Lang::English)) {
-                        let squashed = crate::hitomi::squash(&head);
-
-                        if squashed.contains(&wanted) {
-                            romaji.push((tail, squashed == wanted, String::new()));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        romaji.retain(|(romaji, _, _)| seen.insert(crate::hitomi::squash(romaji)));
-
-        for (name, exact, japanese) in romaji.into_iter().take(3) {
-            let key = crate::hitomi::squash(&name);
-
-            for gallery in self.hitomi_galleries(index, &name).await? {
-                let title = gallery.title.trim().to_string();
-                let address = self.sites[index].address(&gallery.path());
-
-                let pair = match from {
-                    Lang::Japanese => match title.rsplit_once(" | ") {
-                        // `English | romaji`, the romaji as it is (the bonus and the other languages are other titles)
-                        Some((head, tail))
-                            if crate::hitomi::squash(tail) == key
-                                && Lang::of(head) == Some(Lang::English)
-                                && crate::hitomi::squash(head) != key =>
-                        {
-                            Some((head.trim().to_string(), japanese.clone()))
-                        }
-                        _ => None,
-                    },
-                    Lang::English => match &gallery.japanese_title {
-                        Some(japanese) if crate::hitomi::squash(&title) == key && !japanese.trim().is_empty() => {
-                            // the English title is the one of the English gallery that gave the romaji: filled below
-                            Some((String::new(), japanese.trim().to_string()))
-                        }
-                        _ => None,
-                    },
-                };
-
-                if let Some((english, japanese)) = pair {
-                    found.push(Translation { id: gallery.id, url: address, english, japanese, exact });
-                }
-            }
-        }
-
-        // English to Japanese: the English title is the text of the first step (the title in front of the romaji)
         if from == Lang::English {
-            let heads: Vec<String> = first
-                .iter()
-                .filter_map(|g| {
-                    let title = g.title.trim().to_string();
-                    let (head, _) = title.rsplit_once(" | ")?;
-                    (Lang::of(head) == Some(Lang::English) && crate::hitomi::squash(head).contains(&wanted)).then(|| head.trim().to_string())
-                })
-                .collect();
+            // the Japanese gallery is not always in the answer: the romaji of the English titles finds it
+            let anchors: Vec<Gallery> = pool.iter().filter(|g| is_english(g) && squash(&english_of(g)).contains(&wanted)).cloned().collect();
+            let mut asked = HashSet::new();
 
-            if let Some(head) = heads.iter().min_by_key(|head| (crate::hitomi::squash(head) != wanted, head.len())) {
-                for translation in &mut found {
-                    translation.english = head.clone();
+            for anchor in anchors.iter().take(3) {
+                let Some((_, tail)) = anchor.title.rsplit_once(" | ") else { continue };
+
+                if Lang::of(tail) == Some(Lang::English)
+                    && asked.insert(squash(tail))
+                    && !pool.iter().any(|g| japanese_of(g).is_some() && g.same_work(anchor))
+                {
+                    for gallery in self.hitomi_galleries(index, tail).await? {
+                        if !pool.iter().any(|g| g.id == gallery.id) {
+                            pool.push(gallery);
+                        }
+                    }
                 }
             }
         }
 
-        // a gallery that has both titles (English and Japanese, not the romaji) answers at once
-        for gallery in &first {
-            let Some(japanese) = gallery.japanese_title.as_deref().map(str::trim).filter(|t| !t.is_empty()) else { continue };
-            let Some((head, tail)) = gallery.title.rsplit_once(" | ") else { continue };
+        for anchor in &pool {
+            let Some(japanese) = japanese_of(anchor) else { continue };
 
-            if Lang::of(head) == Some(Lang::English) && tail.trim() == japanese {
-                let side = crate::hitomi::squash(if from == Lang::Japanese { japanese } else { head });
+            for other in &pool {
+                if !is_english(other) || !anchor.same_work(other) {
+                    continue;
+                }
+
+                let english = english_of(other);
+                let side = squash(if from == Lang::Japanese { &japanese } else { &english });
 
                 if side.contains(&wanted) {
                     found.push(Translation {
-                        id: gallery.id,
-                        url: self.sites[index].address(&gallery.path()),
-                        english: head.trim().to_string(),
-                        japanese: japanese.to_string(),
+                        id: other.id,
+                        url: self.sites[index].address(&other.path()),
                         exact: side == wanted,
+                        english,
+                        japanese: japanese.clone(),
                     });
                 }
             }
         }
 
         // the same answer once; the same title first, the order of the galleries (the newest first) otherwise
-        let mut seen = std::collections::HashSet::new();
-        found.retain(|t| !t.english.is_empty() && seen.insert((crate::hitomi::squash(&t.english), crate::hitomi::squash(&t.japanese))));
+        let mut seen = HashSet::new();
+        found.retain(|t| seen.insert((squash(&t.english), squash(&t.japanese))));
         found.sort_by_key(|translation| !translation.exact);
 
         Ok(found)
