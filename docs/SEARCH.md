@@ -206,6 +206,8 @@ only the sites that are missing or old are asked), so a restart of the program, 
 says `prefetch: n/total "query"` for each query. A slow site (177Picyy: one request in 20 seconds) is left out of the prefetch,
 because every query would wait for it; a request to `/okazuri/search` asks it, with one form of the query.
 
+A query with Japanese in it is searched three ways: as written, in romaji (both by the search itself), and **in English**: when Hitomi.La is one of the sites, the prefetch asks `/okazuri/translate` for the query (Japanese to English; saved, so it is asked once per `ttl_hours`), and searches the sites for the English titles it gives (3 at most), saving the works. This is also done for a query that was searched before, so the works of the English titles come after the update too. The log says `prefetch: "query" in English "title"`. A failure of the translation is a warning; the query itself is done.
+
 ### After the rules of the romaji changed (`reromanize`)
 
 A work is saved with the romaji it had when it was listed, so after an update of the rules the saved romaji is the old one

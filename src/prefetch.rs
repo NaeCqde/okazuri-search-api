@@ -6,8 +6,8 @@
 //! whose answers got old, newest issues first.
 
 use crate::config::PrefetchConfig;
-use crate::engine::Engine;
-use crate::query::issue_query;
+use crate::engine::{Engine, Lang, Live};
+use crate::query::{has_japanese, issue_query};
 use crate::mirror::{mirror_issues, Issue};
 use crate::utils::Result;
 use std::collections::HashSet;
@@ -30,6 +30,8 @@ pub struct Round {
     pub skipped: usize,
     /// Queries that failed altogether (no site was asked).
     pub failed: usize,
+    /// English titles (from Hitomi.La) that were searched, besides the queries.
+    pub english: usize,
     /// The round stopped at `max_queries_per_round` with queries left.
     pub more: bool,
 }
@@ -67,6 +69,10 @@ impl Prefetcher {
         for (number, query) in queries.into_iter().enumerate() {
             if self.engine.is_fresh(&query).await? {
                 round.skipped += 1;
+                // the English title is looked up once (it is saved): a query that was searched before this existed gets it too
+                if has_japanese(&query) {
+                    self.search_english(&query, &mut round).await;
+                }
                 continue;
             }
             if self.config.max_queries_per_round > 0 && round.searched >= self.config.max_queries_per_round {
@@ -90,10 +96,59 @@ impl Prefetcher {
                 }
             }
 
+            if has_japanese(&query) {
+                self.search_english(&query, &mut round).await;
+            }
+
             tokio::time::sleep(Duration::from_millis(self.config.query_delay_ms)).await;
         }
 
         Ok(round)
+    }
+
+    /// A query in Japanese is searched in English too: Hitomi.La has the English title of a work (`Engine::translate`, saved,
+    /// so a title that was asked is not asked again while it is young), and the sites are searched for that title as well
+    /// (the Japanese title and its romaji were searched before). A failure here is a warning: the query itself is done.
+    async fn search_english(&self, query: &str, round: &mut Round) {
+        if !self.engine.can_translate() || Lang::of(query) != Some(Lang::Japanese) {
+            return;
+        }
+
+        let found = match self.engine.translate(query, Lang::Japanese, Live::Diff).await {
+            Ok((found, _)) => found,
+            Err(e) => {
+                log::warn!("prefetch: no English title for {query:?}: {e}");
+                return;
+            }
+        };
+
+        let mut asked = HashSet::new();
+
+        for translation in found.iter().take(3) {
+            let english = translation.english.trim();
+
+            if english.is_empty() || english == query || !asked.insert(english.to_lowercase()) {
+                continue;
+            }
+            match self.engine.is_fresh(english).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!("prefetch: {english:?}: {e}");
+                    continue;
+                }
+            }
+
+            match self.engine.fetch(english, false).await {
+                Ok(fetched) => {
+                    round.english += 1;
+                    log::info!("prefetch: {query:?} in English {english:?}: {} sites asked, {} new works", fetched.asked.len(), fetched.new.len());
+                }
+                Err(e) => log::warn!("prefetch: {english:?}: {e}"),
+            }
+
+            tokio::time::sleep(Duration::from_millis(self.config.query_delay_ms)).await;
+        }
     }
 
     /// Rounds without end: a new one when the mirror changed (`wake`), when a round left queries, and at least
@@ -113,8 +168,9 @@ impl Prefetcher {
             match round {
                 Ok(round) => {
                     log::info!(
-                        "prefetch: {} searched, {} already searched, {} failed{}",
+                        "prefetch: {} searched ({} English titles too), {} already searched, {} failed{}",
                         round.searched,
+                        round.english,
                         round.skipped,
                         round.failed,
                         if round.more { ", more to do" } else { "" }
@@ -180,7 +236,7 @@ INSERT INTO `numbers` VALUES('BJ3','COMIC ExE 11',500,'LBL1');
         rebuild_mirror(&mirror, EXPORT, "bm", 1).await.unwrap();
         let prefetcher = prefetcher(PrefetchConfig::default(), engine, mirror);
 
-        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 3, skipped: 0, failed: 0, more: false });
+        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 3, skipped: 0, failed: 0, english: 0, more: false });
         let asked = hits.ok.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(asked, 5, "the site finds Japanese titles: a query with Japanese in it is asked as written and in romaji (2 x 2), the other once");
 
@@ -195,7 +251,7 @@ INSERT INTO `numbers` VALUES('BJ3','COMIC ExE 11',500,'LBL1');
         }
 
         // the second round has nothing to do
-        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 0, skipped: 3, failed: 0, more: false });
+        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 0, skipped: 3, failed: 0, english: 0, more: false });
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), asked);
 
         let _ = fs::remove_dir_all(dir);
@@ -210,8 +266,8 @@ INSERT INTO `numbers` VALUES('BJ3','COMIC ExE 11',500,'LBL1');
         rebuild_mirror(&mirror, EXPORT, "bm", 1).await.unwrap();
         let prefetcher = prefetcher(PrefetchConfig { max_queries_per_round: 2, ..PrefetchConfig::default() }, engine, mirror);
 
-        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 2, skipped: 0, failed: 0, more: true });
-        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 1, skipped: 2, failed: 0, more: false });
+        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 2, skipped: 0, failed: 0, english: 0, more: true });
+        assert_eq!(prefetcher.round().await.unwrap(), Round { searched: 1, skipped: 2, failed: 0, english: 0, more: false });
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -214,7 +214,7 @@ pub fn gallery_ids(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<u
 
 /// What `/galleries/<id>.js` says of a gallery: its title (English, or the romaji, or both when the language is not
 /// Japanese) and its Japanese title.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Gallery {
     pub id: u32,
     pub title: String,
@@ -248,6 +248,16 @@ impl Gallery {
     /// The path of the page of the gallery (the site redirects it to the page with the title in its address).
     pub fn path(&self) -> String {
         format!("/galleries/{}.html", self.id)
+    }
+
+    /// The English title of a gallery in English: `English | romaji` is the English before the bar.
+    pub fn english_title(&self) -> String {
+        use crate::engine::Lang;
+
+        match self.title.rsplit_once(" | ") {
+            Some((head, tail)) if Lang::of(head) == Some(Lang::English) && Lang::of(tail) == Some(Lang::English) => head.trim().to_string(),
+            _ => self.title.trim().to_string(),
+        }
     }
 
     /// The work as it is saved: the title, and the Japanese title after a bar (not written twice when the title has it).

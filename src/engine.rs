@@ -742,6 +742,11 @@ impl Engine {
         }
     }
 
+    /// Whether the translation can be asked: Hitomi.La is one of the sites.
+    pub fn can_translate(&self) -> bool {
+        self.sites.iter().any(|site| site.def.format == Format::Hitomi)
+    }
+
     /// The translation of a text, Japanese to English or English to Japanese, from the titles of Hitomi.La (a work has both).
     /// The answer is saved in the tables `translation_lookups` and `translations`: `live` is the one of the search, a young
     /// saved answer is the one that is given unless it is `on`, `off` never asks the site. Returns the language of the text,
@@ -807,13 +812,7 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        // the English title of a gallery in English: `English | romaji` is the English before the bar
-        let english_of = |gallery: &Gallery| -> String {
-            match gallery.title.rsplit_once(" | ") {
-                Some((head, tail)) if Lang::of(head) == Some(Lang::English) && Lang::of(tail) == Some(Lang::English) => head.trim().to_string(),
-                _ => gallery.title.trim().to_string(),
-            }
-        };
+        let english_of = |gallery: &Gallery| gallery.english_title();
         let is_english = |gallery: &Gallery| gallery.language.as_deref() == Some("english");
         let japanese_of = |gallery: &Gallery| gallery.japanese_title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
 
