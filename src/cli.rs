@@ -213,7 +213,7 @@ pub async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Serve { config, host, port } => serve(config, host, port).await,
-        Command::Convert { texts, loanwords, config } => convert(texts, loanwords, config),
+        Command::Convert { texts, loanwords, config } => convert(texts, loanwords, config).await,
         Command::Search { query, live, limit, config } => {
             search(query, live, limit, config).await
         }
@@ -223,8 +223,8 @@ pub async fn run(command: Command) -> Result<()> {
     }
 }
 
-fn load(config: Option<PathBuf>) -> Result<Config> {
-    config::load(&config.unwrap_or_else(config::default_path))
+async fn load(config: Option<PathBuf>) -> Result<Config> {
+    config::load(&config.unwrap_or_else(config::default_path)).await
 }
 
 /// The romaji conversion, which the server always has. Loading the dictionary takes a moment.
@@ -301,7 +301,7 @@ async fn sync_loop(d1: Arc<D1Client>, mirror: PathBuf, interval: Duration, wake:
 }
 
 async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>) -> Result<()> {
-    let config = load(config)?;
+    let config = load(config).await?;
     let host = host.unwrap_or(config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
 
@@ -366,8 +366,8 @@ fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
-fn convert(texts: Vec<String>, loanwords: Loanwords, config: Option<PathBuf>) -> Result<()> {
-    let config = load(config)?;
+async fn convert(texts: Vec<String>, loanwords: Loanwords, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
     let romanizer = Romanizer::new(&config.exceptions)?;
 
     if texts.is_empty() {
@@ -390,7 +390,7 @@ async fn search(
     limit: Option<usize>,
     config: Option<PathBuf>,
 ) -> Result<()> {
-    let mut config = load(config)?;
+    let mut config = load(config).await?;
     // the command is the wish to search (and the engine needs the romaji conversion)
     config.search.enabled = true;
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
@@ -417,7 +417,7 @@ async fn search(
 }
 
 async fn sync(config: Option<PathBuf>) -> Result<()> {
-    let config = load(config)?;
+    let config = load(config).await?;
     let synced = Arc::new(d1_client(&config)?).sync(&config.d1.mirror_path).await?;
 
     println!(
@@ -437,7 +437,7 @@ async fn sync(config: Option<PathBuf>) -> Result<()> {
 /// Makes the romaji of the saved works again and forgets the searches of the ones that changed. Nothing is asked to
 /// a site: the prefetch of the server does that, when it starts.
 async fn reromanize(config: Option<PathBuf>) -> Result<()> {
-    let mut config = load(config)?;
+    let mut config = load(config).await?;
     config.search.enabled = true;
 
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
@@ -452,7 +452,7 @@ async fn reromanize(config: Option<PathBuf>) -> Result<()> {
 }
 
 async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
-    let mut config = load(config)?;
+    let mut config = load(config).await?;
     config.search.enabled = true;
     config.prefetch.enabled = true;
     if let Some(limit) = limit {

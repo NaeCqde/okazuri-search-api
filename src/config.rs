@@ -6,7 +6,6 @@
 use crate::utils::Result;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -208,8 +207,8 @@ pub fn default_path() -> PathBuf {
 }
 
 /// Reads the file; a file that does not exist gives the defaults.
-pub fn load(path: &Path) -> Result<Config> {
-    let text = match fs::read_to_string(path) {
+pub async fn load(path: &Path) -> Result<Config> {
+    let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(format!("cannot read {}: {}", path.display(), e).into()),
@@ -297,18 +296,18 @@ url = \"http://x\"
         assert_eq!(config.exceptions.get("ナース").map(String::as_str), Some("nurse"));
     }
 
-    #[test]
-    fn a_missing_file_is_the_defaults() {
-        let config = load(Path::new("no-such-dir/config.toml")).unwrap();
+    #[tokio::test]
+    async fn a_missing_file_is_the_defaults() {
+        let config = load(Path::new("no-such-dir/config.toml")).await.unwrap();
         assert_eq!(config.server.port, 8000);
     }
 
-    #[test]
-    fn a_broken_file_is_an_error_that_names_the_file() {
+    #[tokio::test]
+    async fn a_broken_file_is_an_error_that_names_the_file() {
         let path = std::env::temp_dir().join("okazuri-search-api-broken-config.toml");
-        fs::write(&path, "[server\nport = ").unwrap();
-        let error = load(&path).unwrap_err().to_string();
-        fs::remove_file(&path).ok();
+        std::fs::write(&path, "[server\nport = ").unwrap();
+        let error = load(&path).await.unwrap_err().to_string();
+        std::fs::remove_file(&path).ok();
         assert!(error.contains("okazuri-search-api-broken-config.toml"), "{error}");
     }
 }
