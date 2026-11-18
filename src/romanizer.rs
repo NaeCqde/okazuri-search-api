@@ -68,6 +68,7 @@ const BUILT_IN_EXCEPTIONS: &[(&str, &str)] = &[
     ("お姉ちゃん", "oneechan"),
     ("おねえちゃん", "oneechan"),
     ("お姉さん", "oneesan"),
+    ("姉弟", "kyoudai"),
     ("お兄ちゃん", "oniichan"),
     ("お兄さん", "oniisan"),
     ("お母さん", "okaasan"),
@@ -652,6 +653,7 @@ mod tests {
         assert_eq!(romaji("エロコスプレ"), "ero cosplay");
         assert_eq!(romaji("えっちなお姉さん"), "ecchi na oneesan");
         assert_eq!(romaji("お母さん"), "okaasan");
+        assert_eq!(romaji("姉弟の日常"), "kyoudai no nichijou");
         assert_eq!(romaji("[DL版] [中国翻訳]"), "[digital] [chinese]");
     }
 
