@@ -84,7 +84,7 @@ The answer:
 ```
 
 `status` is `searched` (asked now), `failed` (the `error` says why) or `not searched` (`live=0`); `queries` are the queries the site is asked
-(one or two, see above) and `count` the works they listed together. A site that fails does not stop the others. `total` is the number of works that have all the words; `results` may be shorter.
+(one or two, see above) and `count` the works they listed together. A site that fails does not stop the others. `total` is the number of works that have all the words; `results` may be shorter. A page is one result: works with the same address (also with or without the `/` at the end, or the `#` part, in lower case) are one, the first stays, and it is `isNew` when any of them is.
 
 ## The sites
 
