@@ -134,7 +134,7 @@ fn find(fetch: &mut Fetch, index: &str, word: &str) -> Result<Option<(u64, i32)>
     let mut address = 0u64;
 
     for _ in 0..MAX_DEPTH {
-        let node = decode_node(&fetch(index, Some((address, address + MAX_NODE_SIZE - 1)))?)?;
+        let node = decode_node(&fetch(index, Some((address, address.saturating_add(MAX_NODE_SIZE - 1))))?)?;
 
         if node.keys.is_empty() {
             return Ok(None);
@@ -188,7 +188,7 @@ pub fn gallery_ids(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<u
     let mut ids: Option<Vec<u32>> = None;
 
     for (offset, length) in lists {
-        let list = decode_ids(&fetch(&data, Some((offset, offset + length as u64 - 1)))?)?;
+        let list = decode_ids(&fetch(&data, Some((offset, offset.saturating_add(length as u64 - 1))))?)?;
 
         ids = Some(match ids {
             None => list,
