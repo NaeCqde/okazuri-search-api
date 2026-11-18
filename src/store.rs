@@ -17,7 +17,6 @@ use sea_orm::{
     QueryOrder, QuerySelect, Schema, Set, SqlxSqliteConnector, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -58,7 +57,7 @@ pub struct SearchStore {
 impl SearchStore {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
 
         let options = SqliteConnectOptions::new()
@@ -536,6 +535,7 @@ impl SearchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn link(path: &str, title: &str) -> NewWork {
         NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase() }

@@ -24,7 +24,7 @@ const API: &str = "https://api.cloudflare.com/client/v4";
 const MAX_POLLS: usize = 120;
 
 pub struct D1Client {
-    agent: ureq::Agent,
+    client: reqwest::Client,
     base: String,
     database_path: String,
     token: String,
@@ -49,11 +49,7 @@ impl D1Client {
 
     pub fn with_base(config: &D1Config, token: String, base: String, poll_interval: Duration) -> Self {
         Self {
-            agent: ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(120)))
-                .http_status_as_error(false)
-                .build()
-                .into(),
+            client: reqwest::Client::builder().timeout(Duration::from_secs(120)).build().expect("the HTTP client"),
             base,
             database_path: format!("/accounts/{}/d1/database/{}", config.account_id, config.database_id),
             token,
@@ -63,9 +59,9 @@ impl D1Client {
     }
 
     /// The JSON an API call answered; an answer that says it failed is an error with the message of Cloudflare.
-    fn parse(mut response: ureq::http::Response<ureq::Body>) -> Result<Value> {
+    async fn parse(response: reqwest::Response) -> Result<Value> {
         let status = response.status().as_u16();
-        let text = response.body_mut().read_to_string().map_err(|e| format!("cannot read the answer: {e}"))?;
+        let text = response.text().await.map_err(|e| format!("cannot read the answer: {e}"))?;
         let value: Value = serde_json::from_str(&text)
             .map_err(|_| format!("Cloudflare answered {status}, which is not JSON: {}", text.chars().take(200).collect::<String>()))?;
 
@@ -78,32 +74,34 @@ impl D1Client {
         Ok(value)
     }
 
-    fn get(&self, path: &str) -> Result<Value> {
+    async fn get(&self, path: &str) -> Result<Value> {
         let response = self
-            .agent
-            .get(&format!("{}{}{}", self.base, self.database_path, path))
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .call()
+            .client
+            .get(format!("{}{}{}", self.base, self.database_path, path))
+            .bearer_auth(&self.token)
+            .send()
+            .await
             .map_err(|e| format!("cannot reach Cloudflare: {e}"))?;
 
-        Self::parse(response).map_err(|e| format!("GET {path}: {e}").into())
+        Self::parse(response).await.map_err(|e| format!("GET {path}: {e}").into())
     }
 
-    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+    async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let response = self
-            .agent
-            .post(&format!("{}{}{}", self.base, self.database_path, path))
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .send(body.to_string())
+            .client
+            .post(format!("{}{}{}", self.base, self.database_path, path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
             .map_err(|e| format!("cannot reach Cloudflare: {e}"))?;
 
-        Self::parse(response).map_err(|e| format!("POST {path}: {e}").into())
+        Self::parse(response).await.map_err(|e| format!("POST {path}: {e}").into())
     }
 
     /// The bookmark of the data now.
-    pub fn bookmark(&self) -> Result<String> {
-        let value = self.get("/time_travel/bookmark")?;
+    pub async fn bookmark(&self) -> Result<String> {
+        let value = self.get("/time_travel/bookmark").await?;
 
         value["result"]["bookmark"]
             .as_str()
@@ -112,7 +110,7 @@ impl D1Client {
     }
 
     /// The SQL of the tables: starts the export, polls it until it is complete, downloads it.
-    pub fn export(&self) -> Result<String> {
+    pub async fn export(&self) -> Result<String> {
         let mut at_bookmark: Option<String> = None;
 
         for _ in 0..MAX_POLLS {
@@ -124,7 +122,7 @@ impl D1Client {
                 body["current_bookmark"] = json!(bookmark);
             }
 
-            let value = self.post("/export", &body)?;
+            let value = self.post("/export", &body).await?;
             // the answer is wrapped once for the API and once for the export
             let export = &value["result"];
 
@@ -136,14 +134,14 @@ impl D1Client {
                 Some("complete") => {
                     let url = export["result"]["signed_url"].as_str().ok_or("the export has no download URL")?;
 
-                    return self.download(url);
+                    return self.download(url).await;
                 }
                 Some("error") => {
                     return Err(format!("the export failed: {}", export["error"].as_str().unwrap_or("no message")).into());
                 }
                 _ => {
                     at_bookmark = export["at_bookmark"].as_str().map(str::to_string).or(at_bookmark);
-                    std::thread::sleep(self.poll_interval);
+                    tokio::time::sleep(self.poll_interval).await;
                 }
             }
         }
@@ -152,29 +150,26 @@ impl D1Client {
     }
 
     /// The SQL file at the signed URL. The URL is the authority, so no token is sent to it.
-    fn download(&self, url: &str) -> Result<String> {
-        let mut response = self.agent.get(url).call().map_err(|e| format!("cannot download the export: {e}"))?;
+    async fn download(&self, url: &str) -> Result<String> {
+        let response = self.client.get(url).send().await.map_err(|e| format!("cannot download the export: {e}"))?;
         let status = response.status().as_u16();
 
         if status != 200 {
             return Err(format!("the download answered {status}").into());
         }
 
-        Ok(response.body_mut().read_to_string().map_err(|e| format!("cannot read the export: {e}"))?)
+        Ok(response.text().await.map_err(|e| format!("cannot read the export: {e}"))?)
     }
 
-    /// Rebuilds the mirror if the data changed since it was built (or there is no mirror). The calls to Cloudflare
-    /// block, so they run on the blocking threads of tokio.
+    /// Rebuilds the mirror if the data changed since it was built (or there is no mirror).
     pub async fn sync(self: &Arc<Self>, mirror: &Path) -> Result<Synced> {
-        let client = self.clone();
-        let bookmark = tokio::task::spawn_blocking(move || client.bookmark()).await??;
+        let bookmark = self.bookmark().await?;
 
         if mirror_bookmark(mirror).await?.as_deref() == Some(bookmark.as_str()) {
             return Ok(Synced { changed: false, exported: false, bookmark });
         }
 
-        let client = self.clone();
-        let sql = tokio::task::spawn_blocking(move || client.export()).await??;
+        let sql = self.export().await?;
 
         // another table was written to: the same data is not loaded again, and whoever waits for a new mirror is not woken
         if mirror_content_hash(mirror).await?.as_deref() == Some(content_hash(&sql).as_str()) {
@@ -351,9 +346,9 @@ INSERT INTO \"numbers\" (\"id\",\"name\",\"date\",\"magazine_id\") VALUES('BJ1',
         assert!(error.contains("403") && error.contains("Authentication error"), "{error}");
     }
 
-    #[test]
-    fn an_unreachable_server_is_an_error() {
-        let error = client(1, "secret").bookmark().unwrap_err().to_string();
+    #[tokio::test]
+    async fn an_unreachable_server_is_an_error() {
+        let error = client(1, "secret").bookmark().await.unwrap_err().to_string();
 
         assert!(error.contains("cannot reach Cloudflare"), "{error}");
     }

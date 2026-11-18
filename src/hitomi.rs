@@ -34,7 +34,10 @@ const MAX_LIST_BYTES: i64 = 2_000_000;
 const MAX_DEPTH: usize = 24;
 
 /// Reads a path of the index host: the whole answer, or the bytes of the range (both ends included).
-pub type Fetch<'a> = dyn FnMut(&str, Option<(u64, u64)>) -> Result<Vec<u8>, String> + 'a;
+#[allow(async_fn_in_trait)]
+pub trait Fetch {
+    async fn get(&mut self, path: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String>;
+}
 
 /// The key of a word: the first 4 bytes of its SHA-256.
 pub fn hash_word(word: &str) -> [u8; 4] {
@@ -129,12 +132,12 @@ fn decode_ids(bytes: &[u8]) -> Result<Vec<u32>, String> {
 }
 
 /// Where the list of a word is in the data file: its offset and its length. None when no title has the word.
-fn find(fetch: &mut Fetch, index: &str, word: &str) -> Result<Option<(u64, i32)>, String> {
+async fn find(fetch: &mut impl Fetch, index: &str, word: &str) -> Result<Option<(u64, i32)>, String> {
     let key = hash_word(word);
     let mut address = 0u64;
 
     for _ in 0..MAX_DEPTH {
-        let node = decode_node(&fetch(index, Some((address, address + MAX_NODE_SIZE - 1)))?)?;
+        let node = decode_node(&fetch.get(index, Some((address, address + MAX_NODE_SIZE - 1))).await?)?;
 
         if node.keys.is_empty() {
             return Ok(None);
@@ -157,8 +160,8 @@ fn find(fetch: &mut Fetch, index: &str, word: &str) -> Result<Option<(u64, i32)>
 
 /// The ids of the galleries that have every word (the ones that are in the index) in their title, the newest first, as
 /// many as `limit`.
-pub fn gallery_ids(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<u32>, String> {
-    let version = String::from_utf8_lossy(&fetch("/galleriesindex/version", None)?).trim().to_string();
+pub async fn gallery_ids(fetch: &mut impl Fetch, query: &str, limit: usize) -> Result<Vec<u32>, String> {
+    let version = String::from_utf8_lossy(&fetch.get("/galleriesindex/version", None).await?).trim().to_string();
     if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("the version of the index is {version:?}"));
     }
@@ -177,7 +180,7 @@ pub fn gallery_ids(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<u
     // where the lists are: the shortest list first
     let mut lists: Vec<(u64, i32)> = Vec::new();
     for word in words {
-        if let Some(list) = find(fetch, &index, word)? {
+        if let Some(list) = find(fetch, &index, word).await? {
             if list.1 > 4 && i64::from(list.1) <= MAX_LIST_BYTES {
                 lists.push(list);
             }
@@ -188,7 +191,7 @@ pub fn gallery_ids(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<u
     let mut ids: Option<Vec<u32>> = None;
 
     for (offset, length) in lists {
-        let list = decode_ids(&fetch(&data, Some((offset, offset + length as u64 - 1)))?)?;
+        let list = decode_ids(&fetch.get(&data, Some((offset, offset + length as u64 - 1))).await?)?;
 
         ids = Some(match ids {
             None => list,
@@ -301,13 +304,13 @@ pub fn parse_gallery(id: u32, body: &str) -> Option<Gallery> {
 
 /// The galleries for a query: at most `limit`, the newest first. A gallery whose file is gone is left out; when none of
 /// them can be read, that is an error.
-pub fn galleries(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<Gallery>, String> {
-    let ids = gallery_ids(fetch, query, limit)?;
+pub async fn galleries(fetch: &mut impl Fetch, query: &str, limit: usize) -> Result<Vec<Gallery>, String> {
+    let ids = gallery_ids(fetch, query, limit).await?;
     let mut found = Vec::new();
     let mut failed = None;
 
     for id in &ids {
-        match fetch(&format!("/galleries/{id}.js"), None) {
+        match fetch.get(&format!("/galleries/{id}.js"), None).await {
             Ok(body) => found.extend(parse_gallery(*id, &String::from_utf8_lossy(&body))),
             Err(e) => failed = Some(e),
         }
@@ -320,8 +323,8 @@ pub fn galleries(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<Gal
 }
 
 /// The works for a query: at most `limit`, the newest first.
-pub fn search(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<Link>, String> {
-    Ok(galleries(fetch, query, limit)?.iter().map(Gallery::link).collect())
+pub async fn search(fetch: &mut impl Fetch, query: &str, limit: usize) -> Result<Vec<Link>, String> {
+    Ok(galleries(fetch, query, limit).await?.iter().map(Gallery::link).collect())
 }
 
 /// Letters and digits in lower case, without the spaces and the marks between them: how a title is compared with the text.
@@ -410,16 +413,17 @@ mod tests {
             Site { files, requests: 0 }
         }
 
-        fn fetch(&mut self) -> impl FnMut(&str, Option<(u64, u64)>) -> Result<Vec<u8>, String> + '_ {
-            move |path, range| {
-                self.requests += 1;
-                let file = self.files.get(path).ok_or_else(|| format!("HTTP 404 {path}"))?;
+    }
 
-                Ok(match range {
-                    Some((from, to)) => file[(from as usize).min(file.len())..(to as usize + 1).min(file.len())].to_vec(),
-                    None => file.clone(),
-                })
-            }
+    impl Fetch for Site {
+        async fn get(&mut self, path: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
+            self.requests += 1;
+            let file = self.files.get(path).ok_or_else(|| format!("HTTP 404 {path}"))?;
+
+            Ok(match range {
+                Some((from, to)) => file[(from as usize).min(file.len())..(to as usize + 1).min(file.len())].to_vec(),
+                None => file.clone(),
+            })
         }
     }
 
@@ -467,37 +471,34 @@ mod tests {
         assert!(decode_ids(&[0, 0, 0, 0]).is_err());
     }
 
-    #[test]
-    fn the_ids_of_a_word_are_found_in_a_tree_of_two_levels() {
+    #[tokio::test]
+    async fn the_ids_of_a_word_are_found_in_a_tree_of_two_levels() {
         let mut site = site();
-        let mut fetch = site.fetch();
 
         for (word, count) in [("kyoudai", 3), ("ikemasen", 3), ("姉弟", 2), ("comic", 5), ("de", 7)] {
-            assert_eq!(gallery_ids(&mut fetch, word, 100).unwrap().len(), count, "{word}");
+            assert_eq!(gallery_ids(&mut site, word, 100).await.unwrap().len(), count, "{word}");
         }
-        assert!(gallery_ids(&mut fetch, "nothere", 100).unwrap().is_empty());
+        assert!(gallery_ids(&mut site, "nothere", 100).await.unwrap().is_empty());
     }
 
-    #[test]
-    fn the_words_are_intersected_the_newest_first_and_an_unknown_word_is_left_out() {
+    #[tokio::test]
+    async fn the_words_are_intersected_the_newest_first_and_an_unknown_word_is_left_out() {
         let mut site = site();
-        let mut fetch = site.fetch();
 
-        assert_eq!(gallery_ids(&mut fetch, "Kyoudai Ikemasen", 100).unwrap(), [30, 10]);
-        assert_eq!(gallery_ids(&mut fetch, "kyoudai de shi ikemasen", 100).unwrap(), [30, 10], "`shi` is in no title");
-        assert_eq!(gallery_ids(&mut fetch, "comic", 2).unwrap(), [40, 30], "the newest ones");
-        assert!(gallery_ids(&mut fetch, "shi", 100).unwrap().is_empty());
-        assert!(gallery_ids(&mut fetch, "", 100).unwrap().is_empty());
+        assert_eq!(gallery_ids(&mut site, "Kyoudai Ikemasen", 100).await.unwrap(), [30, 10]);
+        assert_eq!(gallery_ids(&mut site, "kyoudai de shi ikemasen", 100).await.unwrap(), [30, 10], "`shi` is in no title");
+        assert_eq!(gallery_ids(&mut site, "comic", 2).await.unwrap(), [40, 30], "the newest ones");
+        assert!(gallery_ids(&mut site, "shi", 100).await.unwrap().is_empty());
+        assert!(gallery_ids(&mut site, "", 100).await.unwrap().is_empty());
     }
 
-    #[test]
-    fn the_search_reads_the_titles_of_the_galleries_and_skips_a_gallery_that_is_gone() {
+    #[tokio::test]
+    async fn the_search_reads_the_titles_of_the_galleries_and_skips_a_gallery_that_is_gone() {
         let mut site = site();
-        let mut fetch = site.fetch();
 
         // 20 has a list entry and no file
         assert_eq!(
-            search(&mut fetch, "kyoudai", 10).unwrap(),
+            search(&mut site, "kyoudai", 10).await.unwrap(),
             [
                 Link { path: "/galleries/30.html".into(), title: "Kyoudai de Shitara Ikemasen | 姉弟でシたらいけません".into() },
                 Link { path: "/galleries/10.html".into(), title: "Kyoudai Comic".into() },
@@ -520,10 +521,16 @@ mod tests {
         assert_eq!(squash(" -!?"), "");
     }
 
-    #[test]
-    fn a_broken_site_is_an_error() {
-        let mut fetch = |_: &str, _: Option<(u64, u64)>| -> Result<Vec<u8>, String> { Ok(b"<html>".to_vec()) };
+    struct Broken;
 
-        assert!(gallery_ids(&mut fetch, "kyoudai", 10).is_err(), "the version is not a number");
+    impl Fetch for Broken {
+        async fn get(&mut self, _: &str, _: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
+            Ok(b"<html>".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_site_is_an_error() {
+        assert!(gallery_ids(&mut Broken, "kyoudai", 10).await.is_err(), "the version is not a number");
     }
 }

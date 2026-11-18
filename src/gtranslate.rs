@@ -45,25 +45,32 @@ pub fn parse(body: &str) -> Option<String> {
 /// The least time between two requests to Google Translate (the server is open: `live=force` must not make it a relay).
 const MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
-static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static LAST: tokio::sync::Mutex<Option<tokio::time::Instant>> = tokio::sync::Mutex::const_new(None);
 
-fn wait_turn() {
-    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+/// Waits for the turn: the lock is held while sleeping, so the requests of all tasks line up (and no thread is blocked).
+async fn wait_turn() {
+    let mut last = LAST.lock().await;
 
     if let Some(wait) = last.and_then(|at| MIN_DELAY.checked_sub(at.elapsed())) {
-        std::thread::sleep(wait);
+        tokio::time::sleep(wait).await;
     }
-    *last = Some(std::time::Instant::now());
+    *last = Some(tokio::time::Instant::now());
 }
 
 /// Asks Google Translate.
-pub fn translate(agent: &ureq::Agent, text: &str, from: Lang, to: Lang) -> Result<String, String> {
-    wait_turn();
-    let mut response = agent
+pub async fn translate(client: &reqwest::Client, text: &str, from: Lang, to: Lang) -> Result<String, String> {
+    wait_turn().await;
+
+    let failed = |e: reqwest::Error| format!("Google Translate: {e}");
+    let body = client
         .post(URL)
-        .send_form([("f.req", request(text, from, to).as_str())])
-        .map_err(|e| format!("Google Translate: {e}"))?;
-    let body = response.body_mut().read_to_string().map_err(|e| format!("Google Translate: {e}"))?;
+        .form(&[("f.req", request(text, from, to))])
+        .send()
+        .await
+        .map_err(failed)?
+        .text()
+        .await
+        .map_err(failed)?;
 
     parse(&body).ok_or_else(|| "Google Translate: no translation in the answer".to_string())
 }
@@ -84,11 +91,11 @@ mod tests {
     ///
     /// The title of a work that was translated by hand is the proof of the model: the Advanced (Gemini) model of the page says
     /// `The Phaethon Assault`, and the classic model says `The Battle of Phaeton`.
-    #[test]
+    #[tokio::test]
     #[ignore = "asks Google Translate"]
-    fn the_advanced_model_translates_paeton_kyoushuusen_the_way_gemini_does() {
-        let agent = ureq::Agent::new_with_defaults();
-        let translated = translate(&agent, "パエトーン強襲戦", Lang::Japanese, Lang::English).unwrap();
+    async fn the_advanced_model_translates_paeton_kyoushuusen_the_way_gemini_does() {
+        let client = reqwest::Client::new();
+        let translated = translate(&client, "パエトーン強襲戦", Lang::Japanese, Lang::English).await.unwrap();
 
         assert_ne!(translated, "The Battle of Phaeton", "this is the classic model");
         assert_eq!(translated, "The Phaethon Assault", "the Advanced (Gemini) model says this; the classic one says The Battle of Phaeton");

@@ -21,10 +21,9 @@ use crate::store::{NewWork, SearchStore, SiteState};
 use crate::utils::{unix_now, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
-use ureq::ResponseExt;
+use tokio::sync::{Mutex, Semaphore};
 
 /// A site that answers 429 is asked once more after the seconds of its Retry-After (this when it gives none), but
 /// never after more than the longest wait.
@@ -330,7 +329,7 @@ pub struct Engine {
     /// When the site was asked last, to keep `min_delay_ms` between two requests.
     gates: Vec<Mutex<Option<Instant>>>,
     store: Arc<SearchStore>,
-    agent: ureq::Agent,
+    client: reqwest::Client,
     config: SearchConfig,
     permits: Semaphore,
     romanizer: Arc<Romanizer>,
@@ -360,13 +359,12 @@ impl Engine {
             .map(|(index, _)| index)
             .collect();
         let order = active.iter().enumerate().map(|(place, &index)| (sites[index].def.name, place)).collect();
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(config.timeout_secs.max(1))))
-            // a 403 or a 500 is an answer to be told apart, not an error of the client
-            .http_status_as_error(false)
+        // a 403 or a 500 is an answer to be told apart, not an error of the client
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(USER_AGENT)
             .build()
-            .into();
+            .expect("the HTTP client");
 
         Arc::new(Self {
             gates: sites.iter().map(|_| Mutex::new(None)).collect(),
@@ -374,7 +372,7 @@ impl Engine {
             active,
             order,
             store,
-            agent,
+            client,
             config: config.clone(),
             permits: Semaphore::new(config.concurrency.max(1)),
             romanizer,
@@ -746,11 +744,17 @@ impl Engine {
         for query in queries {
             let started = Instant::now();
 
-            let worker = self.clone();
-            let text = query.clone();
-            let outcome = tokio::task::spawn_blocking(move || worker.request(index, &text).map(|links| worker.with_romaji(links)))
-                .await
-                .unwrap_or_else(|e| Err(format!("the request task died: {e}")));
+            // the request is async; the romaji (the analyzer) is CPU work, so it runs on a blocking thread
+            let outcome = match self.request(index, &query).await {
+                Ok(links) => {
+                    let worker = self.clone();
+
+                    tokio::task::spawn_blocking(move || worker.with_romaji(links))
+                        .await
+                        .map_err(|e| format!("the romaji task died: {e}"))
+                }
+                Err(e) => Err(e),
+            };
 
             match &outcome {
                 Ok(links) => log::debug!("search {name}: {} works in {:?} ({query})", links.len(), started.elapsed()),
@@ -769,21 +773,21 @@ impl Engine {
         found
     }
 
-    /// The request to a site (blocking). Waits for its turn first.
-    fn request(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
+    /// The request to a site. Waits for its turn first.
+    async fn request(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
         let site = &self.sites[index];
 
         if site.def.format == Format::Hitomi {
-            return self.request_hitomi(index, query);
+            return self.request_hitomi(index, query).await;
         }
 
         let url = site.search_url(query).ok_or_else(|| "the site has no search".to_string())?;
 
         let mut asked_again = false;
         let (status, page_url, body) = loop {
-            self.wait_turn(index);
+            self.wait_turn(index).await;
 
-            let mut request = self.agent.get(&url).header("Accept-Language", "ja,en;q=0.8").header(
+            let mut request = self.client.get(&url).header("Accept-Language", "ja,en;q=0.8").header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             );
@@ -791,7 +795,7 @@ impl Engine {
                 request = request.header("Cookie", cookie);
             }
 
-            let mut response = request.call().map_err(|e| e.to_string())?;
+            let response = request.send().await.map_err(|e| e.to_string())?;
             let status = response.status().as_u16();
 
             // too many requests: wait as long as the site says (not too long), and ask once more
@@ -806,12 +810,12 @@ impl Engine {
 
                 log::debug!("search {}: HTTP 429, asking again in {wait} s", site.def.name);
                 asked_again = true;
-                std::thread::sleep(Duration::from_secs(wait));
+                tokio::time::sleep(Duration::from_secs(wait)).await;
                 continue;
             }
 
-            let page_url = response.get_uri().to_string();
-            let bytes = response.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+            let page_url = response.url().to_string();
+            let bytes = response.bytes().await.map_err(|e| e.to_string())?;
 
             break (status, page_url, String::from_utf8_lossy(&bytes).into_owned());
         };
@@ -827,42 +831,8 @@ impl Engine {
     }
 
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
-    fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
-        let mut fetch = self.hitomi_fetch(index);
-
-        crate::hitomi::search(&mut fetch, query, self.config.max_results_per_site)
-    }
-
-    /// Reads a file of the index host of Hitomi.La (the whole answer, or a range of it), after the turn of the site.
-    fn hitomi_fetch(&self, index: usize) -> impl FnMut(&str, Option<(u64, u64)>) -> std::result::Result<Vec<u8>, String> + '_ {
-        move |path: &str, range: Option<(u64, u64)>| {
-            self.wait_turn(index);
-
-            // the version is asked with a changing number, so that no cache answers with an old one
-            let url = if path.ends_with("/version") {
-                format!("{}{path}?_={}", crate::hitomi::ORIGIN, unix_now() * 1000)
-            } else {
-                format!("{}{path}", crate::hitomi::ORIGIN)
-            };
-
-            let mut request = self.agent.get(&url).header("Referer", "https://hitomi.la/");
-            if let Some((from, to)) = range {
-                request = request.header("Range", format!("bytes={from}-{to}"));
-            }
-
-            let mut response = request.call().map_err(|e| format!("{path}: {e}"))?;
-            let status = response.status().as_u16();
-
-            if status != 200 && status != 206 {
-                return Err(format!("{path}: HTTP {status}"));
-            }
-            if range.is_some() && status == 200 {
-                // the whole file of an index is far too big to read
-                return Err(format!("{path}: the site does not answer a Range request"));
-            }
-
-            response.body_mut().read_to_vec().map_err(|e| format!("{path}: {e}"))
-        }
+    async fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
+        crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
     }
 
     /// Whether the translation can be asked: Hitomi.La is one of the sites.
@@ -947,10 +917,7 @@ impl Engine {
             }
         }
 
-        let (agent, asked) = (self.agent.clone(), text.trim().to_string());
-        let translated = tokio::task::spawn_blocking(move || crate::gtranslate::translate(&agent, &asked, from, from.other()))
-            .await
-            .map_err(|e| format!("the request task died: {e}"))??;
+        let translated = crate::gtranslate::translate(&self.client, text.trim(), from, from.other()).await?;
         let translated = if from == Lang::Japanese { without_the(&translated) } else { translated };
 
         let (english, japanese) = if from == Lang::English { (text.trim().to_string(), translated) } else { (translated, text.trim().to_string()) };
@@ -1000,19 +967,12 @@ impl Engine {
         None
     }
 
-    /// The galleries of Hitomi.La for a query (the site is asked on a thread of its own: it is a few dozen small requests).
+    /// The galleries of Hitomi.La for a query.
     async fn hitomi_galleries(self: &Arc<Self>, index: usize, text: &str) -> Result<Vec<crate::hitomi::Gallery>> {
         let words = normalize(text);
         let limit = self.config.max_results_per_site.clamp(1, 20);
-        let worker = self.clone();
 
-        Ok(tokio::task::spawn_blocking(move || {
-            let mut fetch = worker.hitomi_fetch(index);
-
-            crate::hitomi::galleries(&mut fetch, &words, limit)
-        })
-        .await
-        .map_err(|e| format!("the request task died: {e}"))??)
+        Ok(crate::hitomi::galleries(&mut HitomiFetch { engine: self, index }, &words, limit).await?)
     }
 
     /// Asks the site. The galleries are the same work in different languages when their artists, groups, parodies and kind are
@@ -1097,7 +1057,7 @@ impl Engine {
     }
 
     /// Keeps `min_delay_ms` (or the longer delay of the site) between two requests to the same site.
-    fn wait_turn(&self, index: usize) {
+    async fn wait_turn(&self, index: usize) {
         let site = &self.sites[index];
         // Hitomi.La is asked a few dozen small files for one query, on a static host: its own short delay, not `min_delay_ms`
         let delay = if site.def.format == Format::Hitomi {
@@ -1105,14 +1065,51 @@ impl Engine {
         } else {
             Duration::from_millis(self.config.min_delay_ms.max(site.def.delay_ms))
         };
-        let mut last = self.gates[index].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut last = self.gates[index].lock().await;
 
         if let Some(at) = *last {
             if let Some(wait) = delay.checked_sub(at.elapsed()) {
-                std::thread::sleep(wait);
+                tokio::time::sleep(wait).await;
             }
         }
         *last = Some(Instant::now());
+    }
+}
+
+/// Reads the files of the index host of Hitomi.La (the whole answer, or a range of it), each one after the turn of the site.
+struct HitomiFetch<'a> {
+    engine: &'a Engine,
+    index: usize,
+}
+
+impl crate::hitomi::Fetch for HitomiFetch<'_> {
+    async fn get(&mut self, path: &str, range: Option<(u64, u64)>) -> std::result::Result<Vec<u8>, String> {
+        self.engine.wait_turn(self.index).await;
+
+        // the version is asked with a changing number, so that no cache answers with an old one
+        let url = if path.ends_with("/version") {
+            format!("{}{path}?_={}", crate::hitomi::ORIGIN, unix_now() * 1000)
+        } else {
+            format!("{}{path}", crate::hitomi::ORIGIN)
+        };
+
+        let mut request = self.engine.client.get(&url).header("Referer", "https://hitomi.la/");
+        if let Some((from, to)) = range {
+            request = request.header("Range", format!("bytes={from}-{to}"));
+        }
+
+        let response = request.send().await.map_err(|e| format!("{path}: {e}"))?;
+        let status = response.status().as_u16();
+
+        if status != 200 && status != 206 {
+            return Err(format!("{path}: HTTP {status}"));
+        }
+        if range.is_some() && status == 200 {
+            // the whole file of an index is far too big to read
+            return Err(format!("{path}: the site does not answer a Range request"));
+        }
+
+        response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|e| format!("{path}: {e}"))
     }
 }
 
