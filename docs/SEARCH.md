@@ -21,7 +21,7 @@
    of both answers go into the database and are matched the same way. (`GET /okazuri/sites` says which sites are `japanese`.)
 3. With `live` (the default), every site that can be searched is asked now. The sites are asked at the same time, and a site is
    never asked twice within `min_delay_ms` (177Picyy, which answers 429 to a rush, within 20 seconds; R18Best, within 5). A 429 is
-   answered once with another try after the `Retry-After` of the site (5 seconds if it gives none, at most 30). (`live=0` asks nobody and goes on with the database.)
+   answered once with another try after the `Retry-After` of the site (5 seconds if it gives none, at most 30). (`live=off` asks nobody and goes on with the database.)
 4. The links of the answer that are works' pages are read. A link is a work when it matches the pattern that
    `okazuri_bot/src/websites.ts` uses for the site.
 5. **What is saved is what the list page shows of the work**: its title, as the page writes it, **the romaji of that
@@ -61,14 +61,14 @@ is missing may just be beyond the cut, so it stays. A failed try changes nothing
 | `q` | The words. Required, at most `[search] max_query_chars` characters. |
 | `live=off` | Ask no site: answer from the database alone, even when what it has is out of date. |
 | `live=diff` (default) | Ask only the combinations of query and site that are missing or older than `ttl_hours` (a month); for the others the database answers (`cached`). |
-| `live=on` | Ask every site, cached or not (`searched`; a failure of an earlier try is asked again). |
+| `live=force` | Ask every site, cached or not (`searched`; a failure of an earlier try is asked again). |
 | `limit=n` | The most works in the answer (at most `[search] max_results`). |
 | `translator=auto` (default) | A query with Japanese in it is searched in English too: the English title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translation` says the title (`{"text", "source"}`). |
 | `translator=hitomi` | Hitomi.La only: when it fails or has nothing, the English search is left out (`translation` is `null`). |
 | `translator=google` | Google Translate only. |
 | `translator=none` | No English search. |
 
-`live` also tells the translation what to do: the saved translation is used (`diff`), only the saved one (`off`), or the source is asked again (`on`).
+`live` also tells the translation what to do: the saved translation is used (`diff`), only the saved one (`off`), or the source is asked again (`force`).
 
 The answer:
 
@@ -137,14 +137,14 @@ The answer is **saved** in its own tables of the search database: `translation_l
 and digits in lower case; `text`; `from_lang`; `looked_at`; `count`: a note of the last time the text was asked) and
 `translations` (`key`, `gallery_id`, `position`, `url`, `english`, `japanese`, `exact`). `live` is the one of the search: `diff`
 (default) answers with the saved translations, **however old** (they are kept for good), and asks the site for a text that has none saved: a text
-that was never asked, and a text that nothing answered (it is asked every time, the site may have the work now); `off` only reads what is saved; `on` asks the site always. `saved` says that the answer is the saved one.
-A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not off, diff or on is a
+that was never asked, and a text that nothing answered (it is asked every time, the site may have the work now); `force` asks the site always. There is **no `live=off`** here (a 422): the saved answer is the answer of `diff`. `saved` says that the answer is the saved one.
+A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not diff or force is a
 422. The route is there when `[search]` is on.
 
 ### `GET /google/translate?q=<text>`: the same from Google Translate
 
 The same rules for `q` (Japanese or English, the direction follows), and the same tables: the translation is saved with the source
-`google` (kept for good). `live=diff` (default) answers with the saved one, and `live=on` asks Google again. There is **no
+`google` (kept for good). `live=diff` (default) answers with the saved one, and `live=force` asks Google again. There is **no
 `live=off`** for Google Translate (a 422): it is asked whenever nothing is saved (in the search, `off` is `diff` for the Google part; `/auto/translate` refuses it too). A translation that was saved for the other direction answers too, when its title is the whole text
 (`十` → `Ten` saved, so `Ten` → `十`). A translation from Japanese to English does not start with `The` (`The Phaethon Assault` →
 `Phaethon Assault`): it is taken off before it is saved; the translation of Hitomi.La is left as the site writes it.

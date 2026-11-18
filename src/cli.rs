@@ -31,8 +31,8 @@ serve                                  Start the server, and what the config swi
     --port <port>        Port to listen on (default: [server] port, 8000)\n\
 search <words>...                      Search the sites for the words (in romaji), save what they list, and print the\n\
                                        saved works whose title has all the words\n\
-    --live <off|diff|on> off: do not ask the sites, answer from the database; diff (default): ask the\n\
-                         queries and sites that are missing or older than [search] ttl_hours; on: ask every\n\
+    --live <off|diff|force> off: do not ask the sites, answer from the database; diff (default): ask the\n\
+                         queries and sites that are missing or older than [search] ttl_hours; force: ask every\n\
                          site\n\
     --limit <n>          The most works to print (default: [search] max_results)\n\
     --config <path>      Config file\n\
@@ -52,7 +52,7 @@ convert [text]...                      Print the romaji of the text. Without tex
     --config <path>      Config file, for [exceptions]\n\
 --help, -h                             Show this help\n\n\
 GET /romaji?q=<text>[&loanwords=romaji|english]   the romaji as text/plain\n\
-GET /okazuri/search?q=<words>[&live=off|diff|on][&limit=n]\n\
+GET /okazuri/search?q=<words>[&live=off|diff|force][&limit=n]\n\
                                                      the works whose title has all the words ([search])\n\
 GET /okazuri/sites                                   the sites                          ([search])\n\
 GET /health                                          ok";
@@ -137,7 +137,7 @@ fn parse_search(args: &[String]) -> Result<Command> {
             "--live" => {
                 let text = value(&mut iter, arg)?;
 
-                live = Live::parse(&text).ok_or_else(|| format!("--live is off, diff or on, not {text:?}"))?;
+                live = Live::parse(&text).ok_or_else(|| format!("--live is off, diff or force, not {text:?}"))?;
             }
             "--limit" => limit = Some(number(&mut iter, arg)?),
             "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),

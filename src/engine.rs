@@ -267,16 +267,16 @@ pub enum Live {
     /// the database answers (`cached`).
     Diff,
     /// Asks every site, whether its answer is up to date or not.
-    On,
+    Force,
 }
 
 impl Live {
-    /// `off`, `diff` and `on`; `0`, `false`, `no` are off, `1`, `true`, `yes` are on. `None` for anything else.
+    /// `off`, `diff` and `force`; `0`, `false`, `no` are off, `1`, `true`, `yes` are force. `None` for anything else.
     pub fn parse(text: &str) -> Option<Live> {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" | "0" | "false" | "no" => Some(Live::Off),
             "diff" | "" => Some(Live::Diff),
-            "on" | "1" | "true" | "yes" => Some(Live::On),
+            "force" | "1" | "true" | "yes" => Some(Live::Force),
             _ => None,
         }
     }
@@ -619,7 +619,7 @@ impl Engine {
         let fetched = match request.live {
             Live::Off => Fetched::default(),
             Live::Diff => self.fetch_with(request.query, true, false).await?,
-            Live::On => self.fetch_with(request.query, true, true).await?,
+            Live::Force => self.fetch_with(request.query, true, true).await?,
         };
 
         let mut hits: Vec<Hit> = Vec::new();
@@ -849,12 +849,12 @@ impl Engine {
 
         let saved = self.store.translations(&key, "hitomi").await?;
 
-        if live != Live::On && !saved.is_empty() {
+        if live != Live::Force && !saved.is_empty() {
             return Ok((saved.into_iter().map(Translation::from).collect(), true));
         }
 
         // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
-        if live != Live::On {
+        if live != Live::Force {
             let others = self.store.translations_with("hitomi", from == Lang::English, &key, false, 20).await?;
 
             if !others.is_empty() {
@@ -897,7 +897,7 @@ impl Engine {
             return Err("nothing to translate".into());
         }
 
-        if live != Live::On {
+        if live != Live::Force {
             if let Some(row) = self.store.translations(&key, "google").await?.into_iter().next() {
                 return Ok((Translation::from(row), true));
             }
@@ -1282,8 +1282,8 @@ pub(crate) mod tests {
         assert!(first.results.iter().all(|h| h.is_new));
         assert!(again.results.iter().all(|h| !h.is_new), "and saved nothing");
 
-        // live=on asks the sites whose answer is up to date too
-        let all = engine.search(&Request { live: Live::On, ..Request::new("q") }).await.unwrap();
+        // live=force asks the sites whose answer is up to date too
+        let all = engine.search(&Request { live: Live::Force, ..Request::new("q") }).await.unwrap();
         assert_eq!(requests(&hits), (2, 2, 2), "every site is asked again, a failure included");
         assert!(all.sites.iter().filter(|s| s.status != "failed").all(|s| s.status == "searched"));
         assert_eq!(all.results.len(), 2);
@@ -1417,7 +1417,7 @@ pub(crate) mod tests {
         // never asked, and the site is not to be asked: nothing
         assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
         // punctuation alone is nothing to look for
-        assert_eq!(engine.translate_hitomi(" !? ", Lang::Japanese, Live::On).await.unwrap(), (vec![], false));
+        assert_eq!(engine.translate_hitomi(" !? ", Lang::Japanese, Live::Force).await.unwrap(), (vec![], false));
 
         // a saved answer is the one that is given, whatever `live` says unless it is `on`
         store.save_translations("七", "hitomi", "七", "ja", unix_now(), &[row.clone()]).await.unwrap();
@@ -1429,7 +1429,7 @@ pub(crate) mod tests {
         // a saved answer never gets old: only `on` asks the site again (the engine of the tests has no Hitomi.La: that is an error)
         store.save_translations("七", "hitomi", "七", "ja", 1, &[row.clone()]).await.unwrap();
         assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 1);
-        assert!(engine.translate_hitomi("七", Lang::Japanese, Live::On).await.is_err());
+        assert!(engine.translate_hitomi("七", Lang::Japanese, Live::Force).await.is_err());
         assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
 
         // a translation that was asked from the other side answers too: Japanese to English saved, English to Japanese asked
@@ -1437,7 +1437,7 @@ pub(crate) mod tests {
         let (found, saved) = engine.translate_hitomi("Nine", Lang::English, Live::Diff).await.unwrap();
         assert!(saved);
         assert_eq!((found[0].japanese.as_str(), found[0].exact), ("九つの命", false));
-        assert_eq!(engine.translate_hitomi("九つの命", Lang::Japanese, Live::On).await.is_err(), true, "`on` asks the site");
+        assert_eq!(engine.translate_hitomi("九つの命", Lang::Japanese, Live::Force).await.is_err(), true, "`on` asks the site");
         assert_eq!(engine.translate_hitomi("Nine Lives", Lang::English, Live::Off).await.unwrap().0[0].exact, true);
 
         // Google Translate is cached the same way: the saved translation is the answer (no request), `off` needs a saved one

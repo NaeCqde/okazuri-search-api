@@ -96,7 +96,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
     }
 
     let Some(live) = Live::parse(params.live.as_deref().unwrap_or("")) else {
-        return invalid("live is off, diff or on");
+        return invalid("live is off, diff or force");
     };
 
     let Some(translator) = Translator::parse(params.translator.as_deref().unwrap_or("")) else {
@@ -140,7 +140,7 @@ fn translate_input(engine: &Engine, params: TranslateQuery) -> std::result::Resu
 
     // like the search: the saved answer (diff, the default), only the saved one (off), the source always (on)
     let Some(live) = Live::parse(params.live.as_deref().unwrap_or("")) else {
-        return Err(invalid("live is off, diff or on"));
+        return Err(invalid("live is off, diff or force"));
     };
 
     Ok((text, from, live))
@@ -154,6 +154,10 @@ async fn hitomila_translate(State(state): State<Arc<AppState>>, Query(params): Q
         Ok(input) => input,
         Err(response) => return response,
     };
+
+    if live == Live::Off {
+        return invalid("live=off is not available for /hitomila/translate: diff or force");
+    }
 
     match engine.translate_hitomi(&text, from, live).await {
         Ok((results, saved)) => {
@@ -172,7 +176,7 @@ async fn hitomila_translate(State(state): State<Arc<AppState>>, Query(params): Q
     }
 }
 
-/// The same from Google Translate (the model of its page that is Gemini). The translation is saved: `live=on` asks again.
+/// The same from Google Translate (the model of its page that is Gemini). The translation is saved: `live=force` asks again.
 async fn google_translate(State(state): State<Arc<AppState>>, Query(params): Query<TranslateQuery>) -> Response {
     let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
     let (text, from, live) = match translate_input(engine, params) {
@@ -181,7 +185,7 @@ async fn google_translate(State(state): State<Arc<AppState>>, Query(params): Que
     };
 
     if live == Live::Off {
-        return invalid("live=off is not available for Google Translate (it is asked when nothing is saved): diff or on");
+        return invalid("live=off is not available for Google Translate (it is asked when nothing is saved): diff or force");
     }
 
     match engine.translate_google(&text, from, live).await {
@@ -209,7 +213,7 @@ async fn auto_translate(State(state): State<Arc<AppState>>, Query(params): Query
     };
 
     if live == Live::Off {
-        return invalid("live=off is not available for /auto/translate (Google Translate is asked when nothing is saved): diff or on");
+        return invalid("live=off is not available for /auto/translate (Google Translate is asked when nothing is saved): diff or force");
     }
 
     match engine.translate_auto(&text, from, live).await {
@@ -378,10 +382,9 @@ mod tests {
         assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=maybe", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // only Japanese and English
         assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        // only the saved answers: nothing is saved, so nothing, and no request to the site
-        let (status, _, body) = get_from(state.clone(), &format!("/hitomila/translate?q={}&live=off", encode("姉弟"))).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("\"saved\":true") && body.contains("\"results\":[]") && body.contains("\"from\":\"ja\"") && body.contains("\"translation\":null"), "{body}");
+        // no `off` here: the saved answers are the answer of `diff`, and the site is asked when there is none
+        assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=on", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY, "`on` is `force` now");
         // Google Translate: the same input rules, and `off` with nothing saved is no translation
         assert_eq!(get_from(state.clone(), "/google/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -390,7 +393,7 @@ mod tests {
         assert_eq!(get_from(state.clone(), &format!("/auto/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // the translator of a search
         assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}", encode("姉弟"))).await;
+        let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}&live=force", encode("姉弟"))).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(content_type.starts_with("application/json"));
         assert!(body.contains("did not answer"), "{body}");
@@ -430,8 +433,8 @@ mod tests {
         assert_eq!(json["sites"][0]["status"], "cached");
         assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["isNew"]), (2, &serde_json::json!(false)));
 
-        // live=on asks every site, cached or not; the works are found again and are not new
-        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={}&live=on", encode("COMIC ExE"))).await;
+        // live=force asks every site, cached or not; the works are found again and are not new
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={}&live=force", encode("COMIC ExE"))).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(json["sites"][0]["status"], "searched");
