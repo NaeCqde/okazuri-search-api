@@ -6,6 +6,7 @@
 //! - `GET /okazuri/sites` (`[search] enabled`): the sites, and whether each can be searched.
 //! - `GET /hitomila/translate?q=` (`[search] enabled`): Japanese to English or English to Japanese, from the titles of Hitomi.La, as JSON.
 //! - `GET /google/translate?q=` (`[search] enabled`): the same, from Google Translate.
+//! - `GET /auto/translate?q=` (`[search] enabled`): from Hitomi.La, and from Google Translate when Hitomi.La fails or has nothing.
 //! - `GET /health`: `ok`.
 //!
 //! A function that is off has no route, so it answers 404. A bad request is a 422 with
@@ -34,7 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new().route("/health", get(health)).route("/romaji", get(romaji));
 
     if state.search.is_some() {
-        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate));
+        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
     }
 
     router.with_state(state)
@@ -191,6 +192,30 @@ async fn google_translate(State(state): State<Arc<AppState>>, Query(params): Que
         Err(e) => {
             log::warn!("cannot translate {:?} with Google Translate: {}", text, e);
             json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Google Translate did not answer" }))
+        }
+    }
+}
+
+/// Hitomi.La first, Google Translate when Hitomi.La fails or has nothing. `source` says which one answered.
+async fn auto_translate(State(state): State<Arc<AppState>>, Query(params): Query<TranslateQuery>) -> Response {
+    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
+    let (text, from, live) = match translate_input(engine, params) {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+
+    match engine.translate_auto(&text, from, live).await {
+        Ok((found, saved)) => {
+            let to = from.other();
+
+            json(
+                StatusCode::OK,
+                &serde_json::json!({ "input": text.trim(), "from": from.code(), "to": to.code(), "translation": found.text(to), "source": found.source, "saved": saved }),
+            )
+        }
+        Err(e) => {
+            log::warn!("cannot translate {:?}: {}", text, e);
+            json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "neither Hitomi.La nor Google Translate answered" }))
         }
     }
 }
@@ -353,6 +378,8 @@ mod tests {
         assert_eq!(get_from(state.clone(), "/google/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(get_from(state.clone(), "/auto/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), &format!("/auto/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY);
         // the translator of a search
         assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}", encode("姉弟"))).await;

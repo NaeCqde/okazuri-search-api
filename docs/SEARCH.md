@@ -156,6 +156,17 @@ came back the same from the Advanced and the classic model when this was written
 The saved rows of Hitomi.La and of Google are separate (`translations.source`); a translation of Hitomi.La for the other direction
 answers `/hitomila/translate`, one of Google does not (a machine translation does not go back).
 
+### `GET /auto/translate?q=<text>`
+
+Hitomi.La first (`/hitomila/translate`), and Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The same
+rules for `q` and `live`; the answer is the first translation, and `source` says who gave it:
+
+```json
+{ "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "ZenZero Gyaku Ra Goudou \"Phaethon Assault\"", "source": "hitomi", "saved": false }
+```
+
+Both are saved as above; a 502 when neither has a translation. This is what `translator=auto` of the search uses.
+
 `GET /okazuri/sites` lists them. Checked in 2026-10 from a home connection:
 
 | | Sites |

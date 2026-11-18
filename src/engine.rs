@@ -907,6 +907,21 @@ impl Engine {
         Ok((translation, false))
     }
 
+    /// The translation from Hitomi.La, and from Google Translate when Hitomi.La fails or has nothing (`translator=auto`).
+    /// The first translation and whether it is the saved one; an error when neither has one.
+    pub async fn translate_auto(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
+        match self.translate_hitomi(text, from, live).await {
+            Ok((found, saved)) => {
+                if let Some(first) = found.into_iter().next() {
+                    return Ok((first, saved));
+                }
+            }
+            Err(e) => log::warn!("no translation of {text:?} from Hitomi.La: {e}"),
+        }
+
+        self.translate_google(text, from, live).await
+    }
+
     /// The English title of a Japanese text by the translator of a search (`Translator`): None when the translator has none.
     /// `auto` asks Hitomi.La, and Google Translate when Hitomi.La fails or has nothing; `hitomi` and `google` only that one.
     async fn english_of(self: &Arc<Self>, text: &str, translator: Translator, live: Live) -> Option<Translation> {
