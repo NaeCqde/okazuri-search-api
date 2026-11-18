@@ -18,6 +18,8 @@ pub struct Model {
     pub title_key: String,
     pub first_seen: i64,
     pub updated_at: i64,
+    /// The language the title says the work is in (`language.rs`): two-letter codes joined with `,`, or `unknown`.
+    pub language: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

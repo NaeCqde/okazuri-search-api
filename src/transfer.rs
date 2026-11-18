@@ -2,8 +2,8 @@
 //!
 //! The crawl of N machines (`[crawl] shard = "k/N"`) fills one database on each machine. The works of all of them are put in the database
 //! of the server by exporting each one and importing the files there. The file is JSON Lines (a work a line) compressed with
-//! brotli. A line has only what the sites gave (the site, the path of the page, the title) and when the work was saved; the romaji and the
-//! key of the title are made again when the file is read, with the rules of the program that reads it.
+//! brotli. A line has only what the sites gave (the site, the path of the page, the title) and when the work was saved; the romaji, the key
+//! and the language of the title are made again when the file is read, with the rules of the program that reads it.
 //!
 //! A work that is saved already is left as it is (the shards do not overlap, and a work does not change when it is read again).
 //! The queries and the translations are not moved: only the works, which is what the crawl made.
@@ -121,6 +121,8 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
             .map(|line| {
                 let converted = romaji(&line.title, &romanizer).unwrap_or_else(|_| line.title.clone());
 
+                let language = crate::language::detect(&line.title);
+
                 work::Model {
                     website: line.website,
                     path: line.path,
@@ -129,6 +131,7 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                     title: line.title,
                     first_seen: line.first_seen,
                     updated_at: line.updated_at,
+                    language,
                 }
             })
             .collect::<Vec<_>>()
@@ -151,7 +154,7 @@ mod tests {
         let store = SearchStore::in_memory().await.unwrap();
 
         store.save_crawled("A", 100, &[work("/a/1", "Alpha one"), work("/a/2", "Alpha two")], None).await.unwrap();
-        store.save_crawled("B", 200, &[work("/b/1", "Beta one")], None).await.unwrap();
+        store.save_crawled("B", 200, &[work("/b/1", "Beta one [English]")], None).await.unwrap();
 
         store
     }
@@ -173,6 +176,9 @@ mod tests {
         assert_eq!((imported.works, imported.new), (3, 3));
         assert_eq!(to.counts().await.unwrap().1, 3);
         assert_eq!(to.candidates(Some("alphatwo")).await.unwrap().len(), 1, "the index follows the imported works");
+
+        let languages: Vec<_> = to.works_after(None, 10).await.unwrap().into_iter().map(|w| (w.path, w.language)).collect();
+        assert_eq!(languages, [("/a/1".to_string(), "unknown".to_string()), ("/a/2".to_string(), "unknown".to_string()), ("/b/1".to_string(), "en".to_string())], "the language is made on import: it is not in the file");
 
         // the same file again changes nothing
         let again = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();

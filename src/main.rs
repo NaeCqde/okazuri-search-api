@@ -6,6 +6,7 @@ mod cron;
 mod d1;
 mod engine;
 mod hitomi;
+mod language;
 mod entity;
 mod gtranslate;
 mod mirror;

@@ -271,6 +271,14 @@ searches that listed it are forgotten. It asks no site: the prefetch of the serv
 searched and asks the sites again, newest issue first. The queries that are not issues are asked again when somebody searches
 for them.
 
+## The language of a work (`works.language`)
+
+`language.rs` reads the language from the title: the flag a site puts first, the marks of a translation (`[中国翻訳]`, `[汉化]`) and the
+brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). The answer is two-letter codes joined with `,` in the order found
+(`zh`, `en,ko`), or `unknown` when the title says nothing (most titles are Japanese and do not say so). Every result of the search has it
+as `language`. A database from before this has the column added, and the titles read, when it is opened. The file of `export` does not have it: `import`
+makes it (as it makes the romaji and the key); `reromanize` makes it again too.
+
 ## Crawling (`[crawl]`)
 
 The searches only know the works that a query listed. With `[crawl] enabled = true` the server also walks the list of each site that has one

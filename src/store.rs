@@ -7,6 +7,7 @@
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
 use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work};
+use crate::language;
 use crate::query::title_key;
 use crate::sites::toggle_slash;
 use crate::utils::Result;
@@ -115,7 +116,54 @@ impl SearchStore {
             .to_owned();
         db.execute(backend.build(&by_update)).await?;
 
+        Self::add_language(db).await?;
+
         Self::create_word_index(db).await
+    }
+
+    /// A database from before `works.language`: the column is added, and the language of every title is read. It is quick (no request).
+    async fn add_language(db: &DatabaseConnection) -> Result<()> {
+        let has = db
+            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS n FROM pragma_table_info('works') WHERE name = 'language'"))
+            .await?
+            .ok_or("no count")?
+            .try_get::<i64>("", "n")?;
+
+        if has > 0 {
+            return Ok(());
+        }
+
+        log::info!("works.language: adding the column and reading the language of every title");
+        db.execute_unprepared("ALTER TABLE works ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'").await?;
+
+        let transaction = db.begin().await?;
+        let mut after: Option<(String, String)> = None;
+
+        loop {
+            let mut query = work::Entity::find();
+            if let Some((website, path)) = &after {
+                query = query.filter(Expr::cust_with_values("(website, path) > (?, ?)", [website.as_str(), path.as_str()]));
+            }
+            let page = query.order_by_asc(work::Column::Website).order_by_asc(work::Column::Path).limit(2000).all(&transaction).await?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.website.clone(), last.path.clone()));
+
+            for row in &page {
+                let found = language::detect(&row.title);
+
+                if found != language::UNKNOWN {
+                    work::Entity::update_many()
+                        .col_expr(work::Column::Language, Expr::value(found))
+                        .filter(work::Column::Website.eq(row.website.as_str()))
+                        .filter(work::Column::Path.eq(row.path.as_str()))
+                        .exec(&transaction)
+                        .await?;
+                }
+            }
+        }
+        transaction.commit().await?;
+
+        Ok(())
     }
 
     /// The index of the title keys (`works_fts`): FTS5 with the trigram tokenizer, which finds the works whose key has a
@@ -385,12 +433,14 @@ impl SearchStore {
                     title_key: Set(title_key(&item.romaji)),
                     first_seen: Set(now),
                     updated_at: Set(now),
+                    language: Set(language::detect(&item.title)),
                 }),
                 Some(known) if known.title != item.title || known.title_romaji != item.romaji => {
                     let mut changed = known.clone().into_active_model();
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
                     changed.title_key = Set(title_key(&item.romaji));
+                    changed.language = Set(language::detect(&item.title));
                     changed.updated_at = Set(now);
                     changed.update(db).await?;
                 }
@@ -600,6 +650,7 @@ impl SearchStore {
             let mut changed = known.clone().into_active_model();
             changed.title_romaji = Set(romaji.clone());
             changed.title_key = Set(title_key(romaji));
+            changed.language = Set(language::detect(&known.title));
             changed.update(&transaction).await?;
 
             for row in listing::Entity::find()
@@ -718,7 +769,7 @@ mod tests {
         // the columns of the table are all there is
         assert_eq!(
             store.columns_of("works").await.unwrap(),
-            ["website", "path", "title", "title_romaji", "title_key", "first_seen", "updated_at"]
+            ["website", "path", "title", "title_romaji", "title_key", "first_seen", "updated_at", "language"]
         );
 
         let works = store.candidates(None).await.unwrap();
@@ -912,6 +963,7 @@ mod tests {
             title: Set("Old".into()),
             title_romaji: Set("old".into()),
             title_key: Set("old".into()),
+            language: Set("unknown".into()),
             first_seen: Set(1),
             updated_at: Set(1),
         }
@@ -1079,7 +1131,7 @@ mod tests {
         }
         store
             .db
-            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2)")
+            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1, 'unknown'), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2, 'unknown')")
             .await
             .unwrap();
         drop(store);
@@ -1087,6 +1139,28 @@ mod tests {
         let store = SearchStore::open(&path).await.unwrap();
         assert_eq!(paths(store.candidates(Some("kyoudai")).await.unwrap()).await, ["/g/1/"]);
         assert_eq!(paths(store.candidates(Some("other")).await.unwrap()).await, ["/g/2/"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_database_without_the_language_gets_it_read_from_the_titles_when_it_is_opened() {
+        let dir = std::env::temp_dir().join(format!("okazuri-language-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("search.db");
+
+        let store = SearchStore::open(&path).await.unwrap();
+        store
+            .save_crawled("A", 1, &[NewWork { path: "/g/1/".into(), title: "[x] y [中国翻訳]".into(), romaji: "y".into() }, NewWork { path: "/g/2/".into(), title: "plain".into(), romaji: "plain".into() }], None)
+            .await
+            .unwrap();
+        // a database of a version that had no language
+        store.db.execute_unprepared("ALTER TABLE works DROP COLUMN language").await.unwrap();
+        drop(store);
+
+        let store = SearchStore::open(&path).await.unwrap();
+        let works = store.works_after(None, 10).await.unwrap();
+        assert_eq!(works.iter().map(|w| (w.path.as_str(), w.language.as_str())).collect::<Vec<_>>(), [("/g/1/", "zh"), ("/g/2/", "unknown")]);
 
         fs::remove_dir_all(&dir).ok();
     }
