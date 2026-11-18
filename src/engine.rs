@@ -886,6 +886,10 @@ impl Engine {
         if is_challenge(status, &body) {
             return Err("blocked by a Cloudflare challenge".to_string());
         }
+        // E-Hentai answers 200 with a short page that says the address is banned for a while: not a page without works
+        if body.len() < 2000 && body.contains("temporarily banned") {
+            return Err(format!("the address is banned by the site for a while ({})", body.trim().chars().take(120).collect::<String>()));
+        }
         if status != 200 {
             return Err(format!("HTTP {status}"));
         }
