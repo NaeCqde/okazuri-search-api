@@ -212,39 +212,70 @@ pub fn gallery_ids(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<u
     Ok(ids)
 }
 
-/// The work that `/galleries/<id>.js` describes. None when it has no title.
-pub fn parse_gallery(id: u32, body: &str) -> Option<Link> {
+/// What `/galleries/<id>.js` says of a gallery: its title (English, or the romaji, or both when the language is not
+/// Japanese) and its Japanese title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gallery {
+    pub id: u32,
+    pub title: String,
+    pub japanese_title: Option<String>,
+}
+
+impl Gallery {
+    /// The path of the page of the gallery (the site redirects it to the page with the title in its address).
+    pub fn path(&self) -> String {
+        format!("/galleries/{}.html", self.id)
+    }
+
+    /// The work as it is saved: the title, and the Japanese title after a bar (not written twice when the title has it).
+    pub fn link(&self) -> Link {
+        let title = match &self.japanese_title {
+            Some(japanese) if !self.title.contains(japanese.as_str()) => format!("{} | {japanese}", self.title),
+            _ => self.title.clone(),
+        };
+
+        Link { path: self.path(), title }
+    }
+}
+
+/// The gallery that `/galleries/<id>.js` describes. None when it has no title.
+pub fn parse_gallery(id: u32, body: &str) -> Option<Gallery> {
     let json = body.trim().strip_prefix("var galleryinfo")?.trim_start().strip_prefix('=')?.trim().trim_end_matches(';');
     let info: serde_json::Value = serde_json::from_str(json).ok()?;
 
     let text = |key: &str| info.get(key).and_then(|value| value.as_str()).map(str::trim).filter(|text| !text.is_empty());
-    let title = text("title")?;
-    let title = match text("japanese_title") {
-        Some(japanese) if !title.contains(japanese) => format!("{title} | {japanese}"),
-        _ => title.to_string(),
-    };
 
-    Some(Link { path: format!("/galleries/{id}.html"), title })
+    Some(Gallery { id, title: text("title")?.to_string(), japanese_title: text("japanese_title").map(str::to_string) })
 }
 
-/// The works for a query: at most `limit`, the newest first. A gallery whose file is gone is left out; when none of
+/// The galleries for a query: at most `limit`, the newest first. A gallery whose file is gone is left out; when none of
 /// them can be read, that is an error.
-pub fn search(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<Link>, String> {
+pub fn galleries(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<Gallery>, String> {
     let ids = gallery_ids(fetch, query, limit)?;
-    let mut links = Vec::new();
+    let mut found = Vec::new();
     let mut failed = None;
 
     for id in &ids {
         match fetch(&format!("/galleries/{id}.js"), None) {
-            Ok(body) => links.extend(parse_gallery(*id, &String::from_utf8_lossy(&body))),
+            Ok(body) => found.extend(parse_gallery(*id, &String::from_utf8_lossy(&body))),
             Err(e) => failed = Some(e),
         }
     }
 
     match failed {
-        Some(error) if links.is_empty() && !ids.is_empty() => Err(error),
-        _ => Ok(links),
+        Some(error) if found.is_empty() && !ids.is_empty() => Err(error),
+        _ => Ok(found),
     }
+}
+
+/// The works for a query: at most `limit`, the newest first.
+pub fn search(fetch: &mut Fetch, query: &str, limit: usize) -> Result<Vec<Link>, String> {
+    Ok(galleries(fetch, query, limit)?.iter().map(Gallery::link).collect())
+}
+
+/// Letters and digits in lower case, without the spaces and the marks between them: how a title is compared with the text.
+pub fn squash(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 #[cfg(test)]
@@ -425,10 +456,17 @@ mod tests {
 
     #[test]
     fn a_gallery_without_a_title_is_left_out_and_the_japanese_title_is_not_written_twice() {
-        assert_eq!(parse_gallery(5, r#"var galleryinfo = {"title":"Ane | 姉弟","japanese_title":"姉弟"};"#).unwrap().title, "Ane | 姉弟");
-        assert_eq!(parse_gallery(1, r#"var galleryinfo = {"title":"A","japanese_title":""}"#).unwrap().title, "A");
+        assert_eq!(parse_gallery(5, r#"var galleryinfo = {"title":"Ane | 姉弟","japanese_title":"姉弟"};"#).unwrap().link().title, "Ane | 姉弟");
+        assert_eq!(parse_gallery(1, r#"var galleryinfo = {"title":"A","japanese_title":""}"#).unwrap().link().title, "A");
         assert_eq!(parse_gallery(1, r#"var galleryinfo = {"title":"","japanese_title":null}"#), None);
         assert_eq!(parse_gallery(1, "<html>"), None);
+    }
+
+    #[test]
+    fn a_title_is_compared_without_the_spaces_and_the_marks() {
+        assert_eq!(squash("Kyoudai de  Shitara-Ikemasen!"), "kyoudaideshitaraikemasen");
+        assert_eq!(squash("姉弟で シたらいけません。"), squash("姉弟でシたらいけません"));
+        assert_eq!(squash(" -!?"), "");
     }
 
     #[test]
