@@ -3,9 +3,9 @@
 //! the title (`works.language`) and made again by `import` and `reromanize`.
 //!
 //! The answer is the two-letter codes of the languages the title names, joined with `,` in the order it names them (`zh`, `en,ko`; a pack
-//! `[CN,EN,JP,KR]` is `zh,en,ko`), or None when the title says nothing (most titles are Japanese and do not say so). Japanese is
-//! named only when it is the only language: a title that names Japanese and another language (`[Japanese, Chinese]`, a flag of Japan and `[EN]`)
-//! is a work in the other language.
+//! `[CN,EN,JP,KR]` is `zh,en,ja,ko`), or None when the title says nothing (most titles are Japanese and do not say so). The flag of Japan that
+//! a site puts first does not make a title Japanese when the title names another language (`🇯🇵 【EN】Kosuzu-Chan` is `en`): Japanese
+//! stays only when the title has a Japanese tag of its own (`[Japanese, Chinese]`, `[jap / eng]`) or names no other language.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -89,12 +89,7 @@ fn add(found: &mut Vec<&'static str>, code: &'static str) {
 
 /// The language codes of a title, joined with `,`; None when it names none.
 pub fn detect(title: &str) -> Option<String> {
-    let mut found = detect_all(title);
-
-    // Japanese next to another language is the original that the other one translates, or the flag a site puts on everything
-    if found.len() > 1 {
-        found.retain(|code| *code != "ja");
-    }
+    let found = detect_all(title);
 
     (!found.is_empty()).then(|| found.join(","))
 }
@@ -103,6 +98,8 @@ pub fn detect(title: &str) -> Option<String> {
 pub fn detect_all(title: &str) -> Vec<&'static str> {
     let patterns = patterns();
     let mut found: Vec<&'static str> = Vec::new();
+    // the title says Japanese itself (in a bracket), not only the flag a site put first
+    let mut japanese_tag = false;
     let mut text = title.trim();
 
     // the flags that the site put first
@@ -140,10 +137,16 @@ pub fn detect_all(title: &str) -> Vec<&'static str> {
         if named {
             for word in &words {
                 if let Some(code) = code_of_word(word) {
+                    japanese_tag |= code == "ja";
                     add(&mut found, code);
                 }
             }
         }
+    }
+
+    // the flag of Japan next to another language is the site's flag, not a tag of the title
+    if found.len() > 1 && !japanese_tag {
+        found.retain(|code| *code != "ja");
     }
 
     found
@@ -178,11 +181,11 @@ mod tests {
 
     #[test]
     fn a_title_that_names_several_languages_has_them_all_in_the_order_it_names_them_without_japanese() {
-        is("x [CN,EN,JP,KR]", "zh,en,ko");
-        is("x [jap / eng / rus]", "en,ru");
-        is("x [jap / rus / eng]", "ru,en");
-        is("x [English, Japanese]", "en");
-        is("x [Japanese, Chinese]", "zh");
+        is("x [CN,EN,JP,KR]", "zh,en,ja,ko");
+        is("x [jap / eng / rus]", "ja,en,ru");
+        is("x [jap / rus / eng]", "ja,ru,en");
+        is("x [English, Japanese]", "en,ja");
+        is("x [Japanese, Chinese]", "ja,zh");
         is("x [ENG VIE RUS subs]", "en,vi,ru");
         is("[A] B [English] [無邪気漢化組]", "zh,en");
     }
@@ -191,6 +194,8 @@ mod tests {
     fn a_flag_that_the_site_put_first_counts_once() {
         is("🇨🇳 [Hamao] Fallin' [Chinese]", "zh");
         is("🇯🇵 A [EN]", "en");
+        is("🇯🇵 A [JP]", "ja");
+        is("🇯🇵 A [JP] [EN]", "ja,en");
         is("🇯🇵 【EN】Kosuzu-Chan", "en");
         is("🇯🇵 [KR] U", "ko");
         is("🇯🇵 A", "ja");

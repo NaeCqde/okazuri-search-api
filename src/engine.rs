@@ -1882,7 +1882,7 @@ pub(crate) mod tests {
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
         let languages: Vec<_> = outcome.results.iter().map(|hit| (hit.path.as_str(), hit.language.clone())).collect();
 
-        assert!(languages.contains(&("/work/1", vec!["zh".to_string(), "en".to_string(), "ko".to_string()])), "{languages:?}");
+        assert!(languages.contains(&("/work/1", vec!["zh".to_string(), "en".to_string(), "ja".to_string(), "ko".to_string()])), "{languages:?}");
         assert!(languages.contains(&("/work/2", Vec::new())), "{languages:?}");
         assert_eq!(serde_json::to_value(&outcome.results[0]).unwrap()["language"].is_array(), true);
     }
