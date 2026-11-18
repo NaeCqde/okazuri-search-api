@@ -6,7 +6,6 @@
 // of Google Translate with the text in its address (the first load of the page is the request that has the token), reads the
 // answer of the page, and gives the translation back:
 //
-//   GET /translate?from=ja&to=en&text=...   ->  {"translation":"The Phaethon Assault","model":1}
 //   GET /token?from=ja&to=en&text=...      ->  {"model":1,"request":{"url":...,"headers":{...},"body":"f.req=..."}}
 //   GET /health                            ->  {"ok":true}
 //
@@ -39,37 +38,6 @@ const MAX_TEXT_CHARS = 300;
 const ADVANCED = 1;
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
-
-/** The translation in the answer of the RPC `MkEWBc` (the same reading as `gtranslate.rs`). */
-export function parse(body) {
-  for (const line of body.split('\n')) {
-    let entries;
-    try {
-      entries = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!Array.isArray(entries)) continue;
-
-    for (const entry of entries) {
-      if (entry?.[0] !== 'wrb.fr' || entry?.[1] !== 'MkEWBc') continue;
-      let inner;
-      try {
-        inner = JSON.parse(entry[2]);
-      } catch {
-        continue;
-      }
-
-      const sentences = inner?.[1]?.[0]?.[0]?.[5];
-      if (!Array.isArray(sentences)) return null;
-      const translation = sentences.map((s) => s?.[0]).filter((s) => typeof s === 'string').join(' ').trim();
-      const echo = inner?.[0]?.[6]; // [text, from, to, true, null, model]
-
-      return translation ? { translation, source: echo?.[0], model: echo?.[5], tail: JSON.stringify(inner[inner.length - 1]) } : null;
-    }
-  }
-  return null;
-}
 
 /** A minimal client of the DevTools protocol of Chrome. */
 class Cdp {
@@ -154,152 +122,139 @@ pagePromise.catch((error) => {
   process.exit(1);
 });
 
-/** Opens the page of Google Translate with the text, and waits for the answer of the page. */
-async function translateOnce({ cdp, sessionId, call }, text, from, to) {
-  const answer = new Promise((resolveAnswer, reject) => {
-    const requests = new Set();
-    const sent = new Map();
-    const timer = setTimeout(() => {
-      off();
-      reject(new Error('Google Translate did not answer'));
-    }, ANSWER_TIMEOUT_MS);
-    const off = cdp.on(async (message) => {
-      if (message.sessionId !== sessionId) return;
-      const { method, params } = message;
+// What the page may do: its request for the translation is taken (and failed, so that Google does not get it twice), what it does
+// not need to make one (images, fonts, the other RPCs) is failed, and while `letThrough` is set everything goes on (to choose 高度).
+const PATTERNS = [{ urlPattern: '*rpcids=*' }, { urlPattern: '*', resourceType: 'Image' }, { urlPattern: '*', resourceType: 'Font' }, { urlPattern: '*', resourceType: 'Media' }];
+const RELOAD_EVERY = 200;
+const FAST_TIMEOUT_MS = 5_000;
 
-      if (method === 'Network.requestWillBeSent' && params.request.url.includes('rpcids=MkEWBc')) {
-        sent.set(params.requestId, { url: params.request.url, headers: params.request.headers, body: params.request.postData ?? '' });
-      }
-      if (method === 'Network.responseReceived' && params.response.url.includes('rpcids=MkEWBc')) {
-        requests.add(params.requestId);
-      } else if (method === 'Network.loadingFinished' && requests.has(params.requestId)) {
-        try {
-          const { body, base64Encoded } = await call('Network.getResponseBody', { requestId: params.requestId });
-          const parsed = parse(base64Encoded ? Buffer.from(body, 'base64').toString() : body);
-          if (process.env.DEBUG) console.error('answer', params.requestId, JSON.stringify(parsed));
+let waiting = null; // { text, resolve }
+let letThrough = false;
+let warm = false; // the page is open, and the next text can be given to it without loading it again
+let uses = 0;
+let chosen = false;
+let handlerSet = false;
 
-          if (parsed && parsed.source === text) {
-            clearTimeout(timer);
-            off();
-            resolveAnswer({ ...parsed, request: sent.get(params.requestId) });
-          }
-        } catch {
-          // a request that was cancelled by the page has no body
-        }
-      }
-    });
-  });
-  answer.catch(() => {});
+async function setUp({ cdp, sessionId, call }) {
+  if (handlerSet) return;
+  handlerSet = true;
 
-  const address = `https://translate.google.com/?sl=${from}&tl=${to}&text=${encodeURIComponent(text)}&op=translate&hl=ja`;
-  await call('Page.navigate', { url: address });
+  cdp.on((message) => {
+    if (message.sessionId !== sessionId || message.method !== 'Fetch.requestPaused') return;
+    const { request, requestId } = message.params;
+    const act = (method, params = {}) => call(method, { requestId, ...params }).catch(() => {});
 
-  return answer;
-}
-
-/**
- * Opens the page with the text and takes the request that the page makes for the translation (with its token), without
- * letting it go to Google: the caller sends it. Returns `{ url, headers, body, model }`.
- */
-async function tokenOnce({ cdp, sessionId, call }, text, from, to) {
-  const taken = new Promise((resolveToken, reject) => {
-    const timer = setTimeout(() => {
-      off();
-      reject(new Error('the page did not make the request'));
-    }, ANSWER_TIMEOUT_MS);
-    const off = cdp.on(async (message) => {
-      if (message.sessionId !== sessionId || message.method !== 'Fetch.requestPaused') return;
-      const { request, requestId } = message.params;
-
-      call('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+    if (letThrough) return void act('Fetch.continueRequest');
+    if (waiting && request.url.includes('rpcids=MkEWBc')) {
       try {
-        const body = request.postData ?? '';
-        const outer = JSON.parse(decodeURIComponent(body.replace(/^f\.req=/, '').replace(/&$/, '')));
+        const outer = JSON.parse(decodeURIComponent((request.postData ?? '').replace(/^f\.req=/, '').replace(/&$/, '')));
         const inner = JSON.parse(outer[0][0][1]);
 
-        if (process.env.DEBUG) console.error('paused request:', JSON.stringify(inner[0]), 'bgr:', 'x-goog-batchexecute-bgr' in request.headers);
-        if (inner[0][0] === text) {
-          clearTimeout(timer);
-          off();
-          resolveToken({ url: request.url, headers: request.headers, body, model: inner[0][5] });
+        if (inner[0][0] === waiting.text) {
+          waiting.resolve({ url: request.url, headers: request.headers, body: request.postData, model: inner[0][5] });
+          waiting = null;
         }
       } catch {
-        // a request of the page that is not the translation of this text
+        // not a request for a translation
       }
-    });
+    }
+    act('Fetch.failRequest', { errorReason: 'BlockedByClient' });
   });
+  await call('Fetch.enable', { patterns: PATTERNS.map((p) => ({ ...p, requestStage: 'Request' })) });
+}
+
+function expectRequest(text, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      waiting = null;
+      reject(new Error('the page did not make the request'));
+    }, timeoutMs);
+    waiting = { text, resolve: (value) => (clearTimeout(timer), resolve(value)) };
+  });
+}
+
+const addressOf = (text, from, to) => `/?sl=${from}&tl=${to}&text=${encodeURIComponent(text)}&op=translate&hl=ja`;
+
+/** The request of the page for the text. The page that is open is told of the new text in its address (no load: some 0.1 s); a page
+ * that is not open (or that failed) is loaded (some 1.5 s). */
+async function request(page, text, from, to) {
+  if (warm && uses < RELOAD_EVERY) {
+    const taken = expectRequest(text, FAST_TIMEOUT_MS);
+    taken.catch(() => {});
+    await page.call('Runtime.evaluate', {
+      expression: `history.pushState({}, '', ${JSON.stringify(addressOf(text, from, to))}); window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));`,
+    });
+    try {
+      const got = await taken;
+      uses++;
+      return got;
+    } catch {
+      warm = false;
+    }
+  }
+
+  const taken = expectRequest(text, ANSWER_TIMEOUT_MS);
   taken.catch(() => {});
+  await page.call('Page.navigate', { url: `https://translate.google.com${addressOf(text, from, to)}` });
+  const got = await taken;
+  warm = true;
+  uses = 0;
 
-  await call('Fetch.enable', { patterns: [{ urlPattern: '*rpcids=MkEWBc*', requestStage: 'Request' }] });
+  return got;
+}
+
+/** Chooses 高度 (Advanced) in the menu of the models (a page that has a translation shows it); the profile of Chrome remembers it. */
+async function chooseAdvanced(page, text, from, to) {
+  letThrough = true;
   try {
-    await call('Page.navigate', { url: `https://translate.google.com/?sl=${from}&tl=${to}&text=${encodeURIComponent(text)}&op=translate&hl=ja` });
+    await page.call('Page.navigate', { url: `https://translate.google.com${addressOf(text, from, to)}` });
+    await sleep(5000);
+    const { result } = await page.call('Runtime.evaluate', {
+      awaitPromise: true,
+      returnByValue: true,
+      expression: `(async () => {
+        const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+        const shown = (e) => e.getClientRects().length > 0;
+        const find = (pattern, longest) => [...document.querySelectorAll('button, [role=button], [role=menuitem], [role=option], li, div, span')]
+          .filter((e) => shown(e) && pattern.test((e.innerText || '').trim()) && (e.innerText || '').trim().length < longest).pop();
+        const classic = find(/^(クラシック|Classic)$/, 20);
+        if (!classic) return 'the menu of the models was not found';
+        classic.click();
+        await wait(700);
+        const advanced = find(/^(高度|Advanced)/, 80);
+        if (!advanced) return 'the Advanced entry was not found';
+        advanced.click();
+        await wait(900);
+        return 'ok';
+      })()`,
+    });
 
-    return await taken;
+    return result.value;
   } finally {
-    await call('Fetch.disable').catch(() => {});
+    letThrough = false;
+    warm = false;
   }
 }
 
-/** Chooses 高度 (Advanced) in the menu of the models; the profile of Chrome remembers it. */
-async function chooseAdvanced({ call }) {
-  const { result } = await call('Runtime.evaluate', {
-    awaitPromise: true,
-    returnByValue: true,
-    expression: `(async () => {
-      const wait = (ms) => new Promise((done) => setTimeout(done, ms));
-      const shown = (e) => e.getClientRects().length > 0;
-      const find = (pattern, longest) => [...document.querySelectorAll('button, [role=button], [role=menuitem], [role=option], li, div, span')]
-        .filter((e) => shown(e) && pattern.test((e.innerText || '').trim()) && (e.innerText || '').trim().length < longest).pop();
-      const classic = find(/^(クラシック|Classic)$/, 20);
-      if (!classic) return 'the menu of the models was not found';
-      classic.click();
-      await wait(700);
-      const advanced = find(/^(高度|Advanced)/, 80);
-      if (!advanced) return 'the Advanced entry was not found';
-      advanced.click();
-      await wait(900);
-      return 'ok';
-    })()`,
-  });
-
-  return result.value;
-}
-
-let page = null;
-let chosen = false;
-
 async function token(text, from, to) {
-  page ??= await pagePromise;
-  let got = await tokenOnce(page, text, from, to);
+  const page = await pagePromise;
+  await setUp(page);
+  let got = await request(page, text, from, to);
 
   if (got.model !== ADVANCED && !chosen) {
     chosen = true;
-    // the menu of the models is on a page that has a translation: let this one through, and choose
-    await translateOnce(page, text, from, to).catch(() => {});
-    console.error(`the model was ${got.model}: choosing Advanced: ${await chooseAdvanced(page)}`);
-    got = await tokenOnce(page, text, from, to);
+    console.error(`the model was ${got.model}: choosing Advanced: ${await chooseAdvanced(page, text, from, to)}`);
+    got = await request(page, text, from, to);
   }
-  if (got.model !== ADVANCED) throw new Error(`the page used the model ${got.model}, not Advanced (${ADVANCED})`);
+  if (got.model !== ADVANCED) {
+    warm = false;
+    throw new Error(`the page used the model ${got.model}, not Advanced (${ADVANCED})`);
+  }
 
   return { model: got.model, request: { url: got.url, headers: got.headers, body: got.body } };
 }
 
-async function translate(text, from, to) {
-  page ??= await pagePromise;
-  let got = await translateOnce(page, text, from, to);
-
-  if (got.model !== ADVANCED && !chosen) {
-    chosen = true;
-    const done = await chooseAdvanced(page);
-    console.error(`the model was ${got.model}: choosing Advanced: ${done}`);
-    got = await translateOnce(page, text, from, to);
-  }
-  if (got.model !== ADVANCED) throw new Error(`the page used the model ${got.model}, not Advanced (${ADVANCED})`);
-
-  return { translation: got.translation, model: got.model, request: got.request };
-}
-
-// one translation at a time, with a pause between two
+// one text at a time, with a pause between two
 let queue = Promise.resolve();
 function enqueue(job) {
   const run = queue.then(job);
@@ -317,8 +272,8 @@ const languages = new Set(['ja', 'en']);
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
-  if (url.pathname === '/health') return reply(res, 200, { ok: true });
-  if (url.pathname !== '/translate' && url.pathname !== '/token') return reply(res, 404, { error: 'not found' });
+  if (url.pathname === '/health') return reply(res, 200, { ok: true, warm, uses });
+  if (url.pathname !== '/token') return reply(res, 404, { error: 'not found' });
   if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return reply(res, 401, { error: 'unauthorized' });
 
   const text = (url.searchParams.get('text') ?? '').trim();
@@ -329,12 +284,9 @@ const server = http.createServer(async (req, res) => {
   if (!languages.has(from) || !languages.has(to) || from === to) return reply(res, 422, { error: 'from and to are ja and en' });
 
   try {
-    if (url.pathname === '/token') return reply(res, 200, await enqueue(() => token(text, from, to)));
-
-    const { request, ...answer } = await enqueue(() => translate(text, from, to));
-    reply(res, 200, answer);
+    reply(res, 200, await enqueue(() => token(text, from, to)));
   } catch (error) {
-    console.error(`translate failed: ${error.message}`);
+    console.error(`token failed: ${error.message}`);
     reply(res, 502, { error: error.message });
   }
 });
