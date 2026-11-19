@@ -1,11 +1,14 @@
 mod api;
 mod cli;
 mod config;
+mod crawl;
 mod cron;
 mod d1;
 mod engine;
 mod hitomi;
+mod language;
 mod entity;
+mod gtranslate;
 mod mirror;
 mod prefetch;
 mod query;
@@ -16,7 +19,9 @@ mod store;
 #[cfg(test)]
 mod testing;
 mod tokenizer;
+mod transfer;
 mod utils;
+mod verify;
 
 use std::env;
 use std::process::exit;

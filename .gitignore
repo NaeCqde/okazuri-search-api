@@ -6,3 +6,5 @@ d1-mirror.db*
 .DS_Store
 /okazuri-search-api.exe
 /okazuri-search-api
+# the Chrome profile of tools/google-translate-bridge
+/tools/google-translate-bridge/profile/

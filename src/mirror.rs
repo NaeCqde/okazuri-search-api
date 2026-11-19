@@ -19,7 +19,6 @@ use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolO
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryOrder, Schema, Set, SqlxSqliteConnector,
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -74,11 +73,11 @@ pub fn content_hash(sql: &str) -> String {
 /// The bookmark of the data is kept in it, to know later whether the data changed.
 pub async fn rebuild_mirror(path: &Path, sql: &str, bookmark: &str, now: i64) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
 
     let temporary = temporary_path(path);
-    let _ = fs::remove_file(&temporary);
+    let _ = tokio::fs::remove_file(&temporary).await;
 
     let options = SqliteConnectOptions::new()
         .filename(&temporary)
@@ -109,7 +108,7 @@ async fn replace(temporary: &Path, path: &Path) -> Result<()> {
         let moved = {
             let _writing = MIRROR.write().await;
 
-            fs::rename(temporary, path)
+            tokio::fs::rename(temporary, path).await
         };
 
         match moved {
@@ -235,6 +234,7 @@ pub async fn mirror_issues(path: &Path) -> Result<Vec<Issue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const EXPORT: &str = "PRAGMA defer_foreign_keys=TRUE;
 CREATE TABLE `magazines` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL, `cursor_number_id` text, `completed` integer DEFAULT false NOT NULL);

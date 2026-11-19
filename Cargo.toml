@@ -15,12 +15,11 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # The server. Only HTTP/1 and query strings are used, so the rest of axum is left out.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "signal", "sync", "time"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
 
-# The `[cron]` jobs: the HTTP client. Blocking (it runs on the blocking threads of tokio), with rustls,
-# so no OpenSSL is needed, also for musl. lindera's build script already compiles the same crates.
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+# The HTTP client of the sites, Google Translate, D1 and the `[cron]` jobs: async, with rustls, so no OpenSSL is needed, also for musl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli"] }
 
 # The search engine (`[search]`): the two SQLite files (a copy of the D1 tables and the cache of the results), through
 # SeaORM (sqlx; the SQLite library is compiled into the executable), the patterns of the result links, and JSON for the
@@ -38,6 +37,7 @@ unicode-normalization = "0.1"
 # links it into the executable, so there is nothing to install next to the binary (it makes the
 # executable large). The TLS used to download it is rustls, so no OpenSSL is needed, also for musl.
 lindera = { version = "6", default-features = false, features = ["embed-unidic"] }
+brotli = { version = "9.1.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Calling the router without a socket (`api.rs` tests).

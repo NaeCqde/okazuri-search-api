@@ -231,7 +231,7 @@ pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Str
 struct Job {
     name: String,
     schedule: Schedule,
-    method: ureq::http::Method,
+    method: reqwest::Method,
     url: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
@@ -244,7 +244,7 @@ impl Job {
     fn new(config: &JobConfig, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let named = |e: Box<dyn std::error::Error + Send + Sync>| format!("[[cron.jobs]] {:?}: {e}", config.name);
 
-        let method: ureq::http::Method = config
+        let method: reqwest::Method = config
             .method
             .to_ascii_uppercase()
             .parse()
@@ -284,43 +284,36 @@ struct Answer {
 }
 
 /// Sends the request of a job. A status that is not 2xx is an answer, not an error.
-fn send(job: &Job) -> Result<Answer> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(job.timeout))
-        .http_status_as_error(false)
-        .build()
-        .into();
+async fn send(job: &Job) -> Result<Answer> {
+    let client = reqwest::Client::builder().timeout(job.timeout).build()?;
 
-    let mut request = ureq::http::Request::builder().method(job.method.clone()).uri(&job.url);
+    let mut request = client.request(job.method.clone(), &job.url);
     for (key, value) in &job.headers {
         request = request.header(key, value);
     }
+    if let Some(body) = &job.body {
+        request = request.body(body.clone());
+    }
 
-    let response = match &job.body {
-        Some(body) => agent.run(request.body(body.as_str())?)?,
-        None => agent.run(request.body(())?)?,
-    };
+    let response = request.send().await?;
     let status = response.status().as_u16();
     // the body is read only for the log, and a body that is not text is not worth an error
-    let body = response.into_body().read_to_string().unwrap_or_default();
+    let body = response.text().await.unwrap_or_default();
 
     Ok(Answer { status, body: body.chars().take(LOGGED_BODY_CHARS).collect() })
 }
 
 async fn run_job(job: Arc<Job>) {
     let started = Instant::now();
-    let sent = job.clone();
-    let result = tokio::task::spawn_blocking(move || send(&sent)).await;
 
-    match result {
-        Ok(Ok(answer)) if (200..300).contains(&answer.status) => {
+    match send(&job).await {
+        Ok(answer) if (200..300).contains(&answer.status) => {
             log::info!("cron {}: {} in {:?} {}", job.name, answer.status, started.elapsed(), answer.body.trim());
         }
-        Ok(Ok(answer)) => {
+        Ok(answer) => {
             log::warn!("cron {}: {} in {:?} {}", job.name, answer.status, started.elapsed(), answer.body.trim());
         }
-        Ok(Err(e)) => log::warn!("cron {}: failed after {:?}: {}", job.name, started.elapsed(), e),
-        Err(e) => log::error!("cron {}: the request task died: {}", job.name, e),
+        Err(e) => log::warn!("cron {}: failed after {:?}: {}", job.name, started.elapsed(), e),
     }
     job.running.store(false, Ordering::SeqCst);
 }
@@ -599,7 +592,7 @@ mod tests {
         let job = &scheduler.jobs[0];
 
         assert_eq!(scheduler.offset_seconds, 9 * 3600);
-        assert_eq!(job.method, ureq::http::Method::POST);
+        assert_eq!(job.method, reqwest::Method::POST);
         assert_eq!(job.headers, vec![("Authorization".to_string(), "Bearer abc".to_string())]);
         assert_eq!(job.body.as_deref(), Some("{\"ids\": []}"));
         assert_eq!(job.timeout, Duration::from_secs(5));
@@ -641,13 +634,7 @@ mod tests {
         let extra = "method = \"POST\"\nbody = \"{\\\"ids\\\":[\\\"LBL1\\\"]}\"\n[headers]\nAuthorization = \"Bearer abc\"\n";
         let scheduler = scheduler_for(&url, extra);
 
-        let answer = tokio::task::spawn_blocking({
-            let job = scheduler.jobs[0].clone();
-            move || send(&job)
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        let answer = send(&scheduler.jobs[0]).await.unwrap();
 
         assert_eq!(answer, Answer { status: 200, body: "answer".into() });
         let seen = seen.0.lock().unwrap();
@@ -661,9 +648,7 @@ mod tests {
     async fn a_status_that_is_not_2xx_is_an_answer() {
         let (url, _) = target(503).await;
         let scheduler = scheduler_for(&url, "");
-        let job = scheduler.jobs[0].clone();
-
-        let answer = tokio::task::spawn_blocking(move || send(&job)).await.unwrap().unwrap();
+        let answer = send(&scheduler.jobs[0]).await.unwrap();
         assert_eq!(answer.status, 503);
     }
 
@@ -671,9 +656,8 @@ mod tests {
     async fn a_target_that_is_down_is_an_error_not_a_panic() {
         // nothing listens on port 1
         let scheduler = scheduler_for("http://127.0.0.1:1/hook", "timeout_secs = 2");
-        let job = scheduler.jobs[0].clone();
 
-        assert!(tokio::task::spawn_blocking(move || send(&job)).await.unwrap().is_err());
+        assert!(send(&scheduler.jobs[0]).await.is_err());
     }
 
     #[tokio::test]
