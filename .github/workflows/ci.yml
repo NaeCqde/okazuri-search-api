@@ -2,9 +2,8 @@ name: ci
 
 # Every job runs on every push and pull request: the tests on Windows, macOS and Linux, the build and the archive for every
 # platform (the arm ones and the static musl build too), and the release. A version tag (`git tag v0.1.0 && git push --tags`),
-# or a run started by hand from the Actions tab with a tag name, makes the release of that tag. A push to `main` (the merge of a pull
-# request) updates the release `latest` (its tag moves to the pushed commit), which the auto-updater of the servers watches. A push to
-# any other branch, and a pull request, are tested and built but publish nothing.
+# or a run started by hand from the Actions tab with a tag name, makes the release of that tag. Any other push updates the
+# pre-release `latest` (its tag moves to the pushed commit). A pull request does not publish anything.
 on:
     push:
         paths-ignore:
@@ -56,8 +55,60 @@ env:
     OKAZURI_SEARCH_API_NO_COPY: 1
 
 jobs:
+    # A push to main is, as a rule, the merge of a pull request that has already been built. When the tree of the merged commit is
+    # the very tree that the pull request run built (every platform recorded it in TREE-<platform>), that run's files are used and
+    # nothing is built again; any other case (main moved on, a direct push, a build missing or expired) builds as usual.
+    reuse:
+        name: Reuse the pull request build
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: read
+            actions: read
+            pull-requests: read
+        outputs:
+            reuse: ${{ steps.find.outputs.reuse }}
+        steps:
+            - uses: actions/checkout@v4
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+              with:
+                  persist-credentials: false
+            - name: Find the build of the pull request
+              id: find
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].head.sha // empty')
+                  [ -n "$head" ] || { echo "no pull request: build"; exit 0; }
+                  run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event pull_request --commit "$head" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+                  [ -n "$run" ] || { echo "no successful run of the pull request: build"; exit 0; }
+                  # only a run of a branch of this repository: the files of a fork's run are built by code that nobody here has trusted
+                  [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq '.head_repository.full_name')" = "$GITHUB_REPOSITORY" ] || { echo "the pull request run is from a fork: build"; exit 0; }
+                  mkdir dl reuse
+                  gh run download "$run" --repo "$GITHUB_REPOSITORY" --pattern 'okazuri-search-api-*' --dir dl || { echo "download failed: build"; exit 0; }
+                  mine=$(git rev-parse 'HEAD^{tree}')
+                  n=0
+                  for f in dl/*/TREE-*; do
+                    [ -f "$f" ] && [ "$(cat "$f")" = "$mine" ] || { echo "the tree differs from the pull request build: build"; exit 0; }
+                    n=$((n + 1))
+                  done
+                  # one per platform of the matrix below
+                  [ "$n" -eq 4 ] || { echo "$n platforms only: build"; exit 0; }
+                  mv dl/okazuri-search-api-*/* reuse/
+                  echo "reuse run $run (tree $mine)"
+                  echo "reuse=true" >> "$GITHUB_OUTPUT"
+            - uses: actions/upload-artifact@v4
+              if: steps.find.outputs.reuse == 'true'
+              with:
+                  name: okazuri-search-api-reused
+                  path: reuse/*
+                  if-no-files-found: error
+                  retention-days: 1
+
     test:
         name: Test - ${{ matrix.os }}
+        needs: [reuse]
+        if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' }}
         strategy:
             fail-fast: false
             matrix:
@@ -75,7 +126,8 @@ jobs:
     # One build and archive per platform, after the tests passed.
     package:
         name: Build - ${{ matrix.platform.os-name }}
-        needs: test
+        needs: [reuse, test]
+        if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && needs.test.result == 'success' }}
         strategy:
             fail-fast: false
             matrix:
@@ -135,6 +187,7 @@ jobs:
               shell: bash
               run: |
                   mkdir out
+                  git rev-parse 'HEAD^{tree}' > "out/TREE-${{ matrix.platform.os-name }}"
                   asset="okazuri-search-api-${{ matrix.platform.os-name }}"
                   exe="$BUILD_DIR/${{ matrix.platform.executable }}"
                   case "$exe" in *.exe) asset="$asset.exe" ;; esac
@@ -145,11 +198,88 @@ jobs:
                   name: okazuri-search-api-${{ matrix.platform.os-name }}
                   path: out/*
                   if-no-files-found: error
+                  retention-days: 1
 
     # After every platform has built (so that no two jobs race to create the same release).
+    # The macOS files are signed after the build (or after the pull request build was reused), and only for merged code: a push to main or
+    # a version tag (pushes need write access). A pull request and other branches never enter the environment `signing`, which holds the
+    # certificate (the owner's self-signed one: macOS keeps its permissions for the app across updates when the identity is fixed).
+    sign:
+        name: Sign the macOS files
+        needs: [reuse, package]
+        if: ${{ !cancelled() && (needs.reuse.outputs.reuse == 'true' || needs.package.result == 'success') && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        runs-on: macos-latest
+        environment: signing
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: in
+                  pattern: okazuri-search-api-*
+                  merge-multiple: true
+            - name: Sign
+              env:
+                  SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+                  SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+              run: |
+                  set -euo pipefail
+                  keychain="$RUNNER_TEMP/sign.keychain-db"
+                  pw=$(uuidgen)
+                  orig=$(security list-keychains -d user | tr -d '"' | tr -s ' \n' ' ')
+                  trap 'security list-keychains -d user -s $orig; security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/sign.p12"' EXIT
+                  echo "$SIGN_P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+                  security create-keychain -p "$pw" "$keychain"
+                  security set-keychain-settings -lut 3600 "$keychain"
+                  security unlock-keychain -p "$pw" "$keychain"
+                  security import "$RUNNER_TEMP/sign.p12" -k "$keychain" -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign
+                  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$keychain" > /dev/null
+                  # codesign finds the identity only in a keychain of the search list
+                  security list-keychains -d user -s "$keychain" $orig
+                  id=$(security find-identity -p codesigning "$keychain" | awk '/\)/ {print $2; exit}')
+                  [ -n "$id" ] || { echo "no signing identity"; exit 1; }
+                  mkdir signed
+                  n=0
+                  for f in in/*macOS*; do
+                    case "$f" in *.sha256) continue ;; esac
+                    [ -f "$f" ] || continue
+                    b=$(basename "$f")
+                    cp "$f" "signed/$b"
+                    # the identifier is fixed per program, so the permissions stay with the program across builds
+                    codesign --force --keychain "$keychain" --sign "$id" --identifier "quest.nae.okazuri-search-api.${b%%-macOS*}" "signed/$b"
+                    codesign -v "signed/$b"
+                    (cd signed && shasum -a 256 "$b" > "$b.sha256")
+                    n=$((n + 1))
+                  done
+                  # an app in a disk image: the app inside is signed, with the bundle identifier
+                  for f in in/*.app.dmg; do
+                    [ -f "$f" ] || continue
+                    b=$(basename "$f")
+                    hdiutil convert "$f" -format UDRW -o "$RUNNER_TEMP/rw.dmg" -quiet
+                    mnt=$(hdiutil attach "$RUNNER_TEMP/rw.dmg" -nobrowse -readwrite | awk -F'\t' 'END {print $NF}')
+                    for app in "$mnt"/*.app; do
+                      bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+                      codesign --force --deep --keychain "$keychain" --sign "$id" --identifier "$bundle_id" "$app"
+                      codesign -v "$app"
+                    done
+                    hdiutil detach "$mnt" -quiet
+                    hdiutil convert "$RUNNER_TEMP/rw.dmg" -format UDZO -o "signed/$b" -quiet
+                    rm -f "$RUNNER_TEMP/rw.dmg"
+                    (cd signed && shasum -a 256 "$b" > "$b.sha256")
+                    n=$((n + 1))
+                  done
+                  [ "$n" -gt 0 ] || { echo "no macOS file to sign"; exit 1; }
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: signed-macos
+                  path: signed/*
+                  if-no-files-found: error
+                  retention-days: 1
+
     release:
         name: Release
-        needs: package
+        needs: [reuse, package, sign]
+        if: ${{ !cancelled() && needs.sign.result != 'failure' && (needs.reuse.outputs.reuse == 'true' || needs.package.result == 'success') }}
         runs-on: ubuntu-24.04
         permissions:
             contents: write
@@ -158,11 +288,29 @@ jobs:
             - uses: actions/download-artifact@v4
               with:
                   path: dist
+                  pattern: okazuri-search-api-*
                   merge-multiple: true
+            - uses: actions/download-artifact@v4
+              if: needs.sign.result == 'success'
+              with:
+                  name: signed-macos
+                  path: signed
+            - name: Use the signed macOS files
+              if: needs.sign.result == 'success'
+              run: cp signed/* dist/
             - name: List the files
               run: ls -l dist
-            # For a push to `main`: the tag `latest` moves to this commit (created if it is not there).
+            # For a push that is not a version tag: the tag `latest` moves to this commit (created if it is not there).
             # It does not start this workflow again: only `v*` tags do.
+            # Nothing is released until the commit is in the default branch (main): a version tag or a run started by hand on any other
+            # commit stops here.
+            - name: The commit must be in main
+              if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  status=$(gh api "repos/${{ github.repository }}/compare/main...${{ github.sha }}" --jq .status)
+                  case "$status" in identical|behind) ;; *) echo "::error::commit ${{ github.sha }} is not in main ($status): not released"; exit 1 ;; esac
             - name: Move the latest tag
               if: github.event_name == 'push' && github.ref == 'refs/heads/main'
               env:
@@ -181,11 +329,12 @@ jobs:
             # release asset, so .env is example.env).
             - name: Add the license, the changes and the config templates
               run: |
+                  rm -f dist/TREE-*
                   cp "LICENSE" "dist/LICENSE"
                   cp "Changes.md" "dist/Changes.md"
                   cp "config.example.toml" "dist/config.example.toml"
             - name: Make the release
-              if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+              if: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || (github.event_name == 'workflow_dispatch' && inputs.tag != '') }}
               uses: softprops/action-gh-release@v2
               with:
                   tag_name: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'latest' }}
