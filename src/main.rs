@@ -21,6 +21,7 @@ mod testing;
 mod tokenizer;
 mod transfer;
 mod utils;
+mod verify;
 
 use std::env;
 use std::process::exit;

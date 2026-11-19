@@ -17,6 +17,7 @@ pub struct Config {
     pub d1: D1Config,
     pub prefetch: PrefetchConfig,
     pub crawl: CrawlConfig,
+    pub verify: VerifyConfig,
     pub cron: CronConfig,
     /// Word (as UniDic splits it) to the romaji it is replaced by.
     pub exceptions: BTreeMap<String, String>,
@@ -208,6 +209,25 @@ impl Default for CrawlConfig {
             refresh_pages: 1000,
             retry_minutes: 10,
         }
+    }
+}
+
+/// Looking at the page of every saved work now and then, and removing the works whose page is gone (`verify.rs`). Off unless `enabled` is true.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    pub enabled: bool,
+    /// The sites whose pages say that a work is gone, by name; empty is the sites that do (RokuHentai).
+    pub sites: Vec<String>,
+    /// A page is looked at again after this many days.
+    pub interval_days: u64,
+    /// The wait between two pages, on top of the delay of the site (a site with 400 000 works and a month needs one page every 6 s).
+    pub pause_ms: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self { enabled: false, sites: Vec::new(), interval_days: 30, pause_ms: 5000 }
     }
 }
 

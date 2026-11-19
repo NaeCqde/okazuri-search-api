@@ -899,6 +899,18 @@ impl Engine {
         Ok((page_url, body))
     }
 
+    /// Asks for the page of a work, after the turn of the site: `Some(true)` when it is gone, `Some(false)` when it is there, `None` when
+    /// nothing can be said (the request failed, or the status is no sign).
+    pub(crate) async fn probe(&self, index: usize, url: &str) -> Option<bool> {
+        self.wait_turn(index).await;
+
+        let response = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").send().await.ok()?;
+        let status = response.status().as_u16();
+        let body = response.text().await.ok()?;
+
+        page_status(status, &body)
+    }
+
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
     async fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
         crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
@@ -1209,6 +1221,19 @@ fn dedupe_by_url(hits: Vec<Hit>) -> Vec<Hit> {
     }
 
     kept
+}
+
+/// What the answer for the page of a work says: `Some(true)` it is gone (404, 410, or the 503 of RokuHentai that says "temporarily
+/// unavailable ... Here are some results that might be useful to you"), `Some(false)` it is there (200), `None` no sign (another 503, 429, ...).
+fn page_status(status: u16, body: &str) -> Option<bool> {
+    let lower = body.to_lowercase();
+
+    match status {
+        200 => Some(false),
+        404 | 410 => Some(true),
+        503 if lower.contains("temporarily unavailable") && lower.contains("results that might be useful") => Some(true),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1810,6 +1835,18 @@ pub(crate) mod tests {
         );
         assert!(trying.sites_info().iter().find(|s| s.name == "IMHentai").unwrap().active);
         assert!(!trying.sites_info().iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
+    }
+
+    #[test]
+    fn a_page_that_is_gone_is_told_by_its_status_and_a_site_that_is_down_is_no_sign() {
+        let notice = "Roku Hentai is temporarily unavailable. Please try again shortly. Here are some results that might be useful to you.";
+
+        assert_eq!(page_status(503, notice), Some(true));
+        assert_eq!(page_status(404, ""), Some(true));
+        assert_eq!(page_status(410, ""), Some(true));
+        assert_eq!(page_status(200, ""), Some(false));
+        assert_eq!(page_status(503, "Service Unavailable"), None, "a 503 without the notice is a site that is down");
+        assert_eq!(page_status(429, ""), None);
     }
 
     #[tokio::test]

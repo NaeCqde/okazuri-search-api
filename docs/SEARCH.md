@@ -296,6 +296,14 @@ sites are walked at the same time, each one page after page, newest first.
 - **More than one machine:** `shard = "k/N"` on each, then `export` on each (`okazuri-search-api export out.jsonl.br`; JSON Lines, brotli) and
   `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` on the server. A work that is saved already stays as it is.
 
+## Works whose page is gone (`[verify]`)
+
+RokuHentai still lists a work after its page is gone (the page answers 503 with "temporarily unavailable ... Here are some results that might be
+useful to you", or 404). With `[verify] enabled = true` the server looks at the page of every saved work of such a site once in `interval_days`
+(30), one page every `pause_ms` (5 s) after the delay of the site, the works that were never looked at first. A work whose page is gone is
+removed from `works` and remembered in `work_checks` (`gone`): a list, the crawl and an import do not save it again, since the site still
+lists it. A page that cannot be read (a failure, another 503, 429) is looked at again by the next round.
+
 ## Not done
 
 - A site behind a Cloudflare challenge and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.
