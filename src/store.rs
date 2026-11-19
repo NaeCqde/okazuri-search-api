@@ -95,6 +95,8 @@ impl SearchStore {
         let backend = db.get_database_backend();
         let schema = Schema::new(backend);
 
+        Self::replace_old_translations(db).await?;
+
         let mut works = schema.create_table_from_entity(work::Entity);
         let mut searches = schema.create_table_from_entity(search::Entity);
         let mut listings = schema.create_table_from_entity(listing::Entity);
@@ -119,6 +121,30 @@ impl SearchStore {
         Self::add_language(db).await?;
 
         Self::create_word_index(db).await
+    }
+
+    /// A database from before the translation tables took their form (`translations.english_key`): the two tables are only a copy of what
+    /// the sources answered, so they are dropped and made again (the answers are asked again).
+    async fn replace_old_translations(db: &DatabaseConnection) -> Result<()> {
+        let backend = db.get_database_backend();
+        let columns = db
+            .query_one(Statement::from_string(backend, "SELECT count(*) AS n FROM pragma_table_info('translations')"))
+            .await?
+            .ok_or("no count")?
+            .try_get::<i64>("", "n")?;
+        let current = db
+            .query_one(Statement::from_string(backend, "SELECT count(*) AS n FROM pragma_table_info('translations') WHERE name = 'english_key'"))
+            .await?
+            .ok_or("no count")?
+            .try_get::<i64>("", "n")?;
+
+        if columns > 0 && current == 0 {
+            log::info!("translations: an old table, made again");
+            db.execute_unprepared("DROP TABLE translations").await?;
+            db.execute_unprepared("DROP TABLE IF EXISTS translation_lookups").await?;
+        }
+
+        Ok(())
     }
 
     /// A database from before `works.language`: the column is added, and the language of every title is read. It is quick (no request).
