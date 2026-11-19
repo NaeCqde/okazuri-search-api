@@ -305,7 +305,7 @@ jobs:
             # Nothing is released until the commit is in the default branch (main): a version tag or a run started by hand on any other
             # commit stops here.
             - name: The commit must be in main
-              if: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') }}
+              if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
