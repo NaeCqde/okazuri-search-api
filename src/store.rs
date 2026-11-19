@@ -524,6 +524,11 @@ impl SearchStore {
         Ok(new)
     }
 
+    /// How many works of `website` are saved (the ones whose page is gone are not counted).
+    pub async fn counts_of(&self, website: &str) -> Result<u64> {
+        Ok(work::Entity::find().filter(work::Column::Website.eq(website)).filter(work::Column::Deleted.eq(false)).count(&self.db).await?)
+    }
+
     /// The paths of the works of `website` whose page was not looked at since `before` (never looked at first, then the oldest look), at most `limit`.
     pub async fn due_checks(&self, website: &str, before: i64, limit: u64) -> Result<Vec<String>> {
         let rows = self

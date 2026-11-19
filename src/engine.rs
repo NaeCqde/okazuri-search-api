@@ -899,16 +899,17 @@ impl Engine {
         Ok((page_url, body))
     }
 
-    /// Asks for the page of a work, after the turn of the site: `Some(true)` when it is gone, `Some(false)` when it is there, `None` when
-    /// nothing can be said (the request failed, or the status is no sign).
-    pub(crate) async fn probe(&self, index: usize, url: &str) -> Option<bool> {
+    /// Asks for the page of a work, after the turn of the site, and says whether the page is gone (`rule`): `Some(true)` it is gone, `Some(false)`
+    /// it is there, `None` nothing can be said (the request failed, or the answer is no sign).
+    pub(crate) async fn probe(&self, index: usize, url: &str, rule: GoneRule) -> Option<bool> {
         self.wait_turn(index).await;
 
         let response = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").send().await.ok()?;
         let status = response.status().as_u16();
+        let final_path = response.url().path().to_string();
         let body = response.text().await.ok()?;
 
-        page_status(status, &body)
+        page_status(rule, status, &final_path, &body)
     }
 
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
@@ -1223,16 +1224,46 @@ fn dedupe_by_url(hits: Vec<Hit>) -> Vec<Hit> {
     kept
 }
 
-/// What the answer for the page of a work says: `Some(true)` it is gone (404, 410, or the 503 of RokuHentai that says "temporarily
-/// unavailable ... Here are some results that might be useful to you"), `Some(false)` it is there (200), `None` no sign (another 503, 429, ...).
-fn page_status(status: u16, body: &str) -> Option<bool> {
-    let lower = body.to_lowercase();
+/// How a site tells that the page of a work is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoneRule {
+    /// The page answers 404 or 410 (RokuHentai: or the 503 with "temporarily unavailable ... Here are some results that might be useful to you").
+    NotFound,
+    /// The page redirects to `/404/` (AsmHentai, HentaiEra).
+    RedirectsTo404,
+    /// The page answers 200 with a sentence that says the work is not there (Wnacg).
+    Sentence(&'static str),
+}
 
-    match status {
-        200 => Some(false),
-        404 | 410 => Some(true),
-        503 if lower.contains("temporarily unavailable") && lower.contains("results that might be useful") => Some(true),
+/// The sites whose pages tell that a work is gone, and how. (Hitomi.La's page is the same shell for any id: its index file says which
+/// galleries there are. E-Hentai answers 200 with a short text, and it bans an address that asks more than a page every few seconds.)
+pub fn gone_rule(site: &str) -> Option<GoneRule> {
+    match site {
+        "RokuHentai" | "DLsite" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" => Some(GoneRule::NotFound),
+        "AsmHentai" | "HentaiEra" => Some(GoneRule::RedirectsTo404),
+        "Wnacg" => Some(GoneRule::Sentence("您要訪問的漫畫不存在")),
         _ => None,
+    }
+}
+
+/// What the answer for the page of a work says under `rule`: `Some(true)` it is gone, `Some(false)` it is there (a 200 without the sign), `None`
+/// no sign (another 503, 429, a failure of the site, ...).
+fn page_status(rule: GoneRule, status: u16, final_path: &str, body: &str) -> Option<bool> {
+    match rule {
+        GoneRule::NotFound => {
+            let lower = body.to_lowercase();
+
+            match status {
+                200 => Some(false),
+                404 | 410 => Some(true),
+                503 if lower.contains("temporarily unavailable") && lower.contains("results that might be useful") => Some(true),
+                _ => None,
+            }
+        }
+        GoneRule::RedirectsTo404 if final_path.trim_end_matches('/') == "/404" => Some(true),
+        GoneRule::RedirectsTo404 => (status == 200).then_some(false),
+        GoneRule::Sentence(sentence) if status == 200 => Some(body.contains(sentence)),
+        GoneRule::Sentence(_) => None,
     }
 }
 
@@ -1838,15 +1869,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_page_that_is_gone_is_told_by_its_status_and_a_site_that_is_down_is_no_sign() {
+    fn a_page_that_is_gone_is_told_by_the_rule_of_its_site_and_a_site_that_is_down_is_no_sign() {
         let notice = "Roku Hentai is temporarily unavailable. Please try again shortly. Here are some results that might be useful to you.";
 
-        assert_eq!(page_status(503, notice), Some(true));
-        assert_eq!(page_status(404, ""), Some(true));
-        assert_eq!(page_status(410, ""), Some(true));
-        assert_eq!(page_status(200, ""), Some(false));
-        assert_eq!(page_status(503, "Service Unavailable"), None, "a 503 without the notice is a site that is down");
-        assert_eq!(page_status(429, ""), None);
+        assert_eq!(page_status(GoneRule::NotFound, 503, "/x", notice), Some(true));
+        assert_eq!(page_status(GoneRule::NotFound, 404, "/x", ""), Some(true));
+        assert_eq!(page_status(GoneRule::NotFound, 410, "/x", ""), Some(true));
+        assert_eq!(page_status(GoneRule::NotFound, 200, "/x", ""), Some(false));
+        assert_eq!(page_status(GoneRule::NotFound, 503, "/x", "Service Unavailable"), None, "a 503 without the notice is a site that is down");
+        assert_eq!(page_status(GoneRule::NotFound, 429, "/x", ""), None);
+
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 200, "/404/", ""), Some(true));
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 404, "/404", ""), Some(true));
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 200, "/g/1/", ""), Some(false));
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 503, "/g/1/", ""), None);
+
+        let rule = GoneRule::Sentence("not here");
+        assert_eq!(page_status(rule, 200, "/p", "<p>the work is not here!</p>"), Some(true));
+        assert_eq!(page_status(rule, 200, "/p", "<p>a work</p>"), Some(false));
+        assert_eq!(page_status(rule, 500, "/p", "not here"), None);
     }
 
     #[tokio::test]

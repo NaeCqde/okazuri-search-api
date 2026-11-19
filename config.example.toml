@@ -149,13 +149,12 @@ hitomi_batch = 100
 refresh_pages = 1000
 retry_minutes = 10
 
-# Looking at the page of every saved work of a site once in `interval_days`, and removing the works whose page is gone. The site still lists
-# such a work, so it is marked (`works.deleted`, with no title) and a list, the crawl or an import does not save it again. Only RokuHentai tells (its
-# page of a work that is gone answers 503: "temporarily unavailable ... Here are some results that might be useful to you").
+# Looking at the page of every saved work of the sites that tell when a work is gone (RokuHentai, DLsite, HentaiEnvy, Nya:Hentai, momon:GA,
+# Sukebei, AsmHentai, HentaiEra, Wnacg), once in `interval_days`, and marking the works whose page is gone (`works.deleted`, with no title: no search
+# finds them). The sites still list such a work, so a list, the crawl or an import does not save it again. A site is asked one page every
+# `interval_days / works` (900 000 works in 30 days: a page every 2.9 s), never closer than the delay of the site.
 [verify]
 enabled = false
-# Empty: the sites that tell (RokuHentai).
+# Empty: every site of that list.
 sites = []
 interval_days = 30
-# The wait between two pages, on top of the delay of the site. 400 000 works in a month are one page every 6 s.
-pause_ms = 5000

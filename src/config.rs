@@ -217,17 +217,16 @@ impl Default for CrawlConfig {
 #[serde(default)]
 pub struct VerifyConfig {
     pub enabled: bool,
-    /// The sites whose pages say that a work is gone, by name; empty is the sites that do (RokuHentai).
+    /// The sites to look at, by name; empty is every site whose pages say that a work is gone (`engine::gone_rule`).
     pub sites: Vec<String>,
-    /// A page is looked at again after this many days.
+    /// Every page is looked at once in this many days: a site is asked one page every `days / works` (the works of a site that are saved
+    /// now), never closer than the delay of the site.
     pub interval_days: u64,
-    /// The wait between two pages, on top of the delay of the site (a site with 400 000 works and a month needs one page every 6 s).
-    pub pause_ms: u64,
 }
 
 impl Default for VerifyConfig {
     fn default() -> Self {
-        Self { enabled: false, sites: Vec::new(), interval_days: 30, pause_ms: 5000 }
+        Self { enabled: false, sites: Vec::new(), interval_days: 30 }
     }
 }
 

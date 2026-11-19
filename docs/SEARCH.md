@@ -298,11 +298,15 @@ sites are walked at the same time, each one page after page, newest first.
 
 ## Works whose page is gone (`[verify]`)
 
-RokuHentai still lists a work after its page is gone (the page answers 503 with "temporarily unavailable ... Here are some results that might be
-useful to you", or 404). With `[verify] enabled = true` the server looks at the page of every saved work of such a site once in `interval_days`
-(30), one page every `pause_ms` (5 s) after the delay of the site, the works that were never looked at first. A work whose page is gone is
-marked in `works` (`deleted = 1`; its title, romaji and key are blanked, so no search finds it and it is not exported): a list, the crawl and an
-import do not save it again, since the site still lists it. `works.checked_at` is when its page was looked at. A page that cannot be read (a failure, another 503, 429) is looked at again by the next round.
+Some sites keep listing a work after its page is gone. With `[verify] enabled = true` the server looks at the page of every saved work of the
+sites that tell (RokuHentai, DLsite, HentaiEnvy, Nya:Hentai, momon:GA, Sukebei: 404, RokuHentai also a 503 with "temporarily unavailable ...
+Here are some results that might be useful to you"; AsmHentai and HentaiEra: a redirect to `/404/`; Wnacg: the sentence "您要訪問的漫畫不存在")
+once in `interval_days` (30). Each site is asked on its own, one page every `interval_days / works` (never closer than the delay of the
+site); the works that were never looked at first, then the oldest look. A work whose page is gone is marked in `works` (`deleted = 1`; its
+title, romaji and key are blanked, so no search finds it and it is not exported): a list, the crawl and an import do not save it again, since the
+site still lists it. `works.checked_at` is when its page was looked at. A page that cannot be read (a failure, another 503, 429) is looked
+at again later. Not looked at: Hitomi.La (the page is the same shell for any id; its index file says which galleries there are) and E-Hentai (a
+short text with status 200, and an address that asks more than a page every few seconds is banned).
 
 ## Not done
 
