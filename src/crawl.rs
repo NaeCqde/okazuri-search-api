@@ -76,6 +76,29 @@ struct Step {
     next: Option<String>,
 }
 
+/// `lo-hi` of `[crawl] gallery_ids`: (`lo`, `hi`), each one empty or an id.
+pub fn parse_gallery_ids(text: &str) -> Result<(Option<u64>, Option<u64>)> {
+    let error = || format!("[crawl] gallery_ids must look like 100000-2000000, -2000000 or 100000- (lo-hi), got {text:?}");
+    let text = text.trim();
+
+    if text.is_empty() {
+        return Ok((None, None));
+    }
+
+    let (lo, hi) = text.split_once('-').ok_or_else(error)?;
+    let number = |part: &str| -> Result<Option<u64>> {
+        let part = part.trim();
+        if part.is_empty() { Ok(None) } else { Ok(Some(part.parse().map_err(|_| error())?)) }
+    };
+    let (lo, hi) = (number(lo)?, number(hi)?);
+
+    if lo.is_some() && hi.is_some() && lo > hi {
+        return Err(error().into());
+    }
+
+    Ok((lo, hi))
+}
+
 /// `k/N` of `[crawl] shard`.
 pub fn parse_shard(text: &str) -> Result<(u64, u64)> {
     let error = || format!("[crawl] shard must look like 0/1 or 2/4 (k/N with k < N), got {text:?}");
@@ -103,6 +126,8 @@ pub struct Crawler {
     config: CrawlConfig,
     sources: Vec<(usize, Source)>,
     shard: (u64, u64),
+    /// The ids of E-Hentai that this machine reads (`lo`, `hi`).
+    ids: (Option<u64>, Option<u64>),
     schedule: Schedule,
     offset_seconds: i64,
 }
@@ -117,6 +142,7 @@ impl Crawler {
 
     pub fn with_sources(engine: Arc<Engine>, config: CrawlConfig, sources: Vec<(String, Source)>) -> Result<Self> {
         let shard = parse_shard(&config.shard)?;
+        let ids = parse_gallery_ids(&config.gallery_ids)?;
         let schedule = Schedule::parse(&config.schedule).map_err(|e| format!("[crawl] schedule: {e}"))?;
         let offset_seconds = parse_utc_offset(&config.utc_offset).map_err(|e| format!("[crawl] {e}"))?;
 
@@ -139,7 +165,7 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, schedule, offset_seconds })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds })
     }
 
     /// Walks every site, each in a task of its own, for as long as the server runs.
@@ -159,7 +185,10 @@ impl Crawler {
         let name = self.engine.site(*index).def.name;
 
         // a list that is read with the cursor of the page before cannot be shared: the first machine reads it
-        if matches!(source, Source::Cards(_) | Source::GalleryIds(_)) && self.shard.0 != 0 {
+        // (the ids of E-Hentai can be cut into ranges instead: `gallery_ids`)
+        let ranged = matches!(source, Source::GalleryIds(_)) && self.ids != (None, None);
+
+        if matches!(source, Source::Cards(_) | Source::GalleryIds(_)) && self.shard.0 != 0 && !ranged {
             log::info!("crawl {name}: the pages follow one another, so shard 0 reads this site");
             return;
         }
@@ -176,6 +205,12 @@ impl Crawler {
                 }
             };
 
+            // a machine that reads the ids below `hi` has read its range: the newest pages are read again by the machine with no `hi`
+            if done && ranged && self.ids.1.is_some() {
+                log::info!("crawl {name}: the ids {} are read", self.config.gallery_ids);
+                return;
+            }
+
             if done {
                 self.wait_for_schedule().await;
             }
@@ -184,6 +219,9 @@ impl Crawler {
                 Ok(walk) => {
                     if walk.finished {
                         log::info!("crawl {name}: the list is read to its end ({} new works in the last walk)", walk.new);
+                        if ranged && self.ids.1.is_some() {
+                            return;
+                        }
                     } else if done {
                         log::info!("crawl {name}: {} pages read again, {} new works", walk.pages, walk.new);
                     }
@@ -220,7 +258,7 @@ impl Crawler {
         // a first walk that is taken up again: the list moved while it was stopped (new works are on the first pages, and what was
         // read is further down than the cursor says), so the newest pages are read again up to a page that is known, as every later
         // walk does, and then the walk goes on from its cursor
-        if first && !cursor.is_empty() {
+        if first && !cursor.is_empty() && self.ids.1.is_none() {
             let caught_up = self.pages(index, source, String::new(), (0, 1), false).await?;
             log::info!("crawl {name}: {} pages read again from the newest, {} new works, before the walk goes on", caught_up.pages, caught_up.new);
             walk.pages += caught_up.pages;
@@ -346,10 +384,16 @@ impl Crawler {
                 Ok(Step { links, next })
             }
             Source::GalleryIds(first) => {
-                let url = if cursor.is_empty() { first.clone() } else { format!("{first}?next={cursor}") };
+                // a machine of a range starts under its `hi` (`?next=` lists the galleries with a smaller id)
+                let url = match (cursor.is_empty(), self.ids.1) {
+                    (true, Some(hi)) => format!("{first}?next={}", hi + 1),
+                    (true, None) => first.clone(),
+                    (false, _) => format!("{first}?next={cursor}"),
+                };
                 let (page_url, body) = self.engine.get_page(index, &url).await?;
                 let links = site.read(&page_url, &body, MOST_LINKS)?;
-                let next = links.iter().filter_map(|link| gallery_id(&link.path)).min().map(|id| id.to_string());
+                // the walk of a range ends at its `lo`
+                let next = links.iter().filter_map(|link| gallery_id(&link.path)).min().filter(|id| self.ids.0.is_none_or(|lo| *id > lo)).map(|id| id.to_string());
 
                 Ok(Step { links, next })
             }
@@ -499,6 +543,17 @@ mod tests {
         let source = Source::Pages(format!("http://127.0.0.1:{port}/list/{{n}}"));
 
         (Arc::new(Crawler::with_sources(engine, config, vec![("Listed".to_string(), source)]).unwrap()), store)
+    }
+
+    #[test]
+    fn the_ids_of_a_range_are_lo_hi() {
+        assert_eq!(parse_gallery_ids("").unwrap(), (None, None));
+        assert_eq!(parse_gallery_ids("100-2000").unwrap(), (Some(100), Some(2000)));
+        assert_eq!(parse_gallery_ids("-2000").unwrap(), (None, Some(2000)));
+        assert_eq!(parse_gallery_ids(" 100- ").unwrap(), (Some(100), None));
+        assert!(parse_gallery_ids("2000-100").is_err());
+        assert!(parse_gallery_ids("abc").is_err());
+        assert!(parse_gallery_ids("1-x").is_err());
     }
 
     #[test]
