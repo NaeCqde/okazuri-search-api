@@ -302,6 +302,15 @@ jobs:
               run: ls -l dist
             # For a push that is not a version tag: the tag `latest` moves to this commit (created if it is not there).
             # It does not start this workflow again: only `v*` tags do.
+            # Nothing is released until the commit is in the default branch (main): a version tag or a run started by hand on any other
+            # commit stops here.
+            - name: The commit must be in main
+              if: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') }}
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  status=$(gh api "repos/${{ github.repository }}/compare/main...${{ github.sha }}" --jq .status)
+                  case "$status" in identical|behind) ;; *) echo "::error::commit ${{ github.sha }} is not in main ($status): not released"; exit 1 ;; esac
             - name: Move the latest tag
               if: github.event_name == 'push' && github.ref == 'refs/heads/main'
               env:
