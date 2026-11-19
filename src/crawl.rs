@@ -60,6 +60,9 @@ pub fn sources() -> Vec<(&'static str, Source)> {
 /// A list of pages goes on past empty pages at its very start, up to this many of them (the first pages of DLsite have no work that is out yet).
 const EMPTY_PAGES_AT_START: usize = 20;
 
+/// The most pages of a list of pages in a row that may have no new work before a first walk takes the list for read to its end.
+const IDLE_PAGES_AT_END: usize = 100;
+
 /// The waits, in seconds, before a page that failed is asked again (then the walk gives up until `retry_minutes` have passed).
 const STEP_RETRY_SECS: [u64; 4] = [5, 20, 60, 120];
 
@@ -237,6 +240,7 @@ impl Crawler {
     async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool) -> std::result::Result<Walk, String> {
         let name = self.engine.site(index).def.name;
         let mut walk = Walk::default();
+        let mut idle = 0;
         // the first pages of DLsite are sparse (a few works among the ones not out yet), so a page of this machine may be empty after a work
         let leading_empty = if name == "DLsite" && cursor.is_empty() { EMPTY_PAGES_AT_START } else { 0 };
 
@@ -248,12 +252,17 @@ impl Crawler {
                 next = Some((page_number(&cursor, shard) + shard.1).to_string());
             }
             let works = self.engine.works_of(step.links).await?;
+            // a list that repeats its last page (Wnacg) never has an empty one: this many pages in a row without a new work end a first walk
+            if first && idle >= IDLE_PAGES_AT_END && matches!(source, Source::Pages(_)) {
+                next = None;
+            }
             let finished = next.is_none();
             let position = if first { Some((next.as_deref().unwrap_or(""), finished)) } else { None };
             let new = self.engine.store().save_crawled(name, unix_now(), &works, position).await.map_err(|e| e.to_string())?;
 
             walk.pages += 1;
             walk.new += new;
+            idle = if new == 0 { idle + 1 } else { 0 };
             log::debug!("crawl {name}: {listed} works on the page after {cursor:?}, {new} new");
             if first && walk.pages % 50 == 0 {
                 log::info!("crawl {name}: {} pages read, {} new works, at {:?}", walk.pages, walk.new, next.as_deref().unwrap_or("the end"));
