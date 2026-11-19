@@ -2,7 +2,7 @@
 //!
 //! Only the sites whose pages say that a work is gone can be asked (`Engine::probe`: RokuHentai answers 503 with "temporarily
 //! unavailable ... Here are some results that might be useful to you"). The site still lists such a work, so the work is not only removed:
-//! `work_checks` remembers it, and a list, the crawl or an import does not save it again.
+//! `works.deleted` marks it (the row stays, with no title), and a list, the crawl or an import does not save it again.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work, work_check};
+use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work};
 use crate::language;
 use crate::query::title_key;
 use crate::sites::toggle_slash;
@@ -104,8 +104,6 @@ impl SearchStore {
         let mut translations = schema.create_table_from_entity(translation::Entity);
         db.execute(backend.build(works.if_not_exists())).await?;
         let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
-        let mut checks = schema.create_table_from_entity(work_check::Entity);
-        db.execute(backend.build(checks.if_not_exists())).await?;
         db.execute(backend.build(searches.if_not_exists())).await?;
         db.execute(backend.build(crawls.if_not_exists())).await?;
         db.execute(backend.build(listings.if_not_exists())).await?;
@@ -121,6 +119,7 @@ impl SearchStore {
         db.execute(backend.build(&by_update)).await?;
 
         Self::add_language(db).await?;
+        Self::add_deleted(db).await?;
 
         Self::create_word_index(db).await
     }
@@ -144,6 +143,43 @@ impl SearchStore {
             log::info!("translations: an old table, made again");
             db.execute_unprepared("DROP TABLE translations").await?;
             db.execute_unprepared("DROP TABLE IF EXISTS translation_lookups").await?;
+        }
+
+        Ok(())
+    }
+
+    /// A database from before `works.deleted` and `works.checked_at`: the columns are added (quick: no row is written). The table `work_checks`,
+    /// where an earlier version noted them, is read into the columns and dropped.
+    async fn add_deleted(db: &DatabaseConnection) -> Result<()> {
+        let has = db
+            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS n FROM pragma_table_info('works') WHERE name = 'deleted'"))
+            .await?
+            .ok_or("no count")?
+            .try_get::<i64>("", "n")?;
+
+        if has == 0 {
+            log::info!("works.deleted, works.checked_at: adding the columns");
+            db.execute_unprepared("ALTER TABLE works ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0").await?;
+            db.execute_unprepared("ALTER TABLE works ADD COLUMN checked_at INTEGER").await?;
+        }
+
+        let old = db
+            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'work_checks'"))
+            .await?
+            .ok_or("no count")?
+            .try_get::<i64>("", "n")?;
+
+        if old > 0 {
+            log::info!("work_checks: read into works.deleted and works.checked_at");
+            for sql in [
+                "INSERT OR IGNORE INTO works (website, path, title, title_romaji, title_key, first_seen, updated_at, language, deleted, checked_at) \
+                 SELECT website, path, '', '', '', checked_at, checked_at, NULL, 1, checked_at FROM work_checks WHERE gone = 1",
+                "UPDATE works SET checked_at = (SELECT c.checked_at FROM work_checks c WHERE c.website = works.website AND c.path = works.path) \
+                 WHERE EXISTS (SELECT 1 FROM work_checks c WHERE c.website = works.website AND c.path = works.path AND c.gone = 0)",
+                "DROP TABLE work_checks",
+            ] {
+                db.execute_unprepared(sql).await?;
+            }
         }
 
         Ok(())
@@ -437,10 +473,6 @@ impl SearchStore {
 
     /// Adds the works that are not saved, updates the ones whose title changed. Returns the paths of the new ones.
     async fn save_works(db: &impl ConnectionTrait, website: &str, now: i64, listed: &[NewWork]) -> Result<Vec<String>> {
-        // a work whose page is gone is not saved again
-        let gone = Self::gone_paths(db, Some(website)).await?;
-        let listed: Vec<&NewWork> = listed.iter().filter(|w| !gone.contains(&(website.to_string(), w.path.clone()))).collect();
-        let listed = &listed[..];
         let paths: Vec<&str> = listed.iter().map(|w| w.path.as_str()).collect();
         let saved: HashMap<String, work::Model> = work::Entity::find()
             .filter(work::Column::Website.eq(website))
@@ -453,7 +485,7 @@ impl SearchStore {
 
         let mut added = Vec::new();
 
-        for &item in listed {
+        for item in listed {
             match saved.get(&item.path) {
                 None => added.push(work::ActiveModel {
                     website: Set(website.to_string()),
@@ -464,7 +496,11 @@ impl SearchStore {
                     first_seen: Set(now),
                     updated_at: Set(now),
                     language: Set(language::detect(&item.title)),
+                    deleted: Set(false),
+                    checked_at: Set(None),
                 }),
+                // a work whose page is gone is not saved again
+                Some(known) if known.deleted => {}
                 Some(known) if known.title != item.title || known.title_romaji != item.romaji => {
                     let mut changed = known.clone().into_active_model();
                     changed.title = Set(item.title.clone());
@@ -488,25 +524,14 @@ impl SearchStore {
         Ok(new)
     }
 
-    /// The works whose page is gone: (website, path), of one site or of all of them.
-    async fn gone_paths(db: &impl ConnectionTrait, website: Option<&str>) -> Result<HashSet<(String, String)>> {
-        let mut query = work_check::Entity::find().filter(work_check::Column::Gone.eq(true));
-        if let Some(website) = website {
-            query = query.filter(work_check::Column::Website.eq(website));
-        }
-
-        Ok(query.all(db).await?.into_iter().map(|row| (row.website, row.path)).collect())
-    }
-
     /// The paths of the works of `website` whose page was not looked at since `before` (never looked at first, then the oldest look), at most `limit`.
     pub async fn due_checks(&self, website: &str, before: i64, limit: u64) -> Result<Vec<String>> {
         let rows = self
             .db
             .query_all(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
-                "SELECT w.path AS path FROM works w LEFT JOIN work_checks c ON c.website = w.website AND c.path = w.path \
-                 WHERE w.website = ? AND (c.checked_at IS NULL OR c.checked_at < ?) \
-                 ORDER BY c.checked_at IS NOT NULL, c.checked_at, w.path LIMIT ?",
+                "SELECT path FROM works WHERE website = ? AND deleted = 0 AND (checked_at IS NULL OR checked_at < ?) \
+                 ORDER BY checked_at IS NOT NULL, checked_at, path LIMIT ?",
                 [website.into(), before.into(), (limit as i64).into()],
             ))
             .await?;
@@ -514,25 +539,29 @@ impl SearchStore {
         rows.iter().map(|row| Ok(row.try_get::<String>("", "path")?)).collect()
     }
 
-    /// Notes that the pages were looked at (`true`: the page is gone). A work whose page is gone is removed from `works` and from the
-    /// lists, and `save_works` and `import_works` leave it out from then on.
+    /// Notes that the pages were looked at (`true`: the page is gone). A work whose page is gone keeps its row as a mark with no title (so no
+    /// search finds it, and a list, the crawl and an import do not save it again), and the lists forget it.
     pub async fn record_checks(&self, website: &str, results: &[(String, bool)], now: i64) -> Result<()> {
         let transaction = self.db.begin().await?;
 
         for (path, gone) in results {
-            let row = work_check::ActiveModel { website: Set(website.to_string()), path: Set(path.clone()), checked_at: Set(now), gone: Set(*gone) };
-            work_check::Entity::insert(row)
-                .on_conflict(
-                    OnConflict::columns([work_check::Column::Website, work_check::Column::Path])
-                        .update_columns([work_check::Column::CheckedAt, work_check::Column::Gone])
-                        .to_owned(),
-                )
-                .exec_without_returning(&transaction)
-                .await?;
+            let update = work::Entity::update_many()
+                .col_expr(work::Column::CheckedAt, Expr::value(now))
+                .filter(work::Column::Website.eq(website))
+                .filter(work::Column::Path.eq(path.as_str()));
 
             if *gone {
-                work::Entity::delete_many().filter(work::Column::Website.eq(website)).filter(work::Column::Path.eq(path.as_str())).exec(&transaction).await?;
+                update
+                    .col_expr(work::Column::Deleted, Expr::value(true))
+                    .col_expr(work::Column::Title, Expr::value(""))
+                    .col_expr(work::Column::TitleRomaji, Expr::value(""))
+                    .col_expr(work::Column::TitleKey, Expr::value(""))
+                    .col_expr(work::Column::Language, Expr::value(Option::<String>::None))
+                    .exec(&transaction)
+                    .await?;
                 listing::Entity::delete_many().filter(listing::Column::Website.eq(website)).filter(listing::Column::Path.eq(path.as_str())).exec(&transaction).await?;
+            } else {
+                update.exec(&transaction).await?;
             }
         }
 
@@ -585,14 +614,7 @@ impl SearchStore {
             return Ok(0);
         }
 
-        let gone = Self::gone_paths(&self.db, None).await?;
-        let rows: Vec<work::ActiveModel> =
-            works.into_iter().filter(|w| !gone.contains(&(w.website.clone(), w.path.clone()))).map(IntoActiveModel::into_active_model).collect();
-
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
+        let rows: Vec<work::ActiveModel> = works.into_iter().map(IntoActiveModel::into_active_model).collect();
         let transaction = self.db.begin().await?;
         let new = work::Entity::insert_many(rows)
             .on_conflict(OnConflict::columns([work::Column::Website, work::Column::Path]).do_nothing().to_owned())
@@ -747,7 +769,7 @@ impl SearchStore {
     /// The next `limit` works after `after` (a website and a path), in the order of their keys. Reads the table page
     /// by page, so a recount of every title does not need every row in memory.
     pub async fn works_after(&self, after: Option<&(String, String)>, limit: u64) -> Result<Vec<Work>> {
-        let mut query = work::Entity::find();
+        let mut query = work::Entity::find().filter(work::Column::Deleted.eq(false));
 
         if let Some((website, path)) = after {
             query = query.filter(Expr::cust_with_values("(website, path) > (?, ?)", [website.as_str(), path.as_str()]));
@@ -896,7 +918,7 @@ mod tests {
         // the columns of the table are all there is
         assert_eq!(
             store.columns_of("works").await.unwrap(),
-            ["website", "path", "title", "title_romaji", "title_key", "first_seen", "updated_at", "language"]
+            ["website", "path", "title", "title_romaji", "title_key", "first_seen", "updated_at", "language", "deleted", "checked_at"]
         );
 
         let works = store.candidates(&[]).await.unwrap();
@@ -984,14 +1006,15 @@ mod tests {
         assert_eq!(store.due_checks("Site", 0, 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
 
         store.record_checks("Site", &[("/a".into(), true), ("/b".into(), false)], 200).await.unwrap();
-        assert_eq!(paths(store.candidates(&["title"]).await.unwrap()).await, ["/b"], "the work that is gone is removed");
+        assert_eq!(paths(store.candidates(&["title"]).await.unwrap()).await, ["/b"], "the work that is gone is not found: its title is blank");
         assert!(store.due_checks("Site", 150, 10).await.unwrap().is_empty(), "looked at since 150");
         assert_eq!(store.due_checks("Site", 300, 10).await.unwrap(), ["/b"], "a look that is old is made again; /a is not a work any more");
+        assert!(store.works_after(None, 10).await.unwrap().iter().all(|w| w.path != "/a"), "an export or a rewrite does not see it either");
 
         // the list, the crawl and an import all bring /a again: it is left out
         store.save("q2", "Site", 300, &Ok(vec![work("/a"), work("/c")]), false).await.unwrap();
         store.save_crawled("Site", 300, &[work("/a"), work("/d")], None).await.unwrap();
-        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), title_key: "titlea".into(), first_seen: 1, updated_at: 1, language: None };
+        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), title_key: "titlea".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None };
         assert_eq!(store.import_works(vec![gone]).await.unwrap(), 0);
         let mut found = paths(store.candidates(&["title"]).await.unwrap()).await;
         found.sort();
@@ -1117,6 +1140,8 @@ mod tests {
             language: Set(None),
             first_seen: Set(1),
             updated_at: Set(1),
+            deleted: Set(false),
+            checked_at: Set(None),
         }
         .insert(&store.db)
         .await
@@ -1281,7 +1306,7 @@ mod tests {
         }
         store
             .db
-            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1, NULL), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2, NULL)")
+            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1, NULL, 0, NULL), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2, NULL, 0, NULL)")
             .await
             .unwrap();
         drop(store);

@@ -150,7 +150,7 @@ refresh_pages = 1000
 retry_minutes = 10
 
 # Looking at the page of every saved work of a site once in `interval_days`, and removing the works whose page is gone. The site still lists
-# such a work, so it is remembered (`work_checks`) and a list, the crawl or an import does not save it again. Only RokuHentai tells (its
+# such a work, so it is marked (`works.deleted`, with no title) and a list, the crawl or an import does not save it again. Only RokuHentai tells (its
 # page of a work that is gone answers 503: "temporarily unavailable ... Here are some results that might be useful to you").
 [verify]
 enabled = false

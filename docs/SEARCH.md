@@ -301,8 +301,8 @@ sites are walked at the same time, each one page after page, newest first.
 RokuHentai still lists a work after its page is gone (the page answers 503 with "temporarily unavailable ... Here are some results that might be
 useful to you", or 404). With `[verify] enabled = true` the server looks at the page of every saved work of such a site once in `interval_days`
 (30), one page every `pause_ms` (5 s) after the delay of the site, the works that were never looked at first. A work whose page is gone is
-removed from `works` and remembered in `work_checks` (`gone`): a list, the crawl and an import do not save it again, since the site still
-lists it. A page that cannot be read (a failure, another 503, 429) is looked at again by the next round.
+marked in `works` (`deleted = 1`; its title, romaji and key are blanked, so no search finds it and it is not exported): a list, the crawl and an
+import do not save it again, since the site still lists it. `works.checked_at` is when its page was looked at. A page that cannot be read (a failure, another 503, 429) is looked at again by the next round.
 
 ## Not done
 

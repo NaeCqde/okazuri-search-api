@@ -132,6 +132,8 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                     first_seen: line.first_seen,
                     updated_at: line.updated_at,
                     language,
+                    deleted: false,
+                    checked_at: None,
                 }
             })
             .collect::<Vec<_>>()
