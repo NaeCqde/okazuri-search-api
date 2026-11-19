@@ -78,6 +78,9 @@ pub struct SearchConfig {
     pub max_results: usize,
     /// Names of the sites (`GET /okazuri/sites`) that are left out.
     pub disabled_sites: Vec<String>,
+    /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
+    /// still asks it. The sites that have no list, or whose list is not read yet, are asked as before.
+    pub skip_crawled: bool,
     /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
     pub try_unsupported: bool,
     /// The address of `tools/google-translate-bridge` (a Chrome that makes the token of Google Translate), such as
@@ -103,6 +106,7 @@ impl Default for SearchConfig {
             max_results_per_site: 50,
             max_results: 100,
             disabled_sites: Vec::new(),
+            skip_crawled: false,
             try_unsupported: false,
             google_bridge_url: String::new(),
             google_bridge_token: String::new(),

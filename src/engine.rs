@@ -564,10 +564,12 @@ impl Engine {
         let now = unix_now();
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut due = Vec::new();
+        // the sites whose list is read to its end are in the database already
+        let crawled = if self.config.skip_crawled && !refresh { self.store.crawl_done().await? } else { Vec::new() };
 
         for &index in &self.active {
             // a site that the request leaves out is neither asked nor looked up
-            if exclude.contains(&index) {
+            if exclude.contains(&index) || crawled.iter().any(|name| name == self.sites[index].def.name) {
                 continue;
             }
 
@@ -1808,6 +1810,25 @@ pub(crate) mod tests {
         );
         assert!(trying.sites_info().iter().find(|s| s.name == "IMHentai").unwrap().active);
         assert!(!trying.sites_info().iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
+    }
+
+    #[tokio::test]
+    async fn a_crawled_site_is_not_asked_live_when_the_setting_is_on_unless_live_is_force() {
+        let (engine, hits, _) = setup(&SearchConfig { skip_crawled: true, ..config() }).await;
+        engine.store().mark_crawled("Good", unix_now()).await.unwrap();
+
+        engine.search(&Request::new("q")).await.unwrap();
+        assert_eq!(requests(&hits).0, 0, "the list of the site is in the database: it is not asked");
+        assert_eq!(requests(&hits).1, 1, "a site whose list is not read is asked as before");
+
+        engine.search(&Request { live: Live::Force, ..Request::new("q") }).await.unwrap();
+        assert_eq!(requests(&hits).0, 1, "live=force asks it");
+
+        // the setting is off: the crawled site is asked like any other
+        let (plain, hits_plain, _) = setup(&config()).await;
+        plain.store().mark_crawled("Good", unix_now()).await.unwrap();
+        plain.search(&Request::new("q")).await.unwrap();
+        assert_eq!(requests(&hits_plain).0, 1);
     }
 
     #[tokio::test]

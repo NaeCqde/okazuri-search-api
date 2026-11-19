@@ -60,6 +60,9 @@ max_results_per_site = 50
 max_results = 100
 # Sites to leave out (the names of GET /okazuri/sites).
 disabled_sites = []
+# A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The
+# other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`).
+skip_crawled = false
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
 try_unsupported = false
 # Google Translate gives the Advanced (Gemini) answer only to a request that has a token of its bot check, which only a browser

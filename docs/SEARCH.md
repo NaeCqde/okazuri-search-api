@@ -290,6 +290,8 @@ sites are walked at the same time, each one page after page, newest first.
 - **Where it is:** table `crawls` (a row per site: the cursor of the walk, `done`, how many works it saved). A restart goes on from the cursor.
 - **After the first walk:** at the `schedule` the newest pages are read again, up to a page with nothing new in it (`refresh_pages` at the most).
 - **The prefetch** leaves out the sites whose first walk is done, and goes on asking the sites that have no list (Sukebei, JComic, ...).
+- **Answering from the lists:** `[search] skip_crawled = true` stops a request from asking the sites whose list is read (`crawls.done`); the database answers for them
+  (`live=force` still asks). The other sites are asked as before. Turn it on when the database has the whole lists (after `import --mark-done` for a sharded crawl).
 - **The delay** of a site is kept by every request of the program together (`[search] min_delay_ms`, or `[search.site_delay_ms]` for one site).
 - **More than one machine:** `shard = "k/N"` on each, then `export` on each (`okazuri-search-api export out.jsonl.br`; JSON Lines, brotli) and
   `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` on the server. A work that is saved already stays as it is.
