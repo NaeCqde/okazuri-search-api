@@ -158,3 +158,5 @@ enabled = false
 # Empty: every site of that list.
 sites = []
 interval_days = 30
+# A site is never asked two pages closer than this, so a site with more works than interval_days allows is looked at over more days.
+min_pause_ms = 5000

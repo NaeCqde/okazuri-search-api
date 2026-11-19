@@ -222,11 +222,13 @@ pub struct VerifyConfig {
     /// Every page is looked at once in this many days: a site is asked one page every `days / works` (the works of a site that are saved
     /// now), never closer than the delay of the site.
     pub interval_days: u64,
+    /// A site is never asked two pages closer than this (a site with more works than `interval_days` allow is looked at over more days).
+    pub min_pause_ms: u64,
 }
 
 impl Default for VerifyConfig {
     fn default() -> Self {
-        Self { enabled: false, sites: Vec::new(), interval_days: 30 }
+        Self { enabled: false, sites: Vec::new(), interval_days: 30, min_pause_ms: 5000 }
     }
 }
 

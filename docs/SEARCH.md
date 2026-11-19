@@ -301,7 +301,7 @@ sites are walked at the same time, each one page after page, newest first.
 Some sites keep listing a work after its page is gone. With `[verify] enabled = true` the server looks at the page of every saved work of the
 sites that tell (RokuHentai, DLsite, HentaiEnvy, Nya:Hentai, momon:GA, Sukebei: 404, RokuHentai also a 503 with "temporarily unavailable ...
 Here are some results that might be useful to you"; AsmHentai and HentaiEra: a redirect to `/404/`; Wnacg: the sentence "您要訪問的漫畫不存在")
-once in `interval_days` (30). Each site is asked on its own, one page every `interval_days / works` (never closer than the delay of the
+once in `interval_days` (30). Each site is asked on its own, one page every `interval_days / works` (never closer than `min_pause_ms`, 5 s, so a site with more than 518 400 works takes longer than `interval_days`, and than the delay of the
 site); the works that were never looked at first, then the oldest look. A work whose page is gone is marked in `works` (`deleted = 1`; its
 title, romaji and key are blanked, so no search finds it and it is not exported): a list, the crawl and an import do not save it again, since the
 site still lists it. `works.checked_at` is when its page was looked at. A page that cannot be read (a failure, another 503, 429) is looked

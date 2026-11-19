@@ -1,8 +1,8 @@
 //! Looking at the page of every saved work of the sites that tell when a work is gone, once in `interval_days`, and marking the works whose
 //! page is gone (`[verify]`).
 //!
-//! Each site is asked on its own, one page every `interval / works` (900 000 works in 30 days are a page every 2.9 s), never closer than the
-//! delay of the site. The works that were never looked at come first, then the oldest look. A site still lists a work whose page is gone, so the
+//! Each site is asked on its own, one page every `interval / works` (900 000 works in 30 days are a page every 2.9 s), never closer than `min_pause_ms` (5 s: a site with more
+//! than 518 400 works is looked at over more than `interval_days`) and the delay of the site. The works that were never looked at come first, then the oldest look. A site still lists a work whose page is gone, so the
 //! row stays with no title (`works.deleted`): a list, the crawl or an import does not save the work again, and no search finds it.
 
 use std::sync::Arc;
@@ -82,7 +82,7 @@ impl Verifier {
     async fn batch(&self, index: usize, name: &'static str, rule: GoneRule, works: u64) -> Result<usize> {
         let before = now() - self.config.interval_days.max(1) as i64 * 86_400;
         let due = self.engine.store().due_checks(name, before, BATCH).await?;
-        let spacing = Duration::from_millis(self.config.interval_days.max(1) * 86_400_000 / works);
+        let spacing = Duration::from_millis((self.config.interval_days.max(1) * 86_400_000 / works).max(self.config.min_pause_ms));
         let mut results = Vec::new();
 
         for path in due {
