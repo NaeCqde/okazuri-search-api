@@ -1,6 +1,6 @@
 # HTTP API
 
-`200` の応答には、キャッシュを持てる期間が `Cache-Control: public, max-age=60, s-maxage=N` で示されます(検索は 300 秒、
+`200` の応答には、キャッシュを持てる期間が `Cache-Control: public, max-age=60, s-maxage=N` で示されます(検索とカタログの検索は 300 秒、
 `/okazuri/sites` は 1 時間、翻訳と `/romaji` は 1 日)。`live=force` の検索、エラー、`/health` は `no-store` です。
 すべてのパスは `/api/v1` の下にも置かれています(`/api/v1/okazuri/search`)。デモサーバーは `https://okazuri.nae.quest/api/v1/...`
 でも使え(`/api/v1` の後ろは同じパスです)、そこでは Cloudflare が応答をキャッシュします。
@@ -77,6 +77,57 @@ GET /okazuri/search?q=快楽天 2026 7
 `support` は `ready`、`cloudflare`(ブラウザが要るチャレンジ)、`javascript`、`closed` のどれかです。`japanese` は、そのサイトが
 日本語のタイトルで作品を見つけられるかどうかで、`true` なら、日本語を含むクエリを、書かれたとおりの形とローマ字の両方で尋ねます。
 `active` は、現在の `[search]` の設定(`disabled_sites`、`try_unsupported`)で、このサーバーがそのサイトを検索するかどうかです。
+
+## カタログの検索(`[d1]`)
+
+D1 データベースの写し(`[d1] mirror_path`)から答えます。サイトには尋ねません。写しがない(`[d1]` がオフで、ファイルもない)ときは、
+これらのパスは `404` です。写しはあるが `works` と `authors` がまだ入っていないときは `503` で、`okazuri-search-api sync` を実行するか、
+次の自動同期を待ってください(`[d1] tables` に `authors` と `works` を含めておく必要があります)。作品と号の URL は DLsite のページです。
+
+### `GET /okazuri/magazine`: 作品名から雑誌を探す
+
+作品名(完全一致)が載っている号を、新しい号から返します。BOT の `/magazine` と同じです。同名の作品は複数返ります。
+
+| クエリ | |
+|---|---|
+| `q` | 作品名。必須で、1 文字から `[convert] max_query_chars` 文字まで。 |
+| `limit` | 最大件数。1 から 50 まで(既定 10)。 |
+
+```
+GET /okazuri/magazine?q=作品名
+{ "input": "作品名", "total": 1, "results": [ {
+    "id": "BJ9", "title": "作品名", "url": "https://www.dlsite.com/books/work/=/product_id/BJ9.html",
+    "author": "作者", "position": 4,
+    "magazine": { "id": "LBL1", "name": "COMIC快楽天" },
+    "issue": { "id": "BJ2", "name": "COMIC快楽天 2026年07月号", "url": "https://www.dlsite.com/books/work/=/product_id/BJ2.html", "date": 1793181281 } } ] }
+```
+
+`position` は号の中での位置(1、2、3、…)で、`date` は号の発売日(エポック秒)です。作品がなければ `404`、`q` がない、長すぎる、`limit` が範囲外なら `422` です。
+
+### `GET /okazuri/works`: 号の作品一覧
+
+号の名前(`COMIC快楽天 2026年07月号`。号の id でも可)を完全一致で探し、掲載作品を号の中の順に返します。BOT の `/works` と同じです。
+
+```
+GET /okazuri/works?q=COMIC快楽天 2026年07月号
+{ "input": "COMIC快楽天 2026年07月号",
+  "issue": { "id": "BJ2", "name": "COMIC快楽天 2026年07月号", "url": "...", "date": 1793181281 },
+  "magazine": { "id": "LBL1", "name": "COMIC快楽天" },
+  "total": 1,
+  "results": [ { "id": "BJ9", "title": "作品名", "url": "...", "author": "作者", "position": 4 } ] }
+```
+
+号がなければ `404`、`q` がない、または長すぎるときは `422` です。
+
+### `GET /okazuri/magazines`: 雑誌の一覧
+
+写しにあるすべての雑誌を名前順に返します。各雑誌には、号の数 `issues` と、いちばん新しい号 `latest`(号がなければ `null`)が付きます。
+
+```
+GET /okazuri/magazines
+{ "total": 1, "results": [ { "id": "LBL1", "name": "COMIC快楽天", "issues": 120,
+    "latest": { "id": "BJ2", "name": "COMIC快楽天 2026年07月号", "url": "...", "date": 1793181281 } } ] }
+```
 
 ## `GET /romaji`
 
