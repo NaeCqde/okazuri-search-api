@@ -62,6 +62,7 @@
 | `live=diff`(既定) | 答えがない、または `ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかはデータベースが答えます(`cached`)。 |
 | `live=force` | キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます) |
 | `limit=n` | 応答に入れる作品の最大数(最大 `[search] max_results`)。 |
+| `offset=n` | 応答の先頭から飛ばす作品の数(0 から 10000)。`limit` と合わせて、長い答えを何回かに分けて読めます。 |
 | `exclude=A,B` | 除外するサイト(`GET /okazuri/sites` に出る名前。大文字小文字は区別せず、カンマで区切ります)。そのサイトには尋ねず、保存済みの作品も応答に入れず、`sites` にも出ません。サイトにない名前は 422 です。翻訳には影響しません(出どころは `translator` が決めます)。 |
 | `translator=auto`(既定) | 日本語を含むクエリは、英語でも検索します。英語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、Hitomi.La が失敗するか何も返さないときは Google 翻訳(`/google/translate`)から取ります。両方の検索の作品が `results` に入り、`translation` がそのタイトルを示します(`{"text", "source"}`)。 |
 | `translator=hitomi` | Hitomi.La だけを使います。失敗するか何も返さないときは英語の検索をしません(`translation` は `null`)。 |

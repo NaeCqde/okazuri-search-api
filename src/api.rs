@@ -108,6 +108,8 @@ struct SearchQuery {
     q: Option<String>,
     live: Option<String>,
     limit: Option<usize>,
+    /// How many works at the head of the answer are skipped, to read a long answer page by page with `limit`.
+    offset: Option<usize>,
     /// The English title of a query in Japanese is searched too: `auto` (default), `hitomi`, `google` or `none`.
     translator: Option<String>,
     /// The sites that are left out, by name, separated by commas: they are not asked, and their saved works are not in the answer.
@@ -145,11 +147,22 @@ async fn run_search(engine: &Arc<Engine>, params: SearchQuery, exclude: &[usize]
     };
 
     let limit = params.limit.unwrap_or(engine.max_results()).clamp(1, engine.max_results().max(1));
-    // the engine turns the query into romaji first (nothing is added to it), and searches for that
-    let request = Request { query: &text, live, limit, translator, exclude };
+    let offset = params.offset.unwrap_or(0);
+
+    if offset > MAX_SEARCH_OFFSET {
+        return invalid(&format!("offset is 0 to {MAX_SEARCH_OFFSET}"));
+    }
+
+    // the engine turns the query into romaji first (nothing is added to it), and searches for that; a page is the end of the
+    // answer up to offset + limit, without its first offset works
+    let request = Request { query: &text, live, limit: offset + limit, translator, exclude };
 
     match engine.search(&request).await {
-        Ok(outcome) => json(StatusCode::OK, &outcome),
+        Ok(mut outcome) => {
+            outcome.results.drain(..offset.min(outcome.results.len()));
+
+            json(StatusCode::OK, &outcome)
+        }
         Err(e) => {
             log::error!("cannot search {:?}: {}", text, e);
             server_error()
@@ -337,6 +350,9 @@ async fn title(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> R
 }
 
 /// The longest `q` of the lookups in the copy of the catalogue (`/okazuri/magazine`, `/okazuri/works`), in characters.
+/// The most `offset` of a search can skip.
+const MAX_SEARCH_OFFSET: usize = 10_000;
+
 const MAX_LOOKUP_CHARS: usize = 300;
 
 /// The most addresses one request to `/okazuri/title` may carry.
@@ -810,9 +826,19 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // limit=1 cuts the answer, and the total says how many there are
-        let (_, _, body) = get_from(state, &format!("/okazuri/search?q={q}&limit=1")).await;
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1")).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!((json["results"].as_array().unwrap().len(), json["total"].as_u64().unwrap()), (1, 2));
+
+        // offset skips the head of the answer: the second page is the other work, and a page past the end is empty
+        let (_, _, first) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1")).await;
+        let (_, _, second) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1&offset=1")).await;
+        let (_, _, past) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1&offset=2")).await;
+        let (first, second, past): (serde_json::Value, serde_json::Value, serde_json::Value) =
+            (serde_json::from_str(&first).unwrap(), serde_json::from_str(&second).unwrap(), serde_json::from_str(&past).unwrap());
+        assert_ne!(first["results"][0]["url"], second["results"][0]["url"]);
+        assert_eq!((second["total"].as_u64(), past["results"].as_array().unwrap().len()), (Some(2), 0));
+        assert_eq!(get_from(state, &format!("/okazuri/search?q={q}&offset=10001")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
