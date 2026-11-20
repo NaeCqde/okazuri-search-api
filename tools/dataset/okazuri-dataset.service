@@ -1,0 +1,10 @@
+[Unit]
+Description=Write the public dataset and upload it to R2
+After=network-online.target
+
+[Service]
+Type=oneshot
+# DATASET_REMOTE=r2:okazuri-dataset and the paths of the executable and the config
+EnvironmentFile=/etc/okazuri-dataset.env
+ExecStart=/usr/local/bin/okazuri-dataset-publish
+Nice=10

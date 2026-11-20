@@ -4,6 +4,7 @@ mod config;
 mod crawl;
 mod cron;
 mod d1;
+mod dataset;
 mod engine;
 mod hitomi;
 mod language;
