@@ -185,6 +185,11 @@ pub struct CrawlConfig {
     /// `k/N`: this machine reads the pages whose number leaves k when divided by N, so N machines (each with its own IP address) read
     /// every site together without any one of them being the only one a site sees. `0/1` is the whole list.
     pub shard: String,
+    /// `lo-hi`: the galleries of E-Hentai that this machine reads, by id (either side may be empty). The list is read with the id of
+    /// the last gallery of the page before (`?next=`), which can be any id, so the ids are cut into ranges, one for each machine: a
+    /// machine reads from `hi` down to `lo` and stops (the one with no `hi` also reads the newest pages again, as every walk does).
+    /// Empty is the whole list.
+    pub gallery_ids: String,
     /// The index file of Hitomi.La that lists the galleries: `index-all.nozomi`, or `index-japanese.nozomi` for the Japanese ones only.
     pub hitomi_index: String,
     /// How many galleries of Hitomi.La are read before the walk is saved.
@@ -204,6 +209,7 @@ impl Default for CrawlConfig {
             utc_offset: "UTC".to_string(),
             sites: Vec::new(),
             shard: "0/1".to_string(),
+            gallery_ids: String::new(),
             hitomi_index: "index-all.nozomi".to_string(),
             hitomi_batch: 100,
             refresh_pages: 1000,

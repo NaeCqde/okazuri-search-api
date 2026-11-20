@@ -142,6 +142,10 @@ sites = []
 # k/N: this machine reads the pages whose number leaves k when divided by N. Run N machines with 0/N ... N-1/N, then `export` on each and
 # `import` the files on the server. Lists that go one page to the next (RokuHentai, E-Hentai) are read by 0/N only.
 shard = "0/1"
+# lo-hi: the ids of E-Hentai this machine reads (E-Hentai is a list that goes one page to the next, so it is not cut by `shard`, but its
+# `?next=<id>` can start at any id): three machines are e.g. "3060000-" (the newest, and the newest pages again afterwards),
+# "1860000-3059999" and "-1859999". A machine with a `hi` stops at its `lo`. Empty: the whole list.
+gallery_ids = ""
 # index-all.nozomi (every language) or index-japanese.nozomi.
 hitomi_index = "index-all.nozomi"
 hitomi_batch = 100
