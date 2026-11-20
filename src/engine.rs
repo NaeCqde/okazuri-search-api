@@ -225,6 +225,10 @@ pub struct Outcome {
     /// The English title of the query that was searched too (the works of both are in `results`). None when the query has no
     /// Japanese in it, the translator has no title, or the request has no translator.
     pub translation: Option<Translated>,
+    /// The Japanese title of a query without Japanese (English, or romaji) that was searched too (the works of both are in `results`):
+    /// the same as `translation`, the other way. None when the query has Japanese in it or no letter, the translator has no title, or
+    /// the request has no translator.
+    pub translation_ja: Option<Translated>,
 }
 
 /// Where the English title of a query in Japanese comes from (`translator` of a search): the sites are asked for it too.
@@ -662,7 +666,36 @@ impl Engine {
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let mut outcome = self.search_one(request).await?;
 
-        if request.translator == Translator::None || !crate::query::has_japanese(request.query) {
+        if request.translator == Translator::None {
+            return Ok(outcome);
+        }
+
+        // a query without Japanese: its Japanese title is searched too (the same as the English title of a query in Japanese)
+        if !crate::query::has_japanese(request.query) {
+            if !request.query.chars().any(|c| c.is_ascii_alphabetic()) {
+                return Ok(outcome);
+            }
+
+            let Some(found) = self.japanese_of(request.query, request.translator, request.live).await else { return Ok(outcome) };
+            let text = found.japanese.trim().to_string();
+
+            if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
+                return Ok(outcome);
+            }
+
+            match self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await {
+                Ok(more) => {
+                    let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
+                    let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
+
+                    outcome.total += added.len();
+                    outcome.results.extend(added);
+                    outcome.results.truncate(request.limit.max(1));
+                    outcome.translation_ja = Some(Translated { text, source: found.source });
+                }
+                Err(e) => log::warn!("cannot search the Japanese title {text:?} of {:?}: {e}", request.query),
+            }
+
             return Ok(outcome);
         }
 
@@ -747,6 +780,7 @@ impl Engine {
             results: hits,
             query: plan.query,
             translation: None,
+            translation_ja: None,
         })
     }
 
@@ -1043,6 +1077,29 @@ impl Engine {
             match self.translate_google(text, Lang::Japanese, live).await {
                 Ok((found, _)) => return Some(found),
                 Err(e) => log::warn!("no English title of {text:?} from Google Translate: {e}"),
+            }
+        }
+
+        None
+    }
+
+    /// The Japanese title of an English (or romaji) text by the translator of a search: `english_of` the other way.
+    async fn japanese_of(self: &Arc<Self>, text: &str, translator: Translator, live: Live) -> Option<Translation> {
+        if translator != Translator::Google {
+            match self.translate_hitomi(text, Lang::English, live).await {
+                Ok((found, _)) => {
+                    if let Some(first) = found.into_iter().next() {
+                        return Some(first);
+                    }
+                }
+                Err(e) => log::warn!("no Japanese title of {text:?} from Hitomi.La: {e}"),
+            }
+        }
+
+        if translator != Translator::Hitomi {
+            match self.translate_google(text, Lang::English, live).await {
+                Ok((found, _)) => return Some(found),
+                Err(e) => log::warn!("no Japanese title of {text:?} from Google Translate: {e}"),
             }
         }
 
@@ -1645,6 +1702,37 @@ pub(crate) mod tests {
         store.save_translations("八", "hitomi", "八", "ja", unix_now(), &[]).await.unwrap();
         assert!(engine.translate_hitomi("八", Lang::Japanese, Live::Diff).await.is_err());
         assert_eq!(engine.translate_hitomi("八", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
+    }
+
+    #[tokio::test]
+    async fn a_query_without_japanese_is_searched_in_japanese_too() {
+        let (engine, _, store) = setup(&config()).await;
+        let row = crate::entity::translation::Model {
+            key: String::new(),
+            gallery_id: 9,
+            position: 0,
+            url: "https://hitomi.la/galleries/9.html".into(),
+            english: "Nine Lives".into(),
+            japanese: "九つの命".into(),
+            english_key: "ninelives".into(),
+            japanese_key: "九つの命".into(),
+            exact: true,
+            source: "hitomi".into(),
+        };
+        store.save_translations("九つの命", "hitomi", "九つの命", "ja", unix_now(), &[row]).await.unwrap();
+
+        let outcome = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
+        assert_eq!(outcome.translation_ja.as_ref().map(|t| (t.text.as_str(), t.source.as_str())), Some(("九つの命", "hitomi")));
+        assert!(outcome.translation.is_none());
+
+        // a query in Japanese has the English title and no Japanese one; a query with no letter has neither
+        let outcome = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("九つの命") }).await.unwrap();
+        assert!(outcome.translation_ja.is_none());
+        let outcome = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("2026 7") }).await.unwrap();
+        assert!(outcome.translation_ja.is_none() && outcome.translation.is_none());
+        // no translator: no Japanese title
+        let outcome = engine.search(&Request { live: Live::Off, translator: Translator::None, ..Request::new("Nine Lives") }).await.unwrap();
+        assert!(outcome.translation_ja.is_none());
     }
 
     #[tokio::test]

@@ -65,6 +65,8 @@ is missing may just be beyond the cut, so it stays. A failed try changes nothing
 | `limit=n` | The most works in the answer (at most `[search] max_results`). |
 | `exclude=A,B` | The sites (names as `GET /okazuri/sites` lists them, case does not matter, separated by commas) that are left out: they are not asked, their saved works are not in the answer, and they are not in `sites`. A name that is no site is a 422. The translation is not affected: `translator` says where it comes from. |
 | `translator=auto` (default) | A query with Japanese in it is searched in English too: the English title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translation` says the title (`{"text", "source"}`). |
+
+A query **without Japanese** (English, or romaji) is searched in Japanese the same way, the other way round: the Japanese title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translationJa` says the title (`{"text", "source"}`; `null` when there is none, and when the query has Japanese or no letter). `translator` and `live` choose the source in the same way.
 | `translator=hitomi` | Hitomi.La only: when it fails or has nothing, the English search is left out (`translation` is `null`). |
 | `translator=google` | Google Translate only. |
 | `translator=none` | No English search. |

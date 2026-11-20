@@ -435,7 +435,7 @@ mod tests {
     async fn searches_the_sites_and_answers_json() {
         let (state, hits) = search_state().await;
 
-        let (status, content_type, body) = get_from(state.clone(), &format!("/okazuri/search?q={}", encode("COMIC ExE"))).await;
+        let (status, content_type, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}", encode("COMIC ExE"))).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "application/json; charset=utf-8");
@@ -453,20 +453,20 @@ mod tests {
         assert_eq!(json["sites"][1]["status"], "failed");
 
         // live=diff (the default) does not ask a site again within the validity of the answer (a month): the database answers
-        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={}", encode("COMIC ExE"))).await;
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}", encode("COMIC ExE"))).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(json["sites"][0]["status"], "cached");
         assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["isNew"]), (2, &serde_json::json!(false)));
 
         // live=force asks every site, cached or not; the works are found again and are not new
-        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={}&live=force", encode("COMIC ExE"))).await;
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}&live=force", encode("COMIC ExE"))).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(json["sites"][0]["status"], "searched");
 
         // live=off asks nobody
-        let (_, _, body) = get_from(state, &format!("/okazuri/search?q={}&live=off", encode("COMIC ExE"))).await;
+        let (_, _, body) = get_from(state, &format!("/okazuri/search?translator=none&q={}&live=off", encode("COMIC ExE"))).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["sites"][0]["status"], "not searched");
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
