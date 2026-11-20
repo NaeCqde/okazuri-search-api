@@ -43,6 +43,7 @@ GET /okazuri/search?q=快楽天 2026 7
   parameters of the query string that name the work); `url` is the domain of the site put before it.
 - `input` is `q` as it was sent (tidied up), and `query` is its **romaji**: what the sites were asked, and what the
   titles were matched with. A `q` without Japanese in it is its own romaji. `titleRomaji` is the romaji of `title`.
+- `translation` is the English title of a query with Japanese in it, and `translationJa` the Japanese title of a query without Japanese (`{"text", "source"}`, or `null`): the works with that title are in `results` too ([SEARCH.md](SEARCH.md)).
 - `total` is how many saved works have all the words; `results` is cut to `limit`.
 - `isNew` is true for a work that this request found on a site and saved: it was not in the database before. A work that is
   found again is not new, and its row is left as it is (it is written again only if its title changed).
