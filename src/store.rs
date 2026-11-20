@@ -98,8 +98,6 @@ impl SearchStore {
         let backend = db.get_database_backend();
         let schema = Schema::new(backend);
 
-        Self::replace_old_translations(db).await?;
-
         let mut works = schema.create_table_from_entity(work::Entity);
         let mut searches = schema.create_table_from_entity(search::Entity);
         let mut listings = schema.create_table_from_entity(listing::Entity);
@@ -121,114 +119,7 @@ impl SearchStore {
             .to_owned();
         db.execute(backend.build(&by_update)).await?;
 
-        Self::add_language(db).await?;
-        Self::add_deleted(db).await?;
-
         Self::create_word_index(db).await
-    }
-
-    /// A database from before the translation tables took their form (`translations.english_key`): the two tables are only a copy of what
-    /// the sources answered, so they are dropped and made again (the answers are asked again).
-    async fn replace_old_translations(db: &DatabaseConnection) -> Result<()> {
-        let backend = db.get_database_backend();
-        let columns = db
-            .query_one(Statement::from_string(backend, "SELECT count(*) AS n FROM pragma_table_info('translations')"))
-            .await?
-            .ok_or("no count")?
-            .try_get::<i64>("", "n")?;
-        let current = db
-            .query_one(Statement::from_string(backend, "SELECT count(*) AS n FROM pragma_table_info('translations') WHERE name = 'english_key'"))
-            .await?
-            .ok_or("no count")?
-            .try_get::<i64>("", "n")?;
-
-        if columns > 0 && current == 0 {
-            log::info!("translations: an old table, made again");
-            db.execute_unprepared("DROP TABLE translations").await?;
-            db.execute_unprepared("DROP TABLE IF EXISTS translation_lookups").await?;
-        }
-
-        Ok(())
-    }
-
-    /// A database from before `works.deleted` and `works.checked_at`: the columns are added (quick: no row is written). The table `work_checks`,
-    /// where an earlier version noted them, is read into the columns and dropped.
-    async fn add_deleted(db: &DatabaseConnection) -> Result<()> {
-        let has = db
-            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS n FROM pragma_table_info('works') WHERE name = 'deleted'"))
-            .await?
-            .ok_or("no count")?
-            .try_get::<i64>("", "n")?;
-
-        if has == 0 {
-            log::info!("works.deleted, works.checked_at: adding the columns");
-            db.execute_unprepared("ALTER TABLE works ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0").await?;
-            db.execute_unprepared("ALTER TABLE works ADD COLUMN checked_at INTEGER").await?;
-        }
-
-        let old = db
-            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'work_checks'"))
-            .await?
-            .ok_or("no count")?
-            .try_get::<i64>("", "n")?;
-
-        if old > 0 {
-            log::info!("work_checks: read into works.deleted and works.checked_at");
-            for sql in [
-                "INSERT OR IGNORE INTO works (website, path, title, title_romaji, title_key, first_seen, updated_at, language, deleted, checked_at) \
-                 SELECT website, path, '', '', '', checked_at, checked_at, NULL, 1, checked_at FROM work_checks WHERE gone = 1",
-                "UPDATE works SET checked_at = (SELECT c.checked_at FROM work_checks c WHERE c.website = works.website AND c.path = works.path) \
-                 WHERE EXISTS (SELECT 1 FROM work_checks c WHERE c.website = works.website AND c.path = works.path AND c.gone = 0)",
-                "DROP TABLE work_checks",
-            ] {
-                db.execute_unprepared(sql).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// A database from before `works.language`: the column is added, and the language of every title is read. It is quick (no request).
-    async fn add_language(db: &DatabaseConnection) -> Result<()> {
-        let has = db
-            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS n FROM pragma_table_info('works') WHERE name = 'language'"))
-            .await?
-            .ok_or("no count")?
-            .try_get::<i64>("", "n")?;
-
-        if has > 0 {
-            return Ok(());
-        }
-
-        log::info!("works.language: adding the column and reading the language of every title");
-        db.execute_unprepared("ALTER TABLE works ADD COLUMN language TEXT").await?;
-
-        let transaction = db.begin().await?;
-        let mut after: Option<(String, String)> = None;
-
-        loop {
-            let mut query = work::Entity::find();
-            if let Some((website, path)) = &after {
-                query = query.filter(Expr::cust_with_values("(website, path) > (?, ?)", [website.as_str(), path.as_str()]));
-            }
-            let page = query.order_by_asc(work::Column::Website).order_by_asc(work::Column::Path).limit(2000).all(&transaction).await?;
-            let Some(last) = page.last() else { break };
-            after = Some((last.website.clone(), last.path.clone()));
-
-            for row in &page {
-                if let Some(found) = language::detect(&row.title) {
-                    work::Entity::update_many()
-                        .col_expr(work::Column::Language, Expr::value(found))
-                        .filter(work::Column::Website.eq(row.website.as_str()))
-                        .filter(work::Column::Path.eq(row.path.as_str()))
-                        .exec(&transaction)
-                        .await?;
-                }
-            }
-        }
-        transaction.commit().await?;
-
-        Ok(())
     }
 
     /// The index of the title keys (`works_fts`): FTS5 with the trigram tokenizer, which finds the works whose key has a
@@ -1421,28 +1312,6 @@ mod tests {
         let store = SearchStore::open(&path).await.unwrap();
         assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/1/"]);
         assert_eq!(paths(store.candidates(&["other"]).await.unwrap()).await, ["/g/2/"]);
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn a_database_without_the_language_gets_it_read_from_the_titles_when_it_is_opened() {
-        let dir = std::env::temp_dir().join(format!("okazuri-language-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let path = dir.join("search.db");
-
-        let store = SearchStore::open(&path).await.unwrap();
-        store
-            .save_crawled("A", 1, &[NewWork { path: "/g/1/".into(), title: "[x] y [中国翻訳]".into(), romaji: "y".into(), language: Some("zh".into()) }, NewWork { path: "/g/2/".into(), title: "plain".into(), romaji: "plain".into(), language: None }], None)
-            .await
-            .unwrap();
-        // a database of a version that had no language
-        store.db.execute_unprepared("ALTER TABLE works DROP COLUMN language").await.unwrap();
-        drop(store);
-
-        let store = SearchStore::open(&path).await.unwrap();
-        let works = store.works_after(None, 10).await.unwrap();
-        assert_eq!(works.iter().map(|w| (w.path.as_str(), w.language.as_deref())).collect::<Vec<_>>(), [("/g/1/", Some("zh")), ("/g/2/", None)]);
 
         fs::remove_dir_all(&dir).ok();
     }

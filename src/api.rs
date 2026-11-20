@@ -45,7 +45,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// Says how long a cache (Cloudflare in front of this server, a browser) may keep an answer. Only a `200` is kept;
-/// a search that asks every site again (`live=on`) and the health check are never kept.
+/// a search that asks every site again (`live=force`) and the health check are never kept.
 async fn cache_control(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let path = request.uri().path().to_string();
     // Read the query the way the handlers do (percent-decoded, case-insensitive), so `live=ON` or `live=%6Fn` is not kept either.
@@ -512,7 +512,6 @@ mod tests {
         assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // no `off` here: the saved answers are the answer of `diff`, and the site is asked when there is none
         assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=on", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY, "`on` is `force`, the old name");
         // Google Translate: the same input rules, and `off` with nothing saved is no translation
         assert_eq!(get_from(state.clone(), "/google/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -547,13 +546,13 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["query"], "COMIC ExE");
         assert_eq!(json["results"][0]["website"], "Good");
-        assert_eq!(json["results"][0]["isLegal"], true);
+        assert_eq!(json["results"][0]["is_legal"], true);
         assert_eq!(json["results"][0]["title"], "COMIC ExE one");
         assert_eq!(json["results"][0]["path"], "/work/1");
         assert_eq!(json["results"][0]["url"], "http://127.0.0.1/work/1");
         assert_eq!(json["terms"], serde_json::json!(["comic", "exe"]));
         assert_eq!(json["total"], 2);
-        assert_eq!(json["results"][0]["isNew"], true, "this request saved it");
+        assert_eq!(json["results"][0]["is_new"], true, "this request saved it");
         assert_eq!(json["sites"].as_array().unwrap().len(), 3);
         assert_eq!(json["sites"][1]["status"], "failed");
 
@@ -562,7 +561,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(json["sites"][0]["status"], "cached");
-        assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["isNew"]), (2, &serde_json::json!(false)));
+        assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["is_new"]), (2, &serde_json::json!(false)));
 
         // live=force asks every site, cached or not; the works are found again and are not new
         let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}&live=force", encode("COMIC ExE"))).await;
@@ -588,7 +587,7 @@ mod tests {
         assert_eq!(json["query"], "cheat", "the romaji is the query: no hentai or anything else is added");
         assert_eq!(json["terms"], serde_json::json!(["cheat"]));
         assert_eq!(json["results"][0]["title"], "cheat one", "the sites were asked the romaji, and the titles are matched with it");
-        assert_eq!(json["results"][0]["titleRomaji"], "cheat one");
+        assert_eq!(json["results"][0]["title_romaji"], "cheat one");
         assert_eq!(json["sites"][0]["queries"], serde_json::json!(["チート", "cheat"]), "a site that finds Japanese titles is asked both");
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
 

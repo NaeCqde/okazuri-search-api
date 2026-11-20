@@ -17,7 +17,7 @@
 | クエリ | |
 |---|---|
 | `q` | 検索語。必須で、1 文字から `[search] max_query_chars` 文字まで(既定 300)。空白で語を区切ります。最初に必ずローマ字にされます。 |
-| `live` | `off`: どのサイトにも尋ねず、データベースだけで答えます(古くてもそのまま)。`diff`(既定): 答えがない、または `[search] ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかは `cached` になります。`force`: キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。どの場合も、新しい作品を保存し、保存済みの作品とあわせてデータベースから答えます。`0`/`false`/`no` は `off`、`1`/`true`/`yes`/`on` は `force` です。 |
+| `live` | `off`: どのサイトにも尋ねず、データベースだけで答えます(古くてもそのまま)。`diff`(既定): 答えがない、または `[search] ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかは `cached` になります。`force`: キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。どの場合も、新しい作品を保存し、保存済みの作品とあわせてデータベースから答えます |
 | `limit` | 応答に入れる作品の最大数。1 から `[search] max_results` まで(既定 100)。 |
 
 ```
@@ -30,16 +30,16 @@ GET /okazuri/search?q=快楽天 2026 7
   "results": [
     {
       "website": "DLsite",
-      "isLegal": true,
+      "is_legal": true,
       "path": "/books/work/=/product_id/BJ03044883.html",
       "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html",
       "title": "COMIC快楽天 2026年11月号",
-      "titleRomaji": "comic kairakuten 2026 nen 11 gatsu gou",
-      "isNew": true
+      "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou",
+      "is_new": true
     }
   ],
   "sites": [
-    { "website": "DLsite", "status": "searched", "count": 30, "error": null, "searchedAt": 1793181281 }
+    { "website": "DLsite", "status": "searched", "count": 30, "error": null, "searched_at": 1793181281 }
   ]
 }
 ```
@@ -47,14 +47,14 @@ GET /okazuri/search?q=快楽天 2026 7
 - `title` は、サイトの一覧に載っている作品のタイトルで、サイトが書いたままです。`path` は作品ページのパス(作品を指す
   クエリ文字列のパラメータを含みます)で、`url` はそれにサイトのドメインを付けたものです。
 - `input` は送られた `q`(整えたもの)で、`query` はその**ローマ字**です。サイトに尋ねた文字列で、タイトルとの照合にも使います。
-  日本語を含まない `q` は、それ自体がローマ字です。`titleRomaji` は `title` のローマ字です。
-- `titleEnglish` は結果の英語のタイトルで、`titleEnglishSource` はその出どころです(`"official"` か `"google"`。英語のタイトルがなければ
+  日本語を含まない `q` は、それ自体がローマ字です。`title_romaji` は `title` のローマ字です。
+- `title_english` は結果の英語のタイトルで、`title_english_source` はその出どころです(`"official"` か `"google"`。英語のタイトルがなければ
   どちらも `null`)。タイトルが英語ならそのタイトル、両方を併記したタイトル(`English | 日本語`)ならその英語側、そうでなければ保存済みの翻訳です。
   Hitomi.La の翻訳は作品自身のタイトルなので `official`、Google の翻訳は機械翻訳なので `google` です。このために新しくサイトへ尋ねることはありません。
-- `translation` は、日本語を含むクエリの英語のタイトルで、`translationJa` は、日本語を含まないクエリの日本語のタイトルです
+- `translation` は、日本語を含むクエリの英語のタイトルで、`translation_ja` は、日本語を含まないクエリの日本語のタイトルです
   (`{"text", "source"}` または `null`)。そのタイトルを持つ作品も `results` に入ります([SEARCH.md](SEARCH.md))。
 - `total` は、すべての語を含む保存済みの作品の数で、`results` は `limit` で切られます。
-- `isNew` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
+- `is_new` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
   再び見つかった作品は新しくなく、行もそのままです(タイトルが変わったときだけ書き直します)。
 - `sites` は、各サイトの結果を表します。`searched`(いま尋ねた)、`cached`(`live=diff` で、`ttl_hours` 以内に尋ねたので
   データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
@@ -99,8 +99,8 @@ GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fprodu
 `okazuri_bot/src/websites.ts` のサイトと、それぞれを検索するかどうかを返します。
 
 ```
-[ { "name": "DLsite", "isLegal": true, "support": "ready", "hasSearch": true, "japanese": true, "active": true, "note": "" },
-  { "name": "IMHentai", "isLegal": false, "support": "cloudflare", "hasSearch": true, "japanese": true, "active": false, "note": "" }, ... ]
+[ { "name": "DLsite", "is_legal": true, "support": "ready", "has_search": true, "japanese": true, "active": true, "note": "" },
+  { "name": "IMHentai", "is_legal": false, "support": "cloudflare", "has_search": true, "japanese": true, "active": false, "note": "" }, ... ]
 ```
 
 `support` は `ready`、`cloudflare`(ブラウザが要るチャレンジ)、`javascript`、`closed` のどれかです。`japanese` は、そのサイトが

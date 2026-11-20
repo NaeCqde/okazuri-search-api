@@ -60,7 +60,7 @@
 | `q` | 検索語。必須で、最大 `[search] max_query_chars` 文字。 |
 | `live=off` | どのサイトにも尋ねません。データベースが持っているものが古くても、それだけで答えます。 |
 | `live=diff`(既定) | 答えがない、または `ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかはデータベースが答えます(`cached`)。 |
-| `live=force` | キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。`on`(以前の名前)、`1`、`true`、`yes` も同じ意味です。 |
+| `live=force` | キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます) |
 | `limit=n` | 応答に入れる作品の最大数(最大 `[search] max_results`)。 |
 | `exclude=A,B` | 除外するサイト(`GET /okazuri/sites` に出る名前。大文字小文字は区別せず、カンマで区切ります)。そのサイトには尋ねず、保存済みの作品も応答に入れず、`sites` にも出ません。サイトにない名前は 422 です。翻訳には影響しません(出どころは `translator` が決めます)。 |
 | `translator=auto`(既定) | 日本語を含むクエリは、英語でも検索します。英語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、Hitomi.La が失敗するか何も返さないときは Google 翻訳(`/google/translate`)から取ります。両方の検索の作品が `results` に入り、`translation` がそのタイトルを示します(`{"text", "source"}`)。 |
@@ -69,7 +69,7 @@
 | `translator=none` | 英語の検索をしません。 |
 
 **日本語を含まない**クエリ(英語やローマ字)も、逆向きに、同じ方法で日本語でも検索します。日本語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、
-Hitomi.La が失敗するか何も返さないときは Google 翻訳から取ります。両方の検索の作品が `results` に入り、`translationJa` がそのタイトルを示します
+Hitomi.La が失敗するか何も返さないときは Google 翻訳から取ります。両方の検索の作品が `results` に入り、`translation_ja` がそのタイトルを示します
 (`{"text", "source"}`。ないとき、およびクエリに日本語がある、または文字がないときは `null`)。出どころは `translator` と `live` が
 同じように決めます。
 
@@ -84,24 +84,24 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
   "terms": ["comic快楽天", "2026", "11"],
   "total": 28,
   "results": [
-    { "website": "FANZA", "isLegal": true, "path": "/product/25199/b915awnmg04607/",
+    { "website": "FANZA", "is_legal": true, "path": "/product/25199/b915awnmg04607/",
       "url": "https://book.dmm.co.jp/product/25199/b915awnmg04607/", "title": "COMIC快楽天 2026年11月号",
-      "titleRomaji": "comic kairakuten 2026 nen 11 gatsu gou" }
+      "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou" }
   ],
   "sites": [
-    { "website": "FANZA", "status": "searched", "count": 23, "error": null, "searchedAt": 1793181281 }
+    { "website": "FANZA", "status": "searched", "count": 23, "error": null, "searched_at": 1793181281 }
   ]
 }
 ```
 
-`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=0`)、`unavailable`(Hitomi.La の一覧が全件保存される
+`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
 までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
 失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数で、`results` はそれより短いことがあります。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
 スラッシュ付きで保存したページを、サイトが後からスラッシュなしで挙げたときは、スラッシュなしの path に**名前が変わります**(同じ行なので `first_seen` は残り、
 そのページを指す一覧も追従します)。両方の形が同時に挙がったページは、スラッシュなしで保存します(そう書くサイトに、スラッシュは要りません)。
 スラッシュなしで保存したページはそのままです。スラッシュ付きでしか挙がらないページは、スラッシュ付きのままです。同じアドレスの作品(末尾の `/` や `#` 以降の
-有無、大文字小文字だけが違うもの)は 1 つの作品で、最初に保存したものが残り、どれかが新しければ `isNew` になります。
+有無、大文字小文字だけが違うもの)は 1 つの作品で、最初に保存したものが残り、どれかが新しければ `is_new` になります。
 
 ## サイト
 
@@ -276,7 +276,7 @@ Hitomi.La に尋ね(`/hitomila/translate` と同じ。永久に保存。Google �
 
 `language.rs` が、タイトルから言語を読みます。サイトがタイトルの先頭に付ける国旗、翻訳の印(`[中国翻訳]`、`[汉化]`)、言語だけを表す括弧(`[EN]`、`[English]`、`[CN,EN,JP,KR]`)です。
 答えは、タイトルが示した順に `,` でつないだ 2 文字のコードです(`zh`、`en,ja`、`zh,en,ja,ko`)。タイトルに言語がなければ NULL です(ほとんどのタイトルは日本語で、そうは書きません)。
-検索は、これをコードのリストを同じ順にした `language` として返します(`["zh", "en"]`。ないときは `[]`)。この機能より前のデータベースは、開くときに列が追加され、タイトルが読まれます。
+検索は、これをコードのリストを同じ順にした `language` として返します(`["zh", "en"]`。ないときは `[]`)。
 `export` のファイルにはこの列がありません。`import` が作ります(ローマ字とキーを作るのと同じです)。規則が変わったときは、`okazuri-search-api relanguage` がすべてのタイトルを
 読み直し、結果が変わった作品を書き込みます(`reromanize` も、ローマ字が変わった作品には書き込みます)。タイトルのどこかにある国旗(🇯🇵、🇨🇳 など)はその言語を示し、
 **タイトルから取り除かれます**(ローマ字とキーからも)。新しい作品は、国旗なしで保存され、それ以前に保存した作品には `relanguage` が同じことをします。国旗がなくなった後は、

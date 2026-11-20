@@ -39,7 +39,6 @@ const USER_AGENT: &str =
 
 /// A work found: the site, the title as the site writes it, and its page.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct Hit {
     pub website: String,
     pub is_legal: bool,
@@ -132,7 +131,6 @@ impl Lang {
 
 /// A translation of a text: the title of a work of Hitomi.La in English and in Japanese (`translate`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct Translation {
     pub id: u32,
     pub url: String,
@@ -199,7 +197,6 @@ pub struct Fetched {
 
 /// What came of the search on one site.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct SiteReport {
     pub website: String,
     /// `searched` (asked now), `cached` (asked less than `ttl_hours` ago, so the database answers), `failed` (a query
@@ -215,7 +212,6 @@ pub struct SiteReport {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct Outcome {
     /// The query as it was sent (tidied up).
     pub input: String,
@@ -283,12 +279,12 @@ pub enum Live {
 }
 
 impl Live {
-    /// `off`, `diff` and `force`; `0`, `false`, `no` are off, `on`, `1`, `true`, `yes` are force (`on` is the old name). `None` for anything else.
+    /// `off`, `diff` (or nothing) and `force`. `None` for anything else.
     pub fn parse(text: &str) -> Option<Live> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "off" | "0" | "false" | "no" => Some(Live::Off),
+            "off" => Some(Live::Off),
             "diff" | "" => Some(Live::Diff),
-            "force" | "on" | "1" | "true" | "yes" => Some(Live::Force),
+            "force" => Some(Live::Force),
             _ => None,
         }
     }
@@ -320,7 +316,6 @@ impl<'a> Request<'a> {
 
 /// A site as `GET /okazuri/sites` lists it.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SiteInfo {
     pub name: &'static str,
     pub is_legal: bool,
@@ -2288,6 +2283,6 @@ pub(crate) mod tests {
         assert!(english.contains(&("/4", Some("Her B"), Some("google"))), "{english:?}");
         assert!(english.contains(&("/5", None, None)), "nothing saved, nothing asked: {english:?}");
         let json = serde_json::to_value(&outcome.results[0]).unwrap();
-        assert!(json.get("titleEnglish").is_some() && json.get("titleEnglishSource").is_some());
+        assert!(json.get("title_english").is_some() && json.get("title_english_source").is_some());
     }
 }
