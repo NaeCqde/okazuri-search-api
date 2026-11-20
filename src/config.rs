@@ -6,7 +6,6 @@
 use crate::utils::Result;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -17,6 +16,8 @@ pub struct Config {
     pub search: SearchConfig,
     pub d1: D1Config,
     pub prefetch: PrefetchConfig,
+    pub crawl: CrawlConfig,
+    pub verify: VerifyConfig,
     pub cron: CronConfig,
     /// Word (as UniDic splits it) to the romaji it is replaced by.
     pub exceptions: BTreeMap<String, String>,
@@ -68,14 +69,27 @@ pub struct SearchConfig {
     pub timeout_secs: u64,
     /// The shortest time between two requests to the same site.
     pub min_delay_ms: u64,
+    /// The shortest time between two requests to one site, by the name of the site (`GET /okazuri/sites`; case does not matter),
+    /// in place of `min_delay_ms` and of the delay the program knows for the site. Every request of the program to the site (a
+    /// search, the prefetch, the crawl) keeps it together.
+    pub site_delay_ms: BTreeMap<String, u64>,
     /// The most results kept from one site.
     pub max_results_per_site: usize,
     /// The most works in one answer (a request may ask for fewer with limit).
     pub max_results: usize,
     /// Names of the sites (`GET /okazuri/sites`) that are left out.
     pub disabled_sites: Vec<String>,
+    /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
+    /// still asks it. The sites that have no list, or whose list is not read yet, are asked as before.
+    pub skip_crawled: bool,
     /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
     pub try_unsupported: bool,
+    /// The address of `tools/google-translate-bridge` (a Chrome that makes the token of Google Translate), such as
+    /// `http://100.64.0.1:8130`. Empty: Google Translate is asked without the token, which gets the answer of the classic
+    /// model.
+    pub google_bridge_url: String,
+    /// What the bridge wants in `Authorization: Bearer` (its `BRIDGE_TOKEN`); empty for none.
+    pub google_bridge_token: String,
 }
 
 impl Default for SearchConfig {
@@ -89,10 +103,14 @@ impl Default for SearchConfig {
             concurrency: 8,
             timeout_secs: 20,
             min_delay_ms: 1000,
+            site_delay_ms: BTreeMap::new(),
             max_results_per_site: 50,
             max_results: 100,
             disabled_sites: Vec::new(),
+            skip_crawled: false,
             try_unsupported: false,
+            google_bridge_url: String::new(),
+            google_bridge_token: String::new(),
         }
     }
 }
@@ -154,6 +172,66 @@ impl Default for PrefetchConfig {
     }
 }
 
+/// Reading every work of the sites that list them all, in the background of the server (`crawl.rs`). Off unless `enabled` is true.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CrawlConfig {
+    pub enabled: bool,
+    /// When the newest works are read again, once the whole list was read (five fields, as in `[cron]`; the clock is `utc_offset`).
+    pub schedule: String,
+    pub utc_offset: String,
+    /// The sites to crawl, by name; empty is every site that can be.
+    pub sites: Vec<String>,
+    /// `k/N`: this machine reads the pages whose number leaves k when divided by N, so N machines (each with its own IP address) read
+    /// every site together without any one of them being the only one a site sees. `0/1` is the whole list.
+    pub shard: String,
+    /// The index file of Hitomi.La that lists the galleries: `index-all.nozomi`, or `index-japanese.nozomi` for the Japanese ones only.
+    pub hitomi_index: String,
+    /// How many galleries of Hitomi.La are read before the walk is saved.
+    pub hitomi_batch: usize,
+    /// The most pages that one reading of the newest works goes back. It stops at the first page it knows (every work of it saved), so
+    /// after a long pause it goes back as far as the pause was; this is only the safety against a list that never shows a known page.
+    pub refresh_pages: usize,
+    /// The wait after a site failed, before it is tried again.
+    pub retry_minutes: u64,
+}
+
+impl Default for CrawlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "17 * * * *".to_string(),
+            utc_offset: "UTC".to_string(),
+            sites: Vec::new(),
+            shard: "0/1".to_string(),
+            hitomi_index: "index-all.nozomi".to_string(),
+            hitomi_batch: 100,
+            refresh_pages: 1000,
+            retry_minutes: 10,
+        }
+    }
+}
+
+/// Looking at the page of every saved work now and then, and removing the works whose page is gone (`verify.rs`). Off unless `enabled` is true.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    pub enabled: bool,
+    /// The sites to look at, by name; empty is every site whose pages say that a work is gone (`engine::gone_rule`).
+    pub sites: Vec<String>,
+    /// Every page is looked at once in this many days: a site is asked one page every `days / works` (the works of a site that are saved
+    /// now), never closer than the delay of the site.
+    pub interval_days: u64,
+    /// A site is never asked two pages closer than this (a site with more works than `interval_days` allow is looked at over more days).
+    pub min_pause_ms: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self { enabled: false, sites: Vec::new(), interval_days: 30, min_pause_ms: 5000 }
+    }
+}
+
 /// Scheduled HTTP requests (`cron.rs`). Off unless `enabled` is true.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -208,8 +286,8 @@ pub fn default_path() -> PathBuf {
 }
 
 /// Reads the file; a file that does not exist gives the defaults.
-pub fn load(path: &Path) -> Result<Config> {
-    let text = match fs::read_to_string(path) {
+pub async fn load(path: &Path) -> Result<Config> {
+    let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(format!("cannot read {}: {}", path.display(), e).into()),
@@ -297,18 +375,18 @@ url = \"http://x\"
         assert_eq!(config.exceptions.get("ナース").map(String::as_str), Some("nurse"));
     }
 
-    #[test]
-    fn a_missing_file_is_the_defaults() {
-        let config = load(Path::new("no-such-dir/config.toml")).unwrap();
+    #[tokio::test]
+    async fn a_missing_file_is_the_defaults() {
+        let config = load(Path::new("no-such-dir/config.toml")).await.unwrap();
         assert_eq!(config.server.port, 8000);
     }
 
-    #[test]
-    fn a_broken_file_is_an_error_that_names_the_file() {
+    #[tokio::test]
+    async fn a_broken_file_is_an_error_that_names_the_file() {
         let path = std::env::temp_dir().join("okazuri-search-api-broken-config.toml");
-        fs::write(&path, "[server\nport = ").unwrap();
-        let error = load(&path).unwrap_err().to_string();
-        fs::remove_file(&path).ok();
+        std::fs::write(&path, "[server\nport = ").unwrap();
+        let error = load(&path).await.unwrap_err().to_string();
+        std::fs::remove_file(&path).ok();
         assert!(error.contains("okazuri-search-api-broken-config.toml"), "{error}");
     }
 }

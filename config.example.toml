@@ -50,13 +50,27 @@ concurrency = 8
 timeout_secs = 20
 # The shortest time between two requests to the same site. Be kind to the sites: some answer 429 to a rush.
 min_delay_ms = 1000
+# The same, for one site (its name in GET /okazuri/sites), in place of min_delay_ms. Every request of the program to the site (a search,
+# the prefetch, the crawl) keeps it together, so the crawl and the searches never ask a site more often than this.
+# [search.site_delay_ms]
+# "Hitomi.La" = 150
+# "E-Hentai" = 3000
 # The most works kept from one site's list page, and the most in one answer (a request may use limit=).
 max_results_per_site = 50
 max_results = 100
 # Sites to leave out (the names of GET /okazuri/sites).
 disabled_sites = []
+# A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The
+# other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`).
+skip_crawled = false
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
 try_unsupported = false
+# Google Translate gives the Advanced (Gemini) answer only to a request that has a token of its bot check, which only a browser
+# makes. tools/google-translate-bridge is a Chrome (on a Mac, say) that makes the token and hands the request over; this program
+# sends it. Empty: no bridge, and the answer is the one of the classic model.
+google_bridge_url = ""
+# What the bridge wants in "Authorization: Bearer" (its BRIDGE_TOKEN). Empty for none.
+google_bridge_token = ""
 
 # A copy of the magazine tables (magazines and numbers) of the Worker's D1 database. The server asks D1 whether
 # the data changed (the Time Travel bookmark: no rows are read), and when it did, downloads the SQL that D1
@@ -115,3 +129,34 @@ utc_offset = "UTC"
 # [cron.jobs.headers]
 # Authorization = "Bearer ${CRON_SECRET}"
 # Content-Type = "application/json"
+
+# Reading the whole list of the sites that have one (docs/SEARCH.md, "Crawling"). The searches stay; the prefetch asks only the sites
+# the crawl has no list for.
+[crawl]
+enabled = false
+# When the newest pages are read again, after the first walk is done (five fields; the clock is utc_offset).
+schedule = "17 * * * *"
+utc_offset = "UTC"
+# Sites to crawl (empty: all that have a list).
+sites = []
+# k/N: this machine reads the pages whose number leaves k when divided by N. Run N machines with 0/N ... N-1/N, then `export` on each and
+# `import` the files on the server. Lists that go one page to the next (RokuHentai, E-Hentai) are read by 0/N only.
+shard = "0/1"
+# index-all.nozomi (every language) or index-japanese.nozomi.
+hitomi_index = "index-all.nozomi"
+hitomi_batch = 100
+# The newest pages are read until one is known (so a long pause is caught up); this is only the most pages of one reading.
+refresh_pages = 1000
+retry_minutes = 10
+
+# Looking at the page of every saved work of the sites that tell when a work is gone (RokuHentai, DLsite, HentaiEnvy, Nya:Hentai, momon:GA,
+# Sukebei, AsmHentai, HentaiEra, Wnacg), once in `interval_days`, and marking the works whose page is gone (`works.deleted`, with no title: no search
+# finds them). The sites still list such a work, so a list, the crawl or an import does not save it again. A site is asked one page every
+# `interval_days / works` (900 000 works in 30 days: a page every 2.9 s), never closer than the delay of the site.
+[verify]
+enabled = false
+# Empty: every site of that list.
+sites = []
+interval_days = 30
+# A site is never asked two pages closer than this, so a site with more works than interval_days allows is looked at over more days.
+min_pause_ms = 5000

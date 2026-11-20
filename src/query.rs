@@ -13,6 +13,37 @@ pub fn tidy(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A group in brackets, in a pair of any kind of bracket the sites use: `[Circle (Artist)]`, `(C103)`, `【DL版】`, `（Series）`.
+fn bracket_group() -> &'static str {
+    r"(?:\[[^\]]*\]|\([^)]*\)|【[^】]*】|（[^）]*）)"
+}
+
+/// The title of the work alone, for a translation by title (Hitomi.La): what a site puts around the title is left out: the event
+/// and the circle and the artist at the front (`(C103) [Circle (Artist)]`), the series, the tags and the language at the back
+/// (`(Series) [English] [DL版]`), and the other title after a bar (`English | 日本語`, `日本語 / English`): the one in the
+/// language of the text (`japanese`) is kept. When nothing is left, the text is as it was.
+pub fn work_title(text: &str, japanese: bool) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static EDGES: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (front, back) = EDGES.get_or_init(|| {
+        let group = bracket_group();
+
+        (Regex::new(&format!(r"^(?:\s*{group})+")).unwrap(), Regex::new(&format!(r"(?:{group}\s*)+$")).unwrap())
+    });
+
+    let tidied = tidy(text);
+    let segments: Vec<&str> = tidied.split(" | ").flat_map(|part| part.split(" / ")).collect();
+    let chosen = segments.iter().find(|segment| has_japanese(segment) == japanese).or(segments.first()).copied().unwrap_or("");
+
+    let title = front.replace(chosen, "");
+    let title = back.replace(&title, "");
+    let title = title.trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '–' | '~' | '・'));
+
+    if title.is_empty() { tidied } else { title.to_string() }
+}
+
 /// `tidy`, and a multiplication sign is written as `x` (most sites do not agree on `×`, and `COMIC E×E` is `COMIC ExE`).
 pub fn normalize(text: &str) -> String {
     tidy(&text.replace('×', "x"))
@@ -191,14 +222,18 @@ impl Terms {
         self.0.iter().map(|term| term.key.as_str()).collect()
     }
 
-    /// A word that every matching title has in its key, to narrow the rows read from the database: the
-    /// longest one that is not a number (a number is also matched by value). `None` when all are numbers.
-    pub fn prefilter(&self) -> Option<&str> {
-        self.0
-            .iter()
-            .filter(|term| term.number.is_none())
-            .map(|term| term.key.as_str())
-            .max_by_key(|key| key.chars().count())
+    /// The words that every matching title has in its key, to narrow the rows read from the database: all the words that are not numbers
+    /// (a number is also matched by value, so it does not narrow), each once. Empty when all are numbers.
+    pub fn prefilters(&self) -> Vec<&str> {
+        let mut words: Vec<&str> = Vec::new();
+
+        for term in self.0.iter().filter(|term| term.number.is_none()) {
+            if !words.contains(&term.key.as_str()) {
+                words.push(term.key.as_str());
+            }
+        }
+
+        words
     }
 
     /// Does the title have every word? `key` is `title_key(title)`.
@@ -231,6 +266,26 @@ impl Terms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_title_of_the_work_is_what_is_left_without_what_the_site_puts_around_it() {
+        let ja = |text: &str| work_title(text, true);
+        let en = |text: &str| work_title(text, false);
+
+        assert_eq!(ja("[Yamamoto Zenzen] 学園サポ日記 comix 第1話 黒ギャルヤンキーオキガワ編 (COMIC Kuriberon DUMA 2025-09 Vol.76) [MTL] [Korean]"), "学園サポ日記 comix 第1話 黒ギャルヤンキーオキガワ編");
+        assert_eq!(ja("(Mou Nanimo Kowakunai 19) [Butazuraya Seinikuten (Mikan no Kawa Houchikai no Shinsei)] 6月の雨とナイフ (Puella Magi Madoka Magica)"), "6月の雨とナイフ");
+        assert_eq!(ja("[アトリエくろてふ💞+👣] 特別版07 [Cos赤ずきんコス] [70P]"), "特別版07");
+        // two titles: the one in the language of the text
+        assert_eq!(ja("[Todoroki Kangoku] はじめての健康ちん断 | My first sexual health check-up (COMIC ExE 60) [English]"), "はじめての健康ちん断");
+        assert_eq!(en("[Todoroki Kangoku] はじめての健康ちん断 | My first sexual health check-up (COMIC ExE 60) [English]"), "My first sexual health check-up");
+        assert_eq!(ja("COMIC ExE 74 | コミック エグゼ 74"), "コミック エグゼ 74");
+        assert_eq!(ja("日本語のタイトル / English title"), "日本語のタイトル");
+        // a title that is only a bracket, or that has none around it, is left alone
+        assert_eq!(ja("【推しの子】"), "【推しの子】");
+        assert_eq!(ja("ゼンゼロ逆レ合同「パエトーン強襲戦」"), "ゼンゼロ逆レ合同「パエトーン強襲戦」");
+        assert_eq!(ja("  姉弟で　シたらいけません "), "姉弟で シたらいけません");
+        assert_eq!(en("(C103) [Circle (Artist)] Siblings Shouldn't Do It! (Original) [English] [Digital]"), "Siblings Shouldn't Do It!");
+    }
 
     #[test]
     fn the_name_has_to_be_outside_the_parentheses_of_the_title_and_the_number_may_be_anywhere() {
@@ -329,11 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn the_prefilter_is_the_longest_word_that_is_not_a_number() {
-        assert_eq!(Terms::new("COMIC快楽天 2026 07").prefilter(), Some("comic快楽天"));
-        assert_eq!(Terms::new("a abc ab").prefilter(), Some("abc"));
-        assert_eq!(Terms::new("2026 07").prefilter(), None, "all numbers: nothing to narrow by");
-        assert_eq!(Terms::new("").prefilter(), None);
+    fn the_prefilters_are_the_words_that_are_not_numbers() {
+        assert_eq!(Terms::new("COMIC快楽天 2026 07").prefilters(), ["comic快楽天"]);
+        assert_eq!(Terms::new("a abc ab abc").prefilters(), ["a", "abc", "ab"], "each once");
+        assert!(Terms::new("2026 07").prefilters().is_empty(), "all numbers: nothing to narrow by");
+        assert!(Terms::new("").prefilters().is_empty());
         assert_eq!(Terms::new("COMIC E×E").keys(), ["comic", "exe"]);
     }
 }

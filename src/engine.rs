@@ -16,15 +16,14 @@
 use crate::config::SearchConfig;
 use crate::query::{has_japanese, normalize, restore_times, romaji, tidy, Terms};
 use crate::romanizer::Romanizer;
-use crate::sites::{self, is_challenge, Link, Site, Support};
+use crate::sites::{self, is_challenge, Format, Link, Site, Support};
 use crate::store::{NewWork, SearchStore, SiteState};
 use crate::utils::{unix_now, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
-use ureq::ResponseExt;
+use tokio::sync::{Mutex, Semaphore};
 
 /// A site that answers 429 is asked once more after the seconds of its Retry-After (this when it gives none), but
 /// never after more than the longest wait.
@@ -52,6 +51,9 @@ pub struct Hit {
     pub title: String,
     /// The romaji of the title: what the query was matched with.
     pub title_romaji: String,
+    /// The languages the title names (`language.rs`), as two-letter codes in the order it names them (`["zh", "en"]`); `[]` when it
+    /// names none.
+    pub language: Vec<String>,
     /// This request found the work on a site and saved it: it was not in the database before.
     pub is_new: bool,
 }
@@ -75,6 +77,109 @@ impl Plan {
             _ => (&self.input, &self.query),
         }
     }
+}
+
+/// `The Phaethon Assault` -> `Phaethon Assault`: the English of a title does not need the `The` that a translation puts in front.
+fn without_the(english: &str) -> String {
+    let trimmed = english.trim();
+
+    match trimmed.split_once(char::is_whitespace) {
+        Some((first, rest)) if first.eq_ignore_ascii_case("the") && !rest.trim().is_empty() => rest.trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// The two languages that are translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Japanese,
+    English,
+}
+
+impl Lang {
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::Japanese => "ja",
+            Lang::English => "en",
+        }
+    }
+
+    pub fn other(self) -> Lang {
+        match self {
+            Lang::Japanese => Lang::English,
+            Lang::English => Lang::Japanese,
+        }
+    }
+
+    /// The language of a text: Japanese when it has kana or kanji, English when its letters are all Latin (and it has some).
+    /// Any other text (Korean, Cyrillic, a text of marks and digits) is not translated.
+    pub fn of(text: &str) -> Option<Lang> {
+        if crate::query::has_japanese(text) {
+            return Some(Lang::Japanese);
+        }
+
+        let mut letters = text.chars().filter(|c| c.is_alphabetic()).peekable();
+
+        (letters.peek().is_some() && letters.all(|c| c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c))).then_some(Lang::English)
+    }
+}
+
+/// A translation of a text: the title of a work of Hitomi.La in English and in Japanese (`translate`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Translation {
+    pub id: u32,
+    pub url: String,
+    pub english: String,
+    pub japanese: String,
+    /// The text is the whole title.
+    pub exact: bool,
+    /// `hitomi` (the titles of a work of Hitomi.La) or `google` (Google Translate, when Hitomi.La has nothing: `id` is 0 and
+    /// `url` is empty).
+    pub source: String,
+}
+
+impl Translation {
+    /// The text in the language that is asked for.
+    pub fn text(&self, lang: Lang) -> &str {
+        match lang {
+            Lang::Japanese => &self.japanese,
+            Lang::English => &self.english,
+        }
+    }
+
+    /// The row of the table `translations` (the key is put when it is saved).
+    fn row(&self, position: i64) -> crate::entity::translation::Model {
+        crate::entity::translation::Model {
+            key: String::new(),
+            gallery_id: i64::from(self.id),
+            position,
+            url: self.url.clone(),
+            english: self.english.clone(),
+            japanese: self.japanese.clone(),
+            english_key: crate::hitomi::squash(&self.english),
+            japanese_key: crate::hitomi::squash(&self.japanese),
+            exact: self.exact,
+            source: self.source.clone(),
+        }
+    }
+}
+
+impl From<crate::entity::translation::Model> for Translation {
+    fn from(row: crate::entity::translation::Model) -> Self {
+        Translation { id: row.gallery_id as u32, url: row.url, english: row.english, japanese: row.japanese, exact: row.exact, source: row.source }
+    }
+}
+
+/// What `reromanize_works` did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reromanized {
+    /// Works looked at.
+    pub works: usize,
+    /// Works whose romaji came out different.
+    pub changed: usize,
+    /// Searches forgotten, to be done again.
+    pub forgotten: usize,
 }
 
 /// What the sites were asked for a query.
@@ -117,6 +222,42 @@ pub struct Outcome {
     pub total: usize,
     pub results: Vec<Hit>,
     pub sites: Vec<SiteReport>,
+    /// The English title of the query that was searched too (the works of both are in `results`). None when the query has no
+    /// Japanese in it, the translator has no title, or the request has no translator.
+    pub translation: Option<Translated>,
+}
+
+/// Where the English title of a query in Japanese comes from (`translator` of a search): the sites are asked for it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Translator {
+    /// Hitomi.La, and Google Translate when Hitomi.La fails or has nothing.
+    Auto,
+    /// Hitomi.La only: when it has no English title, the English search is left out.
+    Hitomi,
+    /// Google Translate only.
+    Google,
+    /// No English search.
+    None,
+}
+
+impl Translator {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "" | "auto" => Some(Translator::Auto),
+            "hitomi" => Some(Translator::Hitomi),
+            "google" => Some(Translator::Google),
+            "none" => Some(Translator::None),
+            _ => None,
+        }
+    }
+}
+
+/// The English title that was searched too (`Outcome::translation`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Translated {
+    pub text: String,
+    /// `hitomi` or `google`.
+    pub source: String,
 }
 
 /// What a request does about the sites (`live`).
@@ -128,23 +269,23 @@ pub enum Live {
     /// the database answers (`cached`).
     Diff,
     /// Asks every site, whether its answer is up to date or not.
-    On,
+    Force,
 }
 
 impl Live {
-    /// `off`, `diff` and `on`; `0`, `false`, `no` are off, `1`, `true`, `yes` are on. `None` for anything else.
+    /// `off`, `diff` and `force`; `0`, `false`, `no` are off, `on`, `1`, `true`, `yes` are force (`on` is the old name). `None` for anything else.
     pub fn parse(text: &str) -> Option<Live> {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" | "0" | "false" | "no" => Some(Live::Off),
             "diff" | "" => Some(Live::Diff),
-            "on" | "1" | "true" | "yes" => Some(Live::On),
+            "force" | "on" | "1" | "true" | "yes" => Some(Live::Force),
             _ => None,
         }
     }
 }
 
 /// A request to the engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
     /// The words the titles have to have. This is also what the sites are asked.
     pub query: &'a str,
@@ -153,12 +294,17 @@ pub struct Request<'a> {
     pub live: Live,
     /// The most works in the answer.
     pub limit: usize,
+    /// Where the English title of a query in Japanese comes from; the sites are searched for it too.
+    pub translator: Translator,
+    /// The sites (their indexes, `Engine::site_indexes`) that are left out: not asked, and their saved works are not in the
+    /// answer.
+    pub exclude: &'a [usize],
 }
 
 #[cfg(test)]
 impl<'a> Request<'a> {
     pub fn new(query: &'a str) -> Self {
-        Self { query, live: Live::Diff, limit: 100 }
+        Self { query, live: Live::Diff, limit: 100, translator: Translator::None, exclude: &[] }
     }
 }
 
@@ -185,8 +331,10 @@ pub struct Engine {
     order: HashMap<&'static str, usize>,
     /// When the site was asked last, to keep `min_delay_ms` between two requests.
     gates: Vec<Mutex<Option<Instant>>>,
+    /// The shortest time between two requests to each site: the one every request of the program keeps (`wait_turn`).
+    delays: Vec<Duration>,
     store: Arc<SearchStore>,
-    agent: ureq::Agent,
+    client: reqwest::Client,
     config: SearchConfig,
     permits: Semaphore,
     romanizer: Arc<Romanizer>,
@@ -216,25 +364,32 @@ impl Engine {
             .map(|(index, _)| index)
             .collect();
         let order = active.iter().enumerate().map(|(place, &index)| (sites[index].def.name, place)).collect();
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(config.timeout_secs.max(1))))
-            // a 403 or a 500 is an answer to be told apart, not an error of the client
-            .http_status_as_error(false)
+        // a 403 or a 500 is an answer to be told apart, not an error of the client
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(USER_AGENT)
             .build()
-            .into();
+            .expect("the HTTP client");
+
+        let delays = sites.iter().map(|site| Self::delay_of(site, config)).collect();
 
         Arc::new(Self {
+            delays,
             gates: sites.iter().map(|_| Mutex::new(None)).collect(),
             sites,
             active,
             order,
             store,
-            agent,
+            client,
             config: config.clone(),
             permits: Semaphore::new(config.concurrency.max(1)),
             romanizer,
         })
+    }
+
+    /// Where the token of Google Translate is made (`gtranslate::Bridge`; empty: nowhere).
+    fn bridge(&self) -> crate::gtranslate::Bridge<'_> {
+        crate::gtranslate::Bridge { url: &self.config.google_bridge_url, token: &self.config.google_bridge_token }
     }
 
     pub fn max_query_chars(&self) -> usize {
@@ -251,6 +406,32 @@ impl Engine {
         Ok(normalize(&romaji(&normalize(text), &self.romanizer)?))
     }
 
+    /// The index of a site by its name, searched or not (the crawl reads sites that have no search too).
+    pub(crate) fn site_named(&self, name: &str) -> Option<usize> {
+        self.sites.iter().position(|site| site.def.name == name)
+    }
+
+    pub(crate) fn site(&self, index: usize) -> &Site {
+        &self.sites[index]
+    }
+
+    pub(crate) fn store(&self) -> &Arc<SearchStore> {
+        &self.store
+    }
+
+    /// The files of the index host of Hitomi.La, each one read after the turn of the site (`site` is its index).
+    pub(crate) fn hitomi(&self, index: usize) -> HitomiFetch<'_> {
+        HitomiFetch { engine: self, index }
+    }
+
+    /// The links of a page as works, with the romaji of their titles. The romaji is CPU work (the dictionary), so it is done
+    /// on a thread of its own.
+    pub(crate) async fn works_of(self: &Arc<Self>, links: Vec<Link>) -> std::result::Result<Vec<NewWork>, String> {
+        let worker = self.clone();
+
+        tokio::task::spawn_blocking(move || worker.with_romaji(links)).await.map_err(|e| e.to_string())
+    }
+
     /// The works of a list page with the romaji of their titles, which is what a query is matched with. A title
     /// that cannot be converted is its own romaji.
     fn with_romaji(&self, links: Vec<Link>) -> Vec<NewWork> {
@@ -262,6 +443,65 @@ impl Engine {
                 NewWork { path: link.path, title: link.title, romaji: converted }
             })
             .collect()
+    }
+
+    /// Makes the romaji of every saved work again, with the rules of this version of the program. A work whose romaji
+    /// came out different is rewritten, and the searches that listed it are forgotten, so the prefetch (or the next
+    /// request) asks the sites for them again. Does nothing to the works that came out the same, so it is cheap to do on
+    /// every start.
+    pub async fn reromanize_works(&self) -> Result<Reromanized> {
+        const PAGE: u64 = 500;
+
+        let mut done = Reromanized::default();
+        let mut after: Option<(String, String)> = None;
+
+        loop {
+            let works = self.store.works_after(after.as_ref(), PAGE).await?;
+            let Some(last) = works.last() else { break };
+
+            after = Some((last.website.clone(), last.path.clone()));
+            done.works += works.len();
+
+            let changes: Vec<_> = works
+                .into_iter()
+                .filter_map(|work| {
+                    let converted = romaji(&work.title, &self.romanizer).unwrap_or_else(|_| work.title.clone());
+
+                    (converted != work.title_romaji).then_some((work, converted))
+                })
+                .collect();
+
+            if !changes.is_empty() {
+                done.changed += changes.len();
+                done.forgotten += self.store.rewrite_romaji(&changes).await?;
+            }
+
+            // the server keeps answering between two pages
+            tokio::task::yield_now().await;
+        }
+
+        Ok(done)
+    }
+
+    /// The indexes of the sites with these names (case does not matter), for `Request::exclude`. The name that is no site is
+    /// the error.
+    pub fn site_indexes(&self, names: &[String]) -> std::result::Result<Vec<usize>, String> {
+        names
+            .iter()
+            .map(|name| {
+                self.sites
+                    .iter()
+                    .position(|site| site.def.name.eq_ignore_ascii_case(name.trim()))
+                    .ok_or_else(|| name.trim().to_string())
+            })
+            .collect()
+    }
+
+    /// The indexes of every site but Hitomi.La, and whether Hitomi.La is searched at all (`GET /hitomila/search`).
+    pub fn all_but_hitomi(&self) -> Option<Vec<usize>> {
+        let hitomi = self.sites.iter().position(|site| site.def.format == Format::Hitomi)?;
+
+        self.active.contains(&hitomi).then(|| (0..self.sites.len()).filter(|&index| index != hitomi).collect())
     }
 
     pub fn sites_info(&self) -> Vec<SiteInfo> {
@@ -320,12 +560,19 @@ impl Engine {
 
     /// The sites to ask, each with the queries that are missing or old (all of them with `refresh`). A slow site is left
     /// out unless `slow_too`.
-    async fn due(&self, plan: &Plan, slow_too: bool, refresh: bool) -> Result<Vec<(usize, Vec<String>)>> {
+    async fn due(&self, plan: &Plan, slow_too: bool, refresh: bool, exclude: &[usize]) -> Result<Vec<(usize, Vec<String>)>> {
         let now = unix_now();
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut due = Vec::new();
+        // the sites whose list is read to its end are in the database already
+        let crawled = if self.config.skip_crawled && !refresh { self.store.crawl_done().await? } else { Vec::new() };
 
         for &index in &self.active {
+            // a site that the request leaves out is neither asked nor looked up
+            if exclude.contains(&index) || crawled.iter().any(|name| name == self.sites[index].def.name) {
+                continue;
+            }
+
             let site = &self.sites[index];
             let mut missing = Vec::new();
 
@@ -355,20 +602,35 @@ impl Engine {
 
     /// Is the query fetched from every site (in every form a site is asked), and not too long ago? (The prefetch
     /// skips such a query.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn is_fresh(&self, query: &str) -> Result<bool> {
+        self.is_fresh_without(query, &[]).await
+    }
+
+    /// Like `is_fresh`, without the sites in `exclude`.
+    pub async fn is_fresh_without(&self, query: &str, exclude: &[usize]) -> Result<bool> {
         let plan = self.plan(query)?;
 
-        Ok(self.due(&plan, false, false).await?.is_empty())
+        Ok(self.due(&plan, false, false, exclude).await?.is_empty())
+    }
+
+    /// The searched sites whose whole list the crawl has read: their works are saved already, so the prefetch leaves them out and
+    /// only asks the sites that have no list.
+    pub async fn crawled_sites(&self) -> Result<Vec<usize>> {
+        let done = self.store.crawl_done().await?;
+
+        Ok(self.active.iter().copied().filter(|&index| done.iter().any(|name| name == self.sites[index].def.name)).collect())
     }
 
     /// Asks `query` to the sites whose answer is missing or older than `ttl_hours` (a failure: `retry_failed_minutes`),
     /// and saves the works that are new. A request asks the slow sites too (`slow_too`), the prefetch does not.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn fetch(self: &Arc<Self>, query: &str, slow_too: bool) -> Result<Fetched> {
-        self.fetch_with(query, slow_too, false).await
+        self.fetch_with(query, slow_too, false, &[]).await
     }
 
     /// Like `fetch`; with `refresh` every site is asked, whether its answer is up to date or not.
-    pub async fn fetch_with(self: &Arc<Self>, query: &str, slow_too: bool, refresh: bool) -> Result<Fetched> {
+    pub async fn fetch_with(self: &Arc<Self>, query: &str, slow_too: bool, refresh: bool, exclude: &[usize]) -> Result<Fetched> {
         let plan = self.plan(query)?;
 
         if plan.query.is_empty() {
@@ -378,7 +640,7 @@ impl Engine {
         let mut fetched = Fetched::default();
         let mut tasks = tokio::task::JoinSet::new();
 
-        for (index, texts) in self.due(&plan, slow_too, refresh).await? {
+        for (index, texts) in self.due(&plan, slow_too, refresh, exclude).await? {
             fetched.asked.insert(index);
 
             let engine = self.clone();
@@ -398,6 +660,38 @@ impl Engine {
     /// The answer to a request: the sites are asked (unless the request says not to), and then the saved works
     /// whose title has every word of the query are the result.
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
+        let mut outcome = self.search_one(request).await?;
+
+        if request.translator == Translator::None || !crate::query::has_japanese(request.query) {
+            return Ok(outcome);
+        }
+
+        // the English title: its works are in the answer too. A failure leaves the English search out, not the search
+        let Some(english) = self.english_of(request.query, request.translator, request.live).await else { return Ok(outcome) };
+        let text = english.english.trim().to_string();
+
+        if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
+            return Ok(outcome);
+        }
+
+        match self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await {
+            Ok(more) => {
+                let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
+                let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
+
+                outcome.total += added.len();
+                outcome.results.extend(added);
+                outcome.results.truncate(request.limit.max(1));
+                outcome.translation = Some(Translated { text, source: english.source });
+            }
+            Err(e) => log::warn!("cannot search the English title {text:?} of {:?}: {e}", request.query),
+        }
+
+        Ok(outcome)
+    }
+
+    /// The search of one query (`search` does it for the English title too).
+    async fn search_one(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.query);
 
@@ -407,14 +701,17 @@ impl Engine {
 
         let fetched = match request.live {
             Live::Off => Fetched::default(),
-            Live::Diff => self.fetch_with(request.query, true, false).await?,
-            Live::On => self.fetch_with(request.query, true, true).await?,
+            Live::Diff => self.fetch_with(request.query, true, false, request.exclude).await?,
+            Live::Force => self.fetch_with(request.query, true, true, request.exclude).await?,
         };
 
         let mut hits: Vec<Hit> = Vec::new();
-        for work in self.store.candidates(terms.prefilter()).await? {
+        for work in self.store.candidates(&terms.prefilters()).await? {
             // a site that is left out does not answer, whatever was saved of it
             let Some(&index) = self.active.iter().find(|&&i| self.sites[i].def.name == work.website) else { continue };
+            if request.exclude.contains(&index) {
+                continue;
+            }
 
             // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
             if terms.matches_title(&work.title_romaji) {
@@ -428,6 +725,7 @@ impl Engine {
                     path: work.path,
                     title: work.title,
                     title_romaji: work.title_romaji,
+                    language: work.language.map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
                     is_new,
                 });
             }
@@ -436,24 +734,31 @@ impl Engine {
         // the sites in their order; in a site, the works seen last come first (the order of the database)
         hits.sort_by_key(|hit| self.order.get(hit.website.as_str()).copied().unwrap_or(usize::MAX));
 
+        let hits = dedupe_by_url(hits);
         let total = hits.len();
+        let mut hits = hits;
         hits.truncate(request.limit.max(1));
 
         Ok(Outcome {
-            sites: self.reports(&plan, &fetched.asked, request.live != Live::Off).await?,
+            sites: self.reports(&plan, &fetched.asked, request.live != Live::Off, request.exclude).await?,
             input: plan.input,
             terms: terms.keys().into_iter().map(str::to_string).collect(),
             total,
             results: hits,
             query: plan.query,
+            translation: None,
         })
     }
 
-    async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool) -> Result<Vec<SiteReport>> {
+    async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool, exclude: &[usize]) -> Result<Vec<SiteReport>> {
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut reports = Vec::new();
 
         for &index in &self.active {
+            if exclude.contains(&index) {
+                continue;
+            }
+
             let site = &self.sites[index];
             let name = site.def.name;
             let queries = self.queries_for(site, plan);
@@ -496,11 +801,17 @@ impl Engine {
         for query in queries {
             let started = Instant::now();
 
-            let worker = self.clone();
-            let text = query.clone();
-            let outcome = tokio::task::spawn_blocking(move || worker.request(index, &text).map(|links| worker.with_romaji(links)))
-                .await
-                .unwrap_or_else(|e| Err(format!("the request task died: {e}")));
+            // the request is async; the romaji (the analyzer) is CPU work, so it runs on a blocking thread
+            let outcome = match self.request(index, &query).await {
+                Ok(links) => {
+                    let worker = self.clone();
+
+                    tokio::task::spawn_blocking(move || worker.with_romaji(links))
+                        .await
+                        .map_err(|e| format!("the romaji task died: {e}"))
+                }
+                Err(e) => Err(e),
+            };
 
             match &outcome {
                 Ok(links) => log::debug!("search {name}: {} works in {:?} ({query})", links.len(), started.elapsed()),
@@ -519,16 +830,29 @@ impl Engine {
         found
     }
 
-    /// The request to a site (blocking). Waits for its turn first.
-    fn request(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
+    /// The request to a site. Waits for its turn first.
+    async fn request(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
         let site = &self.sites[index];
-        let url = site.search_url(query).ok_or_else(|| "the site has no search".to_string())?;
 
+        if site.def.format == Format::Hitomi {
+            return self.request_hitomi(index, query).await;
+        }
+
+        let url = site.search_url(query).ok_or_else(|| "the site has no search".to_string())?;
+        let (page_url, body) = self.get_page(index, &url).await?;
+
+        site.read(&page_url, &body, self.config.max_results_per_site)
+    }
+
+    /// A page of a site (the address it ended at, and its text), after the turn of the site. A 429 is waited for once. A
+    /// Cloudflare challenge and any status but 200 are errors.
+    pub(crate) async fn get_page(&self, index: usize, url: &str) -> std::result::Result<(String, String), String> {
+        let site = &self.sites[index];
         let mut asked_again = false;
         let (status, page_url, body) = loop {
-            self.wait_turn(index);
+            self.wait_turn(index).await;
 
-            let mut request = self.agent.get(&url).header("Accept-Language", "ja,en;q=0.8").header(
+            let mut request = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             );
@@ -536,7 +860,7 @@ impl Engine {
                 request = request.header("Cookie", cookie);
             }
 
-            let mut response = request.call().map_err(|e| e.to_string())?;
+            let response = request.send().await.map_err(|e| e.to_string())?;
             let status = response.status().as_u16();
 
             // too many requests: wait as long as the site says (not too long), and ask once more
@@ -551,12 +875,12 @@ impl Engine {
 
                 log::debug!("search {}: HTTP 429, asking again in {wait} s", site.def.name);
                 asked_again = true;
-                std::thread::sleep(Duration::from_secs(wait));
+                tokio::time::sleep(Duration::from_secs(wait)).await;
                 continue;
             }
 
-            let page_url = response.get_uri().to_string();
-            let bytes = response.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+            let page_url = response.url().to_string();
+            let bytes = response.bytes().await.map_err(|e| e.to_string())?;
 
             break (status, page_url, String::from_utf8_lossy(&bytes).into_owned());
         };
@@ -564,24 +888,382 @@ impl Engine {
         if is_challenge(status, &body) {
             return Err("blocked by a Cloudflare challenge".to_string());
         }
+        // E-Hentai answers 200 with a short page that says the address is banned for a while: not a page without works
+        if body.len() < 2000 && body.contains("temporarily banned") {
+            return Err(format!("the address is banned by the site for a while ({})", body.trim().chars().take(120).collect::<String>()));
+        }
         if status != 200 {
             return Err(format!("HTTP {status}"));
         }
 
-        site.read(&page_url, &body, self.config.max_results_per_site)
+        Ok((page_url, body))
+    }
+
+    /// Asks for the page of a work, after the turn of the site, and says whether the page is gone (`rule`): `Some(true)` it is gone, `Some(false)`
+    /// it is there, `None` nothing can be said (the request failed, or the answer is no sign).
+    pub(crate) async fn probe(&self, index: usize, url: &str, rule: GoneRule) -> Option<bool> {
+        self.wait_turn(index).await;
+
+        let response = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").send().await.ok()?;
+        let status = response.status().as_u16();
+        let final_path = response.url().path().to_string();
+        let body = response.text().await.ok()?;
+
+        page_status(rule, status, &final_path, &body)
+    }
+
+    /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
+    async fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
+        crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
+    }
+
+    /// Whether the translation can be asked: Hitomi.La is one of the sites.
+    pub fn can_translate(&self) -> bool {
+        self.sites.iter().any(|site| site.def.format == Format::Hitomi)
+    }
+
+    /// The translation of a text, Japanese to English or English to Japanese, from the titles of Hitomi.La (a work has both).
+    /// The answer is saved in the tables `translation_lookups` and `translations` (source `hitomi`): `live` is the one of the
+    /// search, a saved answer is kept for good and is the one that is given unless it is `on`, and a translation that was
+    /// saved for the other direction answers too. A text that Hitomi.La has nothing for is asked again every time (`diff`):
+    /// the site may have the work now. `off` never asks the site. Returns the translations (the ones that are the whole
+    /// title first) and whether they are the saved ones.
+    pub async fn translate_hitomi(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
+        // only the title of the work: the circle, the artist, the event, the series and the tags around it are left out
+        let title = crate::query::work_title(text, from == Lang::Japanese);
+        let text = title.as_str();
+        let key = crate::hitomi::squash(text);
+
+        if key.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        let saved = self.store.translations(&key, "hitomi").await?;
+
+        if live != Live::Force && !saved.is_empty() {
+            return Ok((saved.into_iter().map(Translation::from).collect(), true));
+        }
+
+        // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
+        if live != Live::Force {
+            let others = self.store.translations_with("hitomi", from == Lang::English, &key, false, 20).await?;
+
+            if !others.is_empty() {
+                let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english_key.clone() } else { row.japanese_key.clone() };
+                let mut found: Vec<Translation> = others
+                    .into_iter()
+                    .map(|row| {
+                        let exact = side(&row) == key;
+
+                        Translation { exact, ..Translation::from(row) }
+                    })
+                    .collect();
+
+                found.sort_by_key(|translation| !translation.exact);
+
+                return Ok((found, true));
+            }
+        }
+
+        if live == Live::Off {
+            return Ok((Vec::new(), true));
+        }
+
+        let found = self.ask_translations(text, from).await?;
+        let rows: Vec<_> = found.iter().enumerate().map(|(place, found)| found.row(place as i64)).collect();
+
+        self.store.save_translations(&key, "hitomi", text.trim(), from.code(), unix_now(), &rows).await?;
+
+        Ok((found, false))
+    }
+
+    /// The translation of Google Translate (`gtranslate.rs`), saved in the same tables (source `google`, kept for good):
+    /// the saved one is the answer unless `live` is `on`, and so is a saved translation of the other direction when its title
+    /// is the whole text. Google is always asked when nothing is saved (there is no `off` for it: `off` is `diff`). In
+    /// English a translation from Japanese does not start with `The`: it is taken off (Google puts it in front of a title).
+    pub async fn translate_google(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
+        let key = crate::hitomi::squash(text);
+
+        if key.is_empty() {
+            return Err("nothing to translate".into());
+        }
+
+        if live != Live::Force {
+            if let Some(row) = self.store.translations(&key, "google").await?.into_iter().next() {
+                return Ok((Translation::from(row), true));
+            }
+
+            // the other direction, asked before: its other side is the text
+            if let Some(row) = self.store.translations_with("google", from == Lang::English, &key, true, 1).await?.into_iter().next() {
+                return Ok((Translation { exact: true, ..Translation::from(row) }, true));
+            }
+        }
+
+        let translated = crate::gtranslate::translate(&self.client, self.bridge(), text.trim(), from, from.other()).await?;
+        let translated = if from == Lang::Japanese { without_the(&translated) } else { translated };
+
+        let (english, japanese) = if from == Lang::English { (text.trim().to_string(), translated) } else { (translated, text.trim().to_string()) };
+        let translation = Translation { id: 0, url: String::new(), english, japanese, exact: false, source: "google".into() };
+
+        self.store.save_translations(&key, "google", text.trim(), from.code(), unix_now(), &[translation.row(0)]).await?;
+
+        Ok((translation, false))
+    }
+
+    /// The translation from Hitomi.La, and from Google Translate when Hitomi.La fails or has nothing (`translator=auto`).
+    /// The first translation and whether it is the saved one; an error when neither has one.
+    pub async fn translate_auto(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
+        match self.translate_hitomi(text, from, live).await {
+            Ok((found, saved)) => {
+                if let Some(first) = found.into_iter().next() {
+                    return Ok((first, saved));
+                }
+            }
+            Err(e) => log::warn!("no translation of {text:?} from Hitomi.La: {e}"),
+        }
+
+        self.translate_google(text, from, live).await
+    }
+
+    /// The English title of a Japanese text by the translator of a search (`Translator`): None when the translator has none.
+    /// `auto` asks Hitomi.La, and Google Translate when Hitomi.La fails or has nothing; `hitomi` and `google` only that one.
+    async fn english_of(self: &Arc<Self>, text: &str, translator: Translator, live: Live) -> Option<Translation> {
+        if translator != Translator::Google {
+            match self.translate_hitomi(text, Lang::Japanese, live).await {
+                Ok((found, _)) => {
+                    if let Some(first) = found.into_iter().next() {
+                        return Some(first);
+                    }
+                }
+                Err(e) => log::warn!("no English title of {text:?} from Hitomi.La: {e}"),
+            }
+        }
+
+        if translator != Translator::Hitomi {
+            match self.translate_google(text, Lang::Japanese, live).await {
+                Ok((found, _)) => return Some(found),
+                Err(e) => log::warn!("no English title of {text:?} from Google Translate: {e}"),
+            }
+        }
+
+        None
+    }
+
+    /// The galleries of Hitomi.La for a query.
+    async fn hitomi_galleries(self: &Arc<Self>, index: usize, text: &str) -> Result<Vec<crate::hitomi::Gallery>> {
+        let words = normalize(text);
+        let limit = self.config.max_results_per_site.clamp(1, 20);
+
+        Ok(crate::hitomi::galleries(&mut HitomiFetch { engine: self, index }, &words, limit).await?)
+    }
+
+    /// Asks the site. The galleries are the same work in different languages when their artists, groups, parodies and kind are
+    /// the same and the pages are about as many (`Gallery::same_work`); the romaji in the titles is not needed. The Japanese
+    /// gallery has the Japanese title, and the galleries in English have the English one (the site keeps the Japanese words in
+    /// the index of the galleries of the other languages too, so the text in Japanese finds them all):
+    /// - Japanese to English: the gallery whose Japanese title has the text, and the English galleries that are the same work;
+    /// - English to Japanese: the English galleries whose title has the text, and the Japanese gallery that is the same work (when
+    ///   the first search does not have it, the romaji after the bar of the title is looked up).
+    /// The ones that are the same title come first, then the newest.
+    async fn ask_translations(self: &Arc<Self>, text: &str, from: Lang) -> Result<Vec<Translation>> {
+        use crate::hitomi::{squash, Gallery};
+
+        let Some(index) = self.sites.iter().position(|site| site.def.format == Format::Hitomi) else {
+            return Err("Hitomi.La is not one of the sites".into());
+        };
+
+        let wanted = squash(text);
+
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let english_of = |gallery: &Gallery| gallery.english_title();
+        let is_english = |gallery: &Gallery| gallery.language.as_deref() == Some("english");
+        let japanese_of = |gallery: &Gallery| gallery.japanese_title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+
+        let mut pool = self.hitomi_galleries(index, text).await?;
+        let mut found: Vec<Translation> = Vec::new();
+
+        if from == Lang::English {
+            // the Japanese gallery is not always in the answer: the romaji of the English titles finds it
+            let anchors: Vec<Gallery> = pool.iter().filter(|g| is_english(g) && squash(&english_of(g)).contains(&wanted)).cloned().collect();
+            let mut asked = HashSet::new();
+
+            for anchor in anchors.iter().take(3) {
+                let Some((_, tail)) = anchor.title.rsplit_once(" | ") else { continue };
+
+                if Lang::of(tail) == Some(Lang::English)
+                    && asked.insert(squash(tail))
+                    && !pool.iter().any(|g| japanese_of(g).is_some() && g.same_work(anchor))
+                {
+                    for gallery in self.hitomi_galleries(index, tail).await? {
+                        if !pool.iter().any(|g| g.id == gallery.id) {
+                            pool.push(gallery);
+                        }
+                    }
+                }
+            }
+        }
+
+        for anchor in &pool {
+            let Some(japanese) = japanese_of(anchor) else { continue };
+
+            for other in &pool {
+                if !is_english(other) || !anchor.same_work(other) {
+                    continue;
+                }
+
+                let english = english_of(other);
+                let side = squash(if from == Lang::Japanese { &japanese } else { &english });
+
+                if side.contains(&wanted) {
+                    found.push(Translation {
+                        id: other.id,
+                        url: self.sites[index].address(&other.path()),
+                        exact: side == wanted,
+                        english,
+                        japanese: japanese.clone(),
+                        source: "hitomi".into(),
+                    });
+                }
+            }
+        }
+
+        // the same answer once; the same title first, the order of the galleries (the newest first) otherwise
+        let mut seen = HashSet::new();
+        found.retain(|t| seen.insert((squash(&t.english), squash(&t.japanese))));
+        found.sort_by_key(|translation| !translation.exact);
+
+        Ok(found)
+    }
+
+    /// The time that is kept between two requests to a site: the one `[search] site_delay_ms` names; else the delay of the site
+    /// when it has its own (Hitomi.La: a few dozen small files on a static host); else the longer of `min_delay_ms` and the delay
+    /// the program knows for the site.
+    fn delay_of(site: &Site, config: &SearchConfig) -> Duration {
+        let named = config.site_delay_ms.iter().find(|(name, _)| name.eq_ignore_ascii_case(site.def.name));
+
+        Duration::from_millis(match named {
+            Some((_, ms)) => *ms,
+            None if site.def.format == Format::Hitomi => site.def.delay_ms,
+            None => config.min_delay_ms.max(site.def.delay_ms),
+        })
     }
 
     /// Keeps `min_delay_ms` (or the longer delay of the site) between two requests to the same site.
-    fn wait_turn(&self, index: usize) {
-        let delay = Duration::from_millis(self.config.min_delay_ms.max(self.sites[index].def.delay_ms));
-        let mut last = self.gates[index].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    async fn wait_turn(&self, index: usize) {
+        let delay = self.delays[index];
+        let mut last = self.gates[index].lock().await;
 
         if let Some(at) = *last {
             if let Some(wait) = delay.checked_sub(at.elapsed()) {
-                std::thread::sleep(wait);
+                tokio::time::sleep(wait).await;
             }
         }
         *last = Some(Instant::now());
+    }
+}
+
+/// Reads the files of the index host of Hitomi.La (the whole answer, or a range of it), each one after the turn of the site.
+pub(crate) struct HitomiFetch<'a> {
+    engine: &'a Engine,
+    index: usize,
+}
+
+impl crate::hitomi::Fetch for HitomiFetch<'_> {
+    async fn get(&mut self, path: &str, range: Option<(u64, u64)>) -> std::result::Result<Vec<u8>, String> {
+        self.engine.wait_turn(self.index).await;
+
+        // the version is asked with a changing number, so that no cache answers with an old one
+        let url = if path.ends_with("/version") {
+            format!("{}{path}?_={}", crate::hitomi::ORIGIN, unix_now() * 1000)
+        } else {
+            format!("{}{path}", crate::hitomi::ORIGIN)
+        };
+
+        let mut request = self.engine.client.get(&url).header("Referer", "https://hitomi.la/");
+        if let Some((from, to)) = range {
+            // a range of a file is read as it is: the bytes are counted in the file, and a compressed answer would not be them
+            request = request.header("Range", format!("bytes={from}-{to}")).header("Accept-Encoding", "identity");
+        }
+
+        let response = request.send().await.map_err(|e| format!("{path}: {e}"))?;
+        let status = response.status().as_u16();
+
+        if status != 200 && status != 206 {
+            return Err(format!("{path}: HTTP {status}"));
+        }
+        if range.is_some() && status == 200 {
+            // the whole file of an index is far too big to read
+            return Err(format!("{path}: the site does not answer a Range request"));
+        }
+
+        response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|e| format!("{path}: {e}"))
+    }
+}
+
+/// One hit for each address: the same page saved twice (`/g/1/` and `/g/1`, two sites that answer with the same address) is
+/// one result. The first one (the order of the answer) stays, and is new when any of them is.
+fn dedupe_by_url(hits: Vec<Hit>) -> Vec<Hit> {
+    let mut places: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<Hit> = Vec::new();
+
+    for hit in hits {
+        let key = hit.url.split('#').next().unwrap_or(&hit.url).trim_end_matches('/').to_lowercase();
+
+        match places.get(&key) {
+            Some(&place) => kept[place].is_new |= hit.is_new,
+            None => {
+                places.insert(key, kept.len());
+                kept.push(hit);
+            }
+        }
+    }
+
+    kept
+}
+
+/// How a site tells that the page of a work is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoneRule {
+    /// The page answers 404 or 410 (RokuHentai: or the 503 with "temporarily unavailable ... Here are some results that might be useful to you").
+    NotFound,
+    /// The page redirects to `/404/` (AsmHentai, HentaiEra).
+    RedirectsTo404,
+    /// The page answers 200 with a sentence that says the work is not there (Wnacg).
+    Sentence(&'static str),
+}
+
+/// The sites whose pages tell that a work is gone, and how. (Hitomi.La's page is the same shell for any id: its index file says which
+/// galleries there are. E-Hentai answers 200 with a short text, and it bans an address that asks more than a page every few seconds.)
+pub fn gone_rule(site: &str) -> Option<GoneRule> {
+    match site {
+        "RokuHentai" | "DLsite" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" => Some(GoneRule::NotFound),
+        "AsmHentai" | "HentaiEra" => Some(GoneRule::RedirectsTo404),
+        "Wnacg" => Some(GoneRule::Sentence("您要訪問的漫畫不存在")),
+        _ => None,
+    }
+}
+
+/// What the answer for the page of a work says under `rule`: `Some(true)` it is gone, `Some(false)` it is there (a 200 without the sign), `None`
+/// no sign (another 503, 429, a failure of the site, ...).
+fn page_status(rule: GoneRule, status: u16, final_path: &str, body: &str) -> Option<bool> {
+    match rule {
+        GoneRule::NotFound => {
+            let lower = body.to_lowercase();
+
+            match status {
+                200 => Some(false),
+                404 | 410 => Some(true),
+                503 if lower.contains("temporarily unavailable") && lower.contains("results that might be useful") => Some(true),
+                _ => None,
+            }
+        }
+        GoneRule::RedirectsTo404 if final_path.trim_end_matches('/') == "/404" => Some(true),
+        GoneRule::RedirectsTo404 => (status == 200).then_some(false),
+        GoneRule::Sentence(sentence) if status == 200 => Some(body.contains(sentence)),
+        GoneRule::Sentence(_) => None,
     }
 }
 
@@ -704,6 +1386,29 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_excluded_site_is_not_asked_not_looked_up_and_not_reported() {
+        let (engine, hits, _) = setup(&config()).await;
+        let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();
+        assert_eq!(leave_out.len(), 1, "the names are matched without regard to case");
+        assert_eq!(engine.site_indexes(&["Nowhere".to_string()]), Err("Nowhere".to_string()));
+
+        // the other two sites are asked, the good one is not, and its works are not in the answer
+        let outcome = engine.search(&Request { exclude: &leave_out, ..Request::new("q") }).await.unwrap();
+        assert_eq!(requests(&hits), (0, 1, 1));
+        assert_eq!(outcome.sites.iter().map(|s| s.website.as_str()).collect::<Vec<_>>(), ["Failing", "Blocked"]);
+        assert!(outcome.results.is_empty());
+
+        // asked later without the exclusion, the site is asked (nothing was saved for it), and it answers
+        let all = engine.search(&Request::new("q")).await.unwrap();
+        assert_eq!(all.results.len(), 2);
+        assert_eq!(requests(&hits).0, 1);
+
+        // its saved works stay out of the answer while it is excluded: nothing is looked up
+        let again = engine.search(&Request { live: Live::Off, exclude: &leave_out, ..Request::new("q") }).await.unwrap();
+        assert!(again.results.is_empty());
+    }
+
+    #[tokio::test]
     async fn the_multiplication_sign_stays_only_for_the_sites_that_need_it() {
         let (port, _) = server().await;
         let work = format!(r"^http://127\.0\.0\.1:{port}/work/\d+");
@@ -713,17 +1418,18 @@ pub(crate) mod tests {
         let store = Arc::new(SearchStore::in_memory().await.unwrap());
         let engine = Engine::with_sites(sites, &config(), store.clone(), crate::testing::romanizer_arc());
 
-        let outcome = engine.search(&Request { query: "COMIC  E×E 11", live: Live::Diff, limit: 10 }).await.unwrap();
+        let outcome = engine.search(&Request { query: "COMIC  E×E 11", live: Live::Diff, limit: 10, translator: Translator::None, exclude: &[] }).await.unwrap();
 
         assert_eq!(outcome.query, "COMIC ExE 11", "the answer is written with x");
         assert_eq!(store.states("COMIC ExE 11").await.unwrap().keys().collect::<Vec<_>>(), ["Plain"]);
         assert_eq!(store.states("COMIC E×E 11").await.unwrap().keys().collect::<Vec<_>>(), ["Times"]);
         let asked: Vec<_> = outcome.sites.iter().map(|site| (site.website.as_str(), site.queries.clone())).collect();
         assert_eq!(asked, [("Plain", vec!["COMIC ExE 11".to_string()]), ("Times", vec!["COMIC E×E 11".to_string()])]);
-        assert_eq!(outcome.total, 4, "both sites answer, and the sign does not matter to the match");
+        // both sites answer (the same two addresses: they are 2 results, not 4), and the sign does not matter to the match
+        assert_eq!(outcome.total, 2);
 
         // the bot writes the sign as x already: between capitals it is put back for the site
-        let outcome = engine.search(&Request { query: "COMIC ExE 12", live: Live::Diff, limit: 10 }).await.unwrap();
+        let outcome = engine.search(&Request { query: "COMIC ExE 12", live: Live::Diff, limit: 10, translator: Translator::None, exclude: &[] }).await.unwrap();
         let asked: Vec<_> = outcome.sites.iter().map(|site| site.queries.clone()).collect();
         assert_eq!(asked, [vec!["COMIC ExE 12".to_string()], vec!["COMIC E×E 12".to_string()]]);
     }
@@ -768,8 +1474,8 @@ pub(crate) mod tests {
         assert!(first.results.iter().all(|h| h.is_new));
         assert!(again.results.iter().all(|h| !h.is_new), "and saved nothing");
 
-        // live=on asks the sites whose answer is up to date too
-        let all = engine.search(&Request { live: Live::On, ..Request::new("q") }).await.unwrap();
+        // live=force asks the sites whose answer is up to date too
+        let all = engine.search(&Request { live: Live::Force, ..Request::new("q") }).await.unwrap();
         assert_eq!(requests(&hits), (2, 2, 2), "every site is asked again, a failure included");
         assert!(all.sites.iter().filter(|s| s.status != "failed").all(|s| s.status == "searched"));
         assert_eq!(all.results.len(), 2);
@@ -790,6 +1496,28 @@ pub(crate) mod tests {
         // another query is another answer
         engine.search(&Request::new("other")).await.unwrap();
         assert_eq!(requests(&hits), (3, 3, 3));
+    }
+
+    #[tokio::test]
+    async fn a_work_whose_romaji_changed_is_written_again_and_its_search_is_forgotten() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into() };
+
+        // saved by an older version: the romaji of 彼女を was "kanojo wo"; the second work is the same as now
+        store.save("q1", "Good", 7, &Ok(vec![work("/work/1", "彼女を", "kanojo wo")]), false).await.unwrap();
+        store.save("q2", "Good", 8, &Ok(vec![work("/work/2", "comic", "comic")]), false).await.unwrap();
+
+        let done = engine.reromanize_works().await.unwrap();
+
+        assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
+        let saved = store.candidates(&[]).await.unwrap();
+        let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
+        assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
+        assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
+        assert!(!store.states("q2").await.unwrap().is_empty(), "the other one stays");
+
+        // the second time there is nothing to do
+        assert_eq!(engine.reromanize_works().await.unwrap(), Reromanized { works: 2, changed: 0, forgotten: 0 });
     }
 
     #[tokio::test]
@@ -840,6 +1568,99 @@ pub(crate) mod tests {
         assert_eq!(titles.len(), 0, "the paths are the same for every query, so a page keeps the last title the site gave");
         assert_eq!(outcome.sites[0].status, "not searched");
         assert_eq!(requests(&hits), (2, 2, 2));
+    }
+
+    #[test]
+    fn the_the_of_a_translated_title_is_taken_off() {
+        assert_eq!(without_the("The Phaethon Assault"), "Phaethon Assault");
+        assert_eq!(without_the("the sister"), "sister");
+        assert_eq!(without_the("Theory of Love"), "Theory of Love");
+        assert_eq!(without_the("The"), "The");
+        assert_eq!(without_the("  Then and Now "), "Then and Now");
+    }
+
+    #[test]
+    fn the_language_of_a_text_is_japanese_or_english_only() {
+        assert_eq!(Lang::of("姉弟でシたらいけません"), Some(Lang::Japanese));
+        assert_eq!(Lang::of("COMIC 快楽天 2026"), Some(Lang::Japanese));
+        assert_eq!(Lang::of("Siblings Shouldn't Do It 2"), Some(Lang::English));
+        assert_eq!(Lang::of("Café"), Some(Lang::English));
+        assert_eq!(Lang::of("형제"), None);
+        assert_eq!(Lang::of("Привет"), None);
+        assert_eq!(Lang::of("123 !?"), None);
+    }
+
+    #[tokio::test]
+    async fn the_translations_are_saved_for_good() {
+        let (engine, _, store) = setup(&config()).await;
+        let row = crate::entity::translation::Model {
+            key: String::new(),
+            gallery_id: 7,
+            position: 0,
+            url: "https://hitomi.la/galleries/7.html".into(),
+            english: "Seven".into(),
+            japanese: "七".into(),
+            english_key: "seven".into(),
+            japanese_key: "七".into(),
+            exact: true,
+            source: "hitomi".into(),
+        };
+
+        // never asked, and the site is not to be asked: nothing
+        assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
+        // punctuation alone is nothing to look for
+        assert_eq!(engine.translate_hitomi(" !? ", Lang::Japanese, Live::Force).await.unwrap(), (vec![], false));
+
+        // a saved answer is the one that is given, whatever `live` says unless it is `on`
+        store.save_translations("七", "hitomi", "七", "ja", unix_now(), &[row.clone()]).await.unwrap();
+        let (found, saved) = engine.translate_hitomi("七", Lang::Japanese, Live::Diff).await.unwrap();
+        assert!(saved);
+        assert_eq!((found[0].id, found[0].text(Lang::English), found[0].text(Lang::Japanese), found[0].exact), (7, "Seven", "七", true));
+        assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
+
+        // a saved answer never gets old: only `on` asks the site again (the engine of the tests has no Hitomi.La: that is an error)
+        store.save_translations("七", "hitomi", "七", "ja", 1, &[row.clone()]).await.unwrap();
+        assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 1);
+        assert!(engine.translate_hitomi("七", Lang::Japanese, Live::Force).await.is_err());
+        assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
+
+        // a translation that was asked from the other side answers too: Japanese to English saved, English to Japanese asked
+        store.save_translations("九", "hitomi", "九", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 9, english: "Nine Lives".into(), japanese: "九つの命".into(), english_key: "ninelives".into(), japanese_key: "九つの命".into(), ..row.clone() }]).await.unwrap();
+        let (found, saved) = engine.translate_hitomi("Nine", Lang::English, Live::Diff).await.unwrap();
+        assert!(saved);
+        assert_eq!((found[0].japanese.as_str(), found[0].exact), ("九つの命", false));
+        assert_eq!(engine.translate_hitomi("九つの命", Lang::Japanese, Live::Force).await.is_err(), true, "`on` asks the site");
+        assert_eq!(engine.translate_hitomi("Nine Lives", Lang::English, Live::Off).await.unwrap().0[0].exact, true);
+
+        // Google Translate is cached the same way: the saved translation is the answer (no request), `off` needs a saved one
+        store.save_translations("十", "google", "十", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 0, url: String::new(), english: "Ten".into(), japanese: "十".into(), english_key: "ten".into(), japanese_key: "十".into(), source: "google".into(), ..row.clone() }]).await.unwrap();
+        let (translation, saved) = engine.translate_google("十", Lang::Japanese, Live::Diff).await.unwrap();
+        assert_eq!((translation.english.as_str(), translation.source.as_str(), saved), ("Ten", "google", true));
+        assert_eq!(engine.translate_google("十", Lang::Japanese, Live::Off).await.unwrap().0.english, "Ten", "`off` is `diff` for Google");
+        // the other direction: Japanese to English was saved, so English to Japanese is the saved one (the whole text only)
+        let (back, saved) = engine.translate_google("Ten", Lang::English, Live::Diff).await.unwrap();
+        assert_eq!((back.japanese.as_str(), saved), ("十", true));
+
+        // a text that found nothing is asked again (`diff`), not taken from the lookup; `off` never asks
+        store.save_translations("八", "hitomi", "八", "ja", unix_now(), &[]).await.unwrap();
+        assert!(engine.translate_hitomi("八", Lang::Japanese, Live::Diff).await.is_err());
+        assert_eq!(engine.translate_hitomi("八", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
+    }
+
+    #[tokio::test]
+    async fn the_same_address_is_one_result() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+
+        // one page saved with and without the slash at the end, and a different page
+        store.save("a", "Good", 1, &Ok(vec![work("/work/10/", "alpha one"), work("/work/11", "alpha two")]), false).await.unwrap();
+        store.save("b", "Good", 2, &Ok(vec![work("/work/10", "alpha one")]), false).await.unwrap();
+
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("alpha") }).await.unwrap();
+
+        assert_eq!(outcome.total, 2, "the total counts a page once");
+        assert_eq!(outcome.results.len(), 2);
+        assert_eq!(outcome.results.iter().filter(|hit| hit.title == "alpha one").count(), 1);
     }
 
     #[tokio::test]
@@ -967,7 +1788,7 @@ pub(crate) mod tests {
         // whatever the query, this site lists the same work
         engine.search(&Request::new("anything")).await.unwrap();
 
-        let saved = store.candidates(None).await.unwrap();
+        let saved = store.candidates(&[]).await.unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].title, "COMIC快楽天 2026年7月号", "the title as the site writes it");
         assert!(saved[0].title_romaji.contains("kairakuten"), "{}", saved[0].title_romaji);
@@ -1036,7 +1857,7 @@ pub(crate) mod tests {
         assert_eq!(info.len(), 28);
         assert!(info.iter().filter(|s| s.active).all(|s| s.support == "ready" && s.has_search));
         assert!(info.iter().any(|s| s.name == "IMHentai" && !s.active && s.support == "cloudflare"));
-        assert!(!info.iter().find(|s| s.name == "Hitomi.La").unwrap().active);
+        assert!(info.iter().find(|s| s.name == "Hitomi.La").unwrap().active, "it is searched through its index files");
 
         let trying = Engine::new(
             &SearchConfig { try_unsupported: true, ..config() },
@@ -1045,6 +1866,47 @@ pub(crate) mod tests {
         );
         assert!(trying.sites_info().iter().find(|s| s.name == "IMHentai").unwrap().active);
         assert!(!trying.sites_info().iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
+    }
+
+    #[test]
+    fn a_page_that_is_gone_is_told_by_the_rule_of_its_site_and_a_site_that_is_down_is_no_sign() {
+        let notice = "Roku Hentai is temporarily unavailable. Please try again shortly. Here are some results that might be useful to you.";
+
+        assert_eq!(page_status(GoneRule::NotFound, 503, "/x", notice), Some(true));
+        assert_eq!(page_status(GoneRule::NotFound, 404, "/x", ""), Some(true));
+        assert_eq!(page_status(GoneRule::NotFound, 410, "/x", ""), Some(true));
+        assert_eq!(page_status(GoneRule::NotFound, 200, "/x", ""), Some(false));
+        assert_eq!(page_status(GoneRule::NotFound, 503, "/x", "Service Unavailable"), None, "a 503 without the notice is a site that is down");
+        assert_eq!(page_status(GoneRule::NotFound, 429, "/x", ""), None);
+
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 200, "/404/", ""), Some(true));
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 404, "/404", ""), Some(true));
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 200, "/g/1/", ""), Some(false));
+        assert_eq!(page_status(GoneRule::RedirectsTo404, 503, "/g/1/", ""), None);
+
+        let rule = GoneRule::Sentence("not here");
+        assert_eq!(page_status(rule, 200, "/p", "<p>the work is not here!</p>"), Some(true));
+        assert_eq!(page_status(rule, 200, "/p", "<p>a work</p>"), Some(false));
+        assert_eq!(page_status(rule, 500, "/p", "not here"), None);
+    }
+
+    #[tokio::test]
+    async fn a_crawled_site_is_not_asked_live_when_the_setting_is_on_unless_live_is_force() {
+        let (engine, hits, _) = setup(&SearchConfig { skip_crawled: true, ..config() }).await;
+        engine.store().mark_crawled("Good", unix_now()).await.unwrap();
+
+        engine.search(&Request::new("q")).await.unwrap();
+        assert_eq!(requests(&hits).0, 0, "the list of the site is in the database: it is not asked");
+        assert_eq!(requests(&hits).1, 1, "a site whose list is not read is asked as before");
+
+        engine.search(&Request { live: Live::Force, ..Request::new("q") }).await.unwrap();
+        assert_eq!(requests(&hits).0, 1, "live=force asks it");
+
+        // the setting is off: the crawled site is asked like any other
+        let (plain, hits_plain, _) = setup(&config()).await;
+        plain.store().mark_crawled("Good", unix_now()).await.unwrap();
+        plain.search(&Request::new("q")).await.unwrap();
+        assert_eq!(requests(&hits_plain).0, 1);
     }
 
     #[tokio::test]
@@ -1088,5 +1950,43 @@ pub(crate) mod tests {
         engine.search(&Request::new("two")).await.unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_delay_of_a_site_in_the_settings_replaces_the_minimum_and_is_kept_by_every_kind_of_request() {
+        // 'good' (case does not matter) waits 400 ms, the others the 0 of min_delay_ms
+        let config = SearchConfig { site_delay_ms: [("good".to_string(), 400)].into(), ..config() };
+        let (engine, _, _) = setup(&config).await;
+        let good = engine.site_named("Good").unwrap();
+        let failing = engine.site_named("Failing").unwrap();
+        let (_, url) = {
+            let site = engine.site(good);
+            (site.def.name, site.search_url("x").unwrap())
+        };
+        let started = Instant::now();
+
+        // a search and a page of the crawl are two kinds of request to one site: they share its turn
+        engine.search(&Request::new("one")).await.unwrap();
+        engine.get_page(good, &url).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(400), "the second request waited for the first: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        let _ = engine.get_page(failing, &engine.site(failing).search_url("x").unwrap()).await;
+        let _ = engine.get_page(failing, &engine.site(failing).search_url("y").unwrap()).await;
+        assert!(started.elapsed() < Duration::from_millis(400), "another site is not slowed: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_language_of_a_result_is_a_list_and_empty_when_the_title_names_none() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+
+        store.save_crawled("Good", 1, &[work("/work/1", "kanojo [CN,EN,JP,KR]"), work("/work/2", "kanojo plain")], None).await.unwrap();
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
+        let languages: Vec<_> = outcome.results.iter().map(|hit| (hit.path.as_str(), hit.language.clone())).collect();
+
+        assert!(languages.contains(&("/work/1", vec!["zh".to_string(), "en".to_string(), "ja".to_string(), "ko".to_string()])), "{languages:?}");
+        assert!(languages.contains(&("/work/2", Vec::new())), "{languages:?}");
+        assert_eq!(serde_json::to_value(&outcome.results[0]).unwrap()["language"].is_array(), true);
     }
 }

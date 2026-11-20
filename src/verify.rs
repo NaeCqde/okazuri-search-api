@@ -1,0 +1,116 @@
+//! Looking at the page of every saved work of the sites that tell when a work is gone, once in `interval_days`, and marking the works whose
+//! page is gone (`[verify]`).
+//!
+//! Each site is asked on its own, one page every `interval / works` (900 000 works in 30 days are a page every 2.9 s), never closer than `min_pause_ms` (5 s: a site with more
+//! than 518 400 works is looked at over more than `interval_days`) and the delay of the site. The works that were never looked at come first, then the oldest look. A site still lists a work whose page is gone, so the
+//! row stays with no title (`works.deleted`): a list, the crawl or an import does not save the work again, and no search finds it.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::config::VerifyConfig;
+use crate::engine::{gone_rule, Engine, GoneRule};
+use crate::utils::Result;
+
+/// How many pages are looked at before the answers are written.
+const BATCH: u64 = 50;
+
+pub struct Verifier {
+    engine: Arc<Engine>,
+    config: VerifyConfig,
+    /// (index of the site in the engine, its name, how its pages say that a work is gone)
+    sites: Vec<(usize, &'static str, GoneRule)>,
+}
+
+/// Every site that has a rule, by name.
+const NAMES: &[&str] = &["RokuHentai", "DLsite", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg"];
+
+impl Verifier {
+    /// An unknown site, or one whose pages do not tell, is an error.
+    pub fn new(engine: Arc<Engine>, config: VerifyConfig) -> Result<Self> {
+        let names: Vec<String> = if config.sites.is_empty() { NAMES.iter().map(|s| s.to_string()).collect() } else { config.sites.clone() };
+        let mut sites = Vec::new();
+
+        for name in names {
+            let Some(known) = NAMES.iter().find(|known| **known == name) else {
+                return Err(format!("[verify] sites: {name} is not a site whose pages tell that a work is gone ({})", NAMES.join(", ")).into());
+            };
+            let index = engine.site_named(known).ok_or_else(|| format!("[verify] sites: {known} is not one of the sites of this program"))?;
+            let rule = gone_rule(known).ok_or_else(|| format!("[verify] sites: no rule for {known}"))?;
+            sites.push((index, *known, rule));
+        }
+
+        Ok(Self { engine, config, sites })
+    }
+
+    pub async fn run(self: Arc<Self>) {
+        log::info!("verify: {} sites, every page once in {} days", self.sites.len(), self.config.interval_days);
+
+        let mut tasks = Vec::new();
+        for &(index, name, rule) in &self.sites {
+            tasks.push(tokio::spawn(self.clone().site(index, name, rule)));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// The loop of one site.
+    async fn site(self: Arc<Self>, index: usize, name: &'static str, rule: GoneRule) {
+        let mut works = 0u64;
+        let mut batches = 0u64;
+
+        loop {
+            // the number of works changes slowly (the crawl): it is counted again now and then
+            if batches % 20 == 0 {
+                works = self.engine.store().counts_of(name).await.unwrap_or(works).max(1);
+            }
+            batches += 1;
+
+            match self.batch(index, name, rule, works).await {
+                Ok(0) => tokio::time::sleep(Duration::from_secs(3600)).await,
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("verify {name}: {e}, again in 10 minutes");
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                }
+            }
+        }
+    }
+
+    /// Looks at the pages of `name` that are due, `BATCH` of them at the most. Returns how many were looked at.
+    async fn batch(&self, index: usize, name: &'static str, rule: GoneRule, works: u64) -> Result<usize> {
+        let before = now() - self.config.interval_days.max(1) as i64 * 86_400;
+        let due = self.engine.store().due_checks(name, before, BATCH).await?;
+        let spacing = Duration::from_millis((self.config.interval_days.max(1) * 86_400_000 / works).max(self.config.min_pause_ms));
+        let mut results = Vec::new();
+
+        for path in due {
+            let started = Instant::now();
+            let url = self.engine.site(index).address(&path);
+
+            // a page that cannot be read now is looked at again by a later batch
+            if let Some(gone) = self.engine.probe(index, &url, rule).await {
+                results.push((path, gone));
+            }
+
+            // the pages of the site are spread over the whole interval
+            if let Some(rest) = spacing.checked_sub(started.elapsed()) {
+                tokio::time::sleep(rest).await;
+            }
+        }
+
+        let removed = results.iter().filter(|(_, gone)| *gone).count();
+        self.engine.store().record_checks(name, &results, now()).await?;
+
+        if removed > 0 {
+            log::info!("verify {name}: {} pages looked at, {removed} gone", results.len());
+        }
+
+        Ok(results.len())
+    }
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}

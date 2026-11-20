@@ -62,6 +62,8 @@ pub enum Format {
     /// JSON with the cards of the results, as HTML, in the array of this key (RokuHentai: the page is drawn
     /// by JavaScript from this answer).
     JsonCards(&'static str),
+    /// No page: the answer is read from the index files of the site (`hitomi.rs`).
+    Hitomi,
 }
 
 /// Where the list page of a site keeps the title of a work. A link whose card has the price, the number of
@@ -178,15 +180,21 @@ pub const SITES: &[SiteDef] = &[
             "the pattern matches every page of the site, so only product pages of the book store count",
         )
     },
-    site(
-        "Hitomi.La",
-        false,
-        "https://hitomi.la",
-        r"^https://hitomi\.la/[a-z]+/.+",
-        None,
-        Support::JavaScript,
-        "analysed (2026-10): the search is JavaScript over binary index files (SHA-256 of each word, a B-tree read with Range requests on ltn.gold-usergeneratedcontent.net), which gives gallery ids; the titles are one more file per id. Possible, but dozens of requests for one query, so it is not done",
-    ),
+    SiteDef {
+        format: Format::Hitomi,
+        // the index files are on a static host: a short wait between two of them is enough (a query is some 20 requests)
+        delay_ms: 150,
+        ..site(
+            "Hitomi.La",
+            false,
+            "https://hitomi.la",
+            r"^https://hitomi\.la/[a-z]+/.+",
+            // the page of the site that has the search box; this program does not ask it (`hitomi.rs`)
+            Some("https://hitomi.la/search.html?{q}"),
+            Support::Ready,
+            "no search page: the words of the query are looked up in the index files that the site's JavaScript reads (SHA-256 of a word, a B-tree, Range requests), the ids are intersected and the title of each gallery is read. The words of Japanese titles and of English titles are in the same index, so a query in Japanese finds the English titles too; the work is kept with both titles",
+        )
+    },
     site(
         "Anime-Sharing",
         false,
@@ -524,6 +532,7 @@ impl Site {
     pub fn read(&self, page_url: &str, body: &str, limit: usize) -> Result<Vec<Link>, String> {
         match self.def.format {
             Format::Html => Ok(self.extract(page_url, body, limit)),
+            Format::Hitomi => Err("the answer of this site is not a page".to_string()),
             Format::JsonCards(key) => {
                 let json: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("the answer is not JSON: {e}"))?;
                 let cards = json.get(key).and_then(|cards| cards.as_array()).ok_or_else(|| format!("the answer has no \"{key}\""))?;
@@ -565,11 +574,16 @@ impl Site {
             let Some(path) = self.path_of(&url) else { continue };
             let Some(title) = self.title_of(attributes, &caps[2]) else { continue };
 
-            match links.iter_mut().find(|link| link.path == path) {
+            match links.iter_mut().find(|link| same_page(&link.path, &path)) {
                 // the same work is linked more than once: keep the longest title
                 Some(known) => {
                     if title.chars().count() > known.title.chars().count() {
                         known.title = title;
+                    }
+                    // `/g/1/` and `/g/1`: a site that links the page without the slash too is one that does not need it,
+                    // so that is the one kept; a site that only links it with the slash keeps the slash
+                    if known.path.ends_with('/') && !path.ends_with('/') {
+                        known.path = path;
                     }
                 }
                 None => links.push(Link { path, title }),
@@ -593,6 +607,30 @@ impl Site {
         };
 
         (!title.is_empty()).then_some(title)
+    }
+}
+
+/// `/g/1/` and `/g/1` are the same page (the part before a `?` is what counts).
+pub fn same_page(a: &str, b: &str) -> bool {
+    a == b || (toggle_slash(a) == b && a != b)
+}
+
+/// The path with the slash at the end of its path part put on or taken off (the path as it is when that is the root).
+pub fn toggle_slash(path: &str) -> String {
+    let (base, query) = match path.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (path, None),
+    };
+
+    let base = match base {
+        "" | "/" => base.to_string(),
+        _ if base.ends_with('/') => base.trim_end_matches('/').to_string(),
+        _ => format!("{base}/"),
+    };
+
+    match query {
+        Some(query) => format!("{base}?{query}"),
+        None => base,
     }
 }
 
@@ -767,6 +805,26 @@ mod tests {
         assert!(site("DLsite").search_url("COMIC E×E 11").unwrap().contains("keyword/%22COMIC+E%C3%97E+11%22/"));
         assert!(site("FANZA").search_url("COMIC E×E 11").unwrap().ends_with("searchstr=%22COMIC%20E%C3%97E%2011%22/"));
         assert!(site("FANZA").search_url("快楽天 2026").unwrap().ends_with("searchstr=%E5%BF%AB%E6%A5%BD%E5%A4%A9%202026/"));
+    }
+
+    #[test]
+    fn the_two_forms_of_a_path_are_one_page() {
+        assert!(same_page("/g/1/", "/g/1"));
+        assert!(same_page("/g/1", "/g/1/"));
+        assert!(same_page("/works?uuid=a", "/works/?uuid=a"));
+        assert!(!same_page("/works?uuid=a", "/works?uuid=b"));
+        assert!(!same_page("/g/1/", "/g/2/"));
+        assert_eq!(toggle_slash("/"), "/");
+        assert_eq!(toggle_slash("/g/1"), "/g/1/");
+        assert_eq!(toggle_slash("/g/1/"), "/g/1");
+    }
+
+    #[test]
+    fn a_page_linked_in_both_forms_is_one_work_without_the_slash_when_the_site_links_that_too() {
+        let both = r#"<a href="/gallery/1/">One</a> <a href="/gallery/1">One (longer)</a> <a href="/gallery/2/">Two</a> <a href="/gallery/2/">Two</a>"#;
+        let links = site("HentaiEnvy").extract("https://hentaienvy.com/search/?key=x", both, 50);
+
+        assert_eq!(links, vec![link("/gallery/1", "One (longer)"), link("/gallery/2/", "Two")], "a site that only has the slash keeps it");
     }
 
     #[test]

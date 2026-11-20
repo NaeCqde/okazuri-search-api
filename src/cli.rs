@@ -8,6 +8,8 @@ use crate::config::{self, Config};
 use crate::cron::{expand, Scheduler};
 use crate::d1::D1Client;
 use crate::engine::{Engine, Live, Request};
+use crate::crawl::Crawler;
+use crate::verify::Verifier;
 use crate::prefetch::Prefetcher;
 use crate::romanizer::{Loanwords, Romanizer};
 use crate::store::SearchStore;
@@ -31,8 +33,8 @@ serve                                  Start the server, and what the config swi
     --port <port>        Port to listen on (default: [server] port, 8000)\n\
 search <words>...                      Search the sites for the words (in romaji), save what they list, and print the\n\
                                        saved works whose title has all the words\n\
-    --live <off|diff|on> off: do not ask the sites, answer from the database; diff (default): ask the\n\
-                         queries and sites that are missing or older than [search] ttl_hours; on: ask every\n\
+    --live <off|diff|force> off: do not ask the sites, answer from the database; diff (default): ask the\n\
+                         queries and sites that are missing or older than [search] ttl_hours; force: ask every\n\
                          site\n\
     --limit <n>          The most works to print (default: [search] max_results)\n\
     --config <path>      Config file\n\
@@ -41,13 +43,30 @@ sync                                   Copy the magazine tables of the D1 databa
 prefetch                               Search for the issues of the copy once through ([prefetch])\n\
     --limit <n>          The most queries (default: [prefetch] max_queries_per_round)\n\
     --config <path>      Config file\n\
+reromanize                             Make the romaji of the saved works again with the rules of this version, and\n\
+                                       forget the searches that listed a work whose romaji changed (the prefetch,\n\
+                                       which the server runs at its start, asks the sites for them again). Stop the\n\
+                                       server first\n\
+    --config <path>      Config file\n\
+relanguage                             Read the language of every saved title again with the rules of this version (`works.language`),
+                                       and write the works whose language is different now. Safe while the server runs
+    --config <path>      Config file
+export <file>                          Write the saved works to a file (JSON Lines, compressed with brotli), to put the works
+                                       that a machine crawled into the database of another (`import`)
+    --site <name>        Only the works of this site (more than once for more sites)
+    --since <unix time>  Only the works saved at this time or later
+    --config <path>      Config file
+import <file>...                        Read the files that `export` wrote into the database; the works saved already stay as they are
+    --mark-done <name>   The whole list of this site is read now (the files of every shard are in): the crawl then reads only its
+                         newest pages again, and the prefetch leaves the site to it (more than once for more sites)
+    --config <path>      Config file
 convert [text]...                      Print the romaji of the text. Without text, every line of the\n\
                                        standard input is converted and printed as a line\n\
     --loanwords <romaji|english>       How to write loanwords spelled in hiragana (default: romaji)\n\
     --config <path>      Config file, for [exceptions]\n\
 --help, -h                             Show this help\n\n\
 GET /romaji?q=<text>[&loanwords=romaji|english]   the romaji as text/plain\n\
-GET /okazuri/search?q=<words>[&live=off|diff|on][&limit=n]\n\
+GET /okazuri/search?q=<words>[&live=off|diff|force][&limit=n]\n\
                                                      the works whose title has all the words ([search])\n\
 GET /okazuri/sites                                   the sites                          ([search])\n\
 GET /health                                          ok";
@@ -59,6 +78,10 @@ pub enum Command {
     Search { query: String, live: Live, limit: Option<usize>, config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
+    Reromanize { config: Option<PathBuf> },
+    Relanguage { config: Option<PathBuf> },
+    Export { file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf> },
+    Import { files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf> },
     Help,
 }
 
@@ -75,6 +98,10 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "search" => parse_search(rest),
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
+        "reromanize" => parse_reromanize(rest),
+        "relanguage" => parse_relanguage(rest),
+        "export" => parse_export(rest),
+        "import" => parse_import(rest),
         // options with no command are the options of `serve`
         arg if arg.starts_with("--") => parse_serve(args),
         other => Err(format!("unknown command: {other}\n\n{USAGE}").into()),
@@ -130,7 +157,7 @@ fn parse_search(args: &[String]) -> Result<Command> {
             "--live" => {
                 let text = value(&mut iter, arg)?;
 
-                live = Live::parse(&text).ok_or_else(|| format!("--live is off, diff or on, not {text:?}"))?;
+                live = Live::parse(&text).ok_or_else(|| format!("--live is off, diff or force, not {text:?}"))?;
             }
             "--limit" => limit = Some(number(&mut iter, arg)?),
             "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
@@ -175,6 +202,67 @@ fn parse_prefetch(args: &[String]) -> Result<Command> {
     Ok(Command::Prefetch { limit, config })
 }
 
+fn parse_reromanize(args: &[String]) -> Result<Command> {
+    let mut config = None;
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+        }
+    }
+
+    Ok(Command::Reromanize { config })
+}
+
+fn parse_relanguage(args: &[String]) -> Result<Command> {
+    match parse_reromanize(args)? {
+        Command::Reromanize { config } => Ok(Command::Relanguage { config }),
+        other => Ok(other),
+    }
+}
+
+fn parse_export(args: &[String]) -> Result<Command> {
+    let (mut file, mut sites, mut since, mut config) = (None, Vec::new(), 0, None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--site" => sites.push(value(&mut iter, arg)?),
+            "--since" => {
+                let text = value(&mut iter, arg)?;
+                since = text.parse::<i64>().map_err(|_| format!("--since needs a unix time, got {text}"))?;
+            }
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other if file.is_none() => file = Some(PathBuf::from(other)),
+            other => return Err(format!("export writes one file, got {other} too").into()),
+        }
+    }
+
+    Ok(Command::Export { file: file.ok_or("export needs the file to write")?, sites, since, config })
+}
+
+fn parse_import(args: &[String]) -> Result<Command> {
+    let (mut files, mut mark_done, mut config) = (Vec::new(), Vec::new(), None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--mark-done" => mark_done.push(value(&mut iter, arg)?),
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other => files.push(PathBuf::from(other)),
+        }
+    }
+    if files.is_empty() {
+        return Err("import needs the files to read".into());
+    }
+
+    Ok(Command::Import { files, mark_done, config })
+}
+
 fn value(iter: &mut std::slice::Iter<String>, option: &str) -> Result<String> {
     iter.next().cloned().ok_or_else(|| format!("{option} needs a value").into())
 }
@@ -192,17 +280,21 @@ pub async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Serve { config, host, port } => serve(config, host, port).await,
-        Command::Convert { texts, loanwords, config } => convert(texts, loanwords, config),
+        Command::Convert { texts, loanwords, config } => convert(texts, loanwords, config).await,
         Command::Search { query, live, limit, config } => {
             search(query, live, limit, config).await
         }
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
+        Command::Reromanize { config } => reromanize(config).await,
+        Command::Relanguage { config } => relanguage(config).await,
+        Command::Export { file, sites, since, config } => export(file, sites, since, config).await,
+        Command::Import { files, mark_done, config } => import(files, mark_done, config).await,
     }
 }
 
-fn load(config: Option<PathBuf>) -> Result<Config> {
-    config::load(&config.unwrap_or_else(config::default_path))
+async fn load(config: Option<PathBuf>) -> Result<Config> {
+    config::load(&config.unwrap_or_else(config::default_path)).await
 }
 
 /// The romaji conversion, which the server always has. Loading the dictionary takes a moment.
@@ -239,6 +331,8 @@ fn d1_client(config: &Config) -> Result<D1Client> {
 struct Background {
     d1: Option<Arc<D1Client>>,
     prefetch: bool,
+    crawl: bool,
+    verify: bool,
 }
 
 impl Background {
@@ -254,7 +348,15 @@ impl Background {
             }
         }
 
-        Ok(Self { d1, prefetch: config.prefetch.enabled })
+        if config.crawl.enabled && !config.search.enabled {
+            return Err("[crawl] needs [search] enabled = true".into());
+        }
+
+        if config.verify.enabled && !config.search.enabled {
+            return Err("[verify] needs [search] enabled = true".into());
+        }
+
+        Ok(Self { d1, prefetch: config.prefetch.enabled, crawl: config.crawl.enabled, verify: config.verify.enabled })
     }
 }
 
@@ -279,7 +381,7 @@ async fn sync_loop(d1: Arc<D1Client>, mirror: PathBuf, interval: Duration, wake:
 }
 
 async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>) -> Result<()> {
-    let config = load(config)?;
+    let config = load(config).await?;
     let host = host.unwrap_or(config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
 
@@ -303,10 +405,12 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     log::info!("listening on http://{}", listener.local_addr()?);
     log::info!(
-        "search: {}, d1: {}, prefetch: {}, cron: {}",
+        "search: {}, d1: {}, prefetch: {}, crawl: {}, verify: {}, cron: {}",
         on_off(config.search.enabled),
         on_off(config.d1.enabled),
         on_off(config.prefetch.enabled),
+        on_off(config.crawl.enabled),
+        on_off(config.verify.enabled),
         on_off(scheduler.is_some()),
     );
 
@@ -321,9 +425,16 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
 
         tasks.push(tokio::spawn(sync_loop(d1, config.d1.mirror_path.clone(), interval, wake.clone())));
     }
+    if let (true, Some(engine)) = (background.crawl, engine.clone()) {
+        // checked here, with the engine: a site that is not known or a shard that is wrong stops the server before it listens
+        tasks.push(tokio::spawn(Arc::new(Crawler::new(engine, config.crawl.clone())?).run()));
+    }
+    if let (true, Some(engine)) = (background.verify, engine.clone()) {
+        tasks.push(tokio::spawn(Arc::new(Verifier::new(engine, config.verify.clone())?).run()));
+    }
     if let (true, Some(engine)) = (background.prefetch, engine) {
         let prefetcher =
-            Arc::new(Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()));
+            Arc::new(Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled));
 
         tasks.push(tokio::spawn(prefetcher.run(wake)));
     }
@@ -344,8 +455,8 @@ fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
-fn convert(texts: Vec<String>, loanwords: Loanwords, config: Option<PathBuf>) -> Result<()> {
-    let config = load(config)?;
+async fn convert(texts: Vec<String>, loanwords: Loanwords, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
     let romanizer = Romanizer::new(&config.exceptions)?;
 
     if texts.is_empty() {
@@ -368,13 +479,13 @@ async fn search(
     limit: Option<usize>,
     config: Option<PathBuf>,
 ) -> Result<()> {
-    let mut config = load(config)?;
+    let mut config = load(config).await?;
     // the command is the wish to search (and the engine needs the romaji conversion)
     config.search.enabled = true;
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
 
     let limit = limit.unwrap_or(config.search.max_results);
-    let outcome = engine.search(&Request { query: &text, live, limit }).await?;
+    let outcome = engine.search(&Request { query: &text, live, limit, translator: crate::engine::Translator::None, exclude: &[] }).await?;
 
     for site in &outcome.sites {
         println!(
@@ -395,7 +506,7 @@ async fn search(
 }
 
 async fn sync(config: Option<PathBuf>) -> Result<()> {
-    let config = load(config)?;
+    let config = load(config).await?;
     let synced = Arc::new(d1_client(&config)?).sync(&config.d1.mirror_path).await?;
 
     println!(
@@ -412,8 +523,66 @@ async fn sync(config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Makes the romaji of the saved works again and forgets the searches of the ones that changed. Nothing is asked to
+/// a site: the prefetch of the server does that, when it starts.
+async fn reromanize(config: Option<PathBuf>) -> Result<()> {
+    let mut config = load(config).await?;
+    config.search.enabled = true;
+
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
+    let done = engine.reromanize_works().await?;
+
+    println!(
+        "{} works looked at, {} written again, {} searches to do again (the prefetch does them when the server starts)",
+        done.works, done.changed, done.forgotten
+    );
+
+    Ok(())
+}
+
+/// Reads the language of every saved title again.
+async fn relanguage(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let (looked, changed) = store.relanguage().await?;
+
+    println!("{looked} works looked at, {changed} written again");
+
+    Ok(())
+}
+
+async fn export(file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let moved = crate::transfer::export(&store, &file, &sites, since).await?;
+    let size = tokio::fs::metadata(&file).await.map(|m| m.len()).unwrap_or(0);
+
+    println!("{} works of {} sites written to {} ({size} bytes)", moved.works, moved.sites.len(), file.display());
+
+    Ok(())
+}
+
+async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    // the romaji of the titles is made here, with the rules of this program
+    let romanizer = load_romanizer(&config)?;
+
+    for file in &files {
+        let moved = crate::transfer::import(&store, file, &romanizer).await?;
+
+        println!("{}: {} works read, {} of them new", file.display(), moved.works, moved.new);
+    }
+    for site in &mark_done {
+        store.mark_crawled(site, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)).await?;
+        println!("{site}: marked as read to its end");
+    }
+
+    Ok(())
+}
+
 async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
-    let mut config = load(config)?;
+    let mut config = load(config).await?;
     config.search.enabled = true;
     config.prefetch.enabled = true;
     if let Some(limit) = limit {
@@ -421,7 +590,7 @@ async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
     }
 
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
-    let prefetcher = Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone());
+    let prefetcher = Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled);
     let round = prefetcher.round().await?;
 
     println!(
@@ -485,6 +654,16 @@ mod tests {
             parse(&args(&["--port", "1"])).unwrap(),
             Command::Serve { config: None, host: None, port: Some(1) }
         );
+    }
+
+    #[test]
+    fn reromanize_takes_only_the_config() {
+        assert_eq!(parse(&args(&["reromanize"])).unwrap(), Command::Reromanize { config: None });
+        assert_eq!(
+            parse(&args(&["reromanize", "--config", "a.toml"])).unwrap(),
+            Command::Reromanize { config: Some(PathBuf::from("a.toml")) }
+        );
+        assert!(parse(&args(&["reromanize", "--limit", "1"])).is_err());
     }
 
     #[test]
