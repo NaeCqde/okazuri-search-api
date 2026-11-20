@@ -1,79 +1,81 @@
-# The search engine
+# 検索エンジン
 
-`GET /okazuri/search?q=<words>` answers with the works that the sites list for a query. It is the part of
-`okazuri-search-api` that is switched on with `[search] enabled = true`.
+`GET /okazuri/search?q=<語>` は、クエリに対して各サイトが一覧に載せている作品を返します。`okazuri-search-api` の中で、
+`[search] enabled = true` で有効になる部分です。
 
 ```
- request ──► ask every site ──► read the list page ──► save title + path ──► find ──► answer
-              (every site, now)      (links of works)     (search.db, new ones)     (AND of the words)
+ リクエスト ──► 全サイトに尋ねる ──► 一覧ページを読む ──► タイトルと path を保存 ──► 探す ──► 応答
+                (全サイト、いま)     (作品へのリンク)     (search.db、新しい作品)    (語の AND)
 ```
 
-## What a request does
+## リクエストがすること
 
-1. The query is tidied up (white space folded, `×` written as `x`) and **turned into romaji, always** (`快楽天 2026 7`
-   is `kairakuten 2026 7`; text without Japanese is its own romaji). The romaji is what is searched for. Nothing is added to
-   it: the sites have a search of their own, and `hentai` is only for web search engines. The exception is `×`: DLsite and
-   FANZA (`keep_times` in `sites.rs`) are asked `COMIC E×E 11` as it was typed, the other sites `COMIC ExE 11`. The answer
-   (`query`) and the matching always use `x`.
-2. Each site is asked either the romaji alone, or **both what was written and its romaji**: a site that finds works by their
-   Japanese title (all but EHentai and HentaiEra, which answer `快楽天` with nothing) is asked the query as written too when it has
-   Japanese in it, so `快楽天 2026` is asked as `快楽天 2026` and as `kairakuten 2026`. A query without Japanese is only romaji. The works
-   of both answers go into the database and are matched the same way. (`GET /okazuri/sites` says which sites are `japanese`.)
-3. With `live` (the default), every site that can be searched is asked now. The sites are asked at the same time, and a site is
-   never asked twice within `min_delay_ms` (177Picyy, which answers 429 to a rush, within 20 seconds; R18Best, within 5). A 429 is
-   answered once with another try after the `Retry-After` of the site (5 seconds if it gives none, at most 30). (`live=off` asks nobody and goes on with the database.)
-4. The links of the answer that are works' pages are read. A link is a work when it matches the pattern that
-   `okazuri_bot/src/websites.ts` uses for the site.
-5. **What is saved is what the list page shows of the work**: its title, as the page writes it, **the romaji of that
-   title** (made with the same conversion as the query, to match it), and the path of its page (no scheme, no domain). No
-   image and no address of an image. **Only what is new is written**: a work that is in the database already is left as it
-   is (its row is written again only if its title changed), and the works that were not there are added. The title is the one of the *item of the list*, not
-   the title of the page; for the sites whose items hold more than the title (a count of likes, a price, a date, the
-   author) it is read from the part of the item that has the title.
-6. The answer is **every saved work whose romaji title has all the words of the (romaji) query** (AND, any order), whether it is new or was saved before, not only the
-   works this request found. A work is one row whatever query found it.
+1. クエリを整えます(空白をまとめ、`×` を `x` にします)。そして**必ずローマ字にします**(`快楽天 2026 7` は
+   `kairakuten 2026 7`。日本語を含まない文は、それ自体がローマ字です)。検索に使うのはこのローマ字で、何も足しません。
+   サイトには独自の検索があり、`hentai` を足すのは Web の検索エンジン向けだったからです。例外は `×` です。DLsite と FANZA
+   (`sites.rs` の `keep_times`)には `COMIC E×E 11` を入力されたとおりに、ほかのサイトには `COMIC ExE 11` を送ります。
+   応答の `query` と照合には、いつも `x` を使います。
+2. 各サイトには、ローマ字だけを尋ねるか、**書かれたとおりの語とそのローマ字の両方**を尋ねます。日本語のタイトルで作品が見つかるサイト
+   (`快楽天` を尋ねても何も返さない EHentai と HentaiEra 以外のすべて)には、クエリに日本語が含まれるとき、書かれたとおりの形も
+   尋ねます。たとえば `快楽天 2026` は、`快楽天 2026` と `kairakuten 2026` の 2 つで尋ねます。日本語を含まないクエリは、ローマ字だけです。
+   どちらの応答の作品もデータベースに入り、同じ方法で照合されます(どのサイトが `japanese` かは `GET /okazuri/sites` で分かります)。
+3. `live`(既定)では、検索できるすべてのサイトに、いま尋ねます。サイトへは同時に尋ね、1 つのサイトに `min_delay_ms` 以内に
+   2 回は尋ねません(177Picyy は、続けて尋ねると 429 を返すので 20 秒、R18Best は 5 秒)。429 には、サイトの
+   `Retry-After`(なければ 5 秒、最大 30 秒)だけ待って、もう 1 回だけ尋ねます(`live=off` はどこにも尋ねず、データベースで進めます)。
+4. 応答のリンクのうち、作品のページを指すものを読みます。リンクが作品かどうかは、`okazuri_bot/src/websites.ts` がそのサイトに
+   使っているパターンに合うかどうかで決めます。
+5. **保存するのは、作品について一覧ページに出ている内容です**。ページが書いたままのタイトル、クエリと同じ変換で作った
+   **そのタイトルのローマ字**(照合のため)、作品ページの path(スキームもドメインもなし)です。画像も画像のアドレスも保存しません。
+   **書き込むのは新しいものだけ**です。すでにデータベースにある作品はそのままにし(行を書き直すのは、タイトルが変わったときだけ)、
+   なかった作品を追加します。タイトルは、ページのタイトルではなく*一覧の項目*のタイトルです。項目にタイトル以外のもの(いいねの数、
+   価格、日付、作者)が入るサイトでは、タイトルのある部分から読みます。
+6. 応答は、**ローマ字のタイトルが(ローマ字にした)クエリの語をすべて含む保存済みの作品**(AND、順序は問いません)です。新しい作品も、
+   以前に保存した作品も入り、このリクエストが見つけた作品だけではありません。作品は、どのクエリが見つけても 1 行です。
 
-### Fetching again, and works that are gone
+### もう一度取得するとき、なくなった作品
 
-A query is asked to a site again only after `[search] ttl_hours` (720: a month) — for a request as well as for the prefetch.
-Nothing is deleted to make room: the new answer of a site is written in one transaction, so the old works are what a search
-sees until the new ones are in. The database (`listings`) knows which query listed which work on which site. When a query
-is asked again and a work that it listed the time before is **not on the list now**, the work is **removed** — if no other
-query lists it, and if the list was whole. A list as long as `max_results_per_site` may have been cut short, and then a work that
-is missing may just be beyond the cut, so it stays. A failed try changes nothing. A work from before `listings` existed
-(no query is known to have listed it) is never removed.
+あるクエリを同じサイトにもう一度尋ねるのは、`[search] ttl_hours`(720。1 か月)がたってからです。リクエストも事前検索も同じです。
+場所を空けるために何かを消すことはありません。サイトの新しい応答は 1 つのトランザクションで書き込むので、新しい作品が入るまでは、
+検索には古い作品が見えています。データベース(`listings`)は、どのサイトでどのクエリがどの作品を挙げたかを知っています。クエリを
+もう一度尋ねたとき、前回それが挙げた作品が**今回の一覧にない**場合、ほかのクエリがその作品を挙げていなければ、そして一覧が
+途中で切れていなければ、その作品は**削除**されます。`max_results_per_site` の長さの一覧は途中で打ち切られた可能性があり、
+そのときは、見つからない作品が打ち切りの先にあるだけかもしれないので、残します。失敗した試行は何も変えません。
+`listings` ができる前の作品(どのクエリが挙げたか分からないもの)は、削除されません。
 
-## Matching
+## 照合
 
-- Case, full width and half width (`ＣＯＭＩＣ`), white space (`COMIC 快楽天` and `COMIC快楽天`) and `×` against `x` do
-  not matter.
-- A word that is a number alone is a number of the title: `07` finds `2026年7月号`, `6` does not find `2026`.
-- **The name has to be outside the parentheses** of the title, the numbers may be anywhere in it: what is in `( )` (or `（ ）`) is not
-  matched against the words of the query. `彼女にできること (COMIC快楽天 2018年8月号)` is a work of the issue, not the issue, so it is not an
-  answer to `COMIC快楽天 2018 8`; `[Mutsutake] Meguri Dokoro 11-po (COMIC ExE 61) [Chinese]` is not an answer to `COMIC ExE 11` (`COMIC ExE`
-  is inside). `COMIC快楽天 2018年8月号 (デジタル特装版)` and `COMIC快楽天 (2018年8月号)` are answers. Brackets (`[ ]`, `【 】`) are not parentheses.
-- So `快楽天 2026 7` finds `COMIC快楽天 2026年07月号` (the query `kairakuten 2026 7` against `comic kairakuten 2026-07`), and `exe 11` finds `COMIC ExE 11`. A query written in romaji finds the same works as the same words in Japanese.
+- 大文字小文字、全角半角(`ＣＯＭＩＣ`)、空白(`COMIC 快楽天` と `COMIC快楽天`)、`×` と `x` の違いは区別しません。
+- 数だけの語は、タイトルの数と見ます。`07` は `2026年7月号` を見つけ、`6` は `2026` を見つけません。
+- **名前はタイトルの括弧の外になければならず、数字はどこにあってもかまいません**。`( )`(や `（ ）`)の中は、クエリの語と照合しません。
+  `彼女にできること (COMIC快楽天 2018年8月号)` は、その号に載った作品であって号ではないので、`COMIC快楽天 2018 8` の答えではありません。
+  `[Mutsutake] Meguri Dokoro 11-po (COMIC ExE 61) [Chinese]` は `COMIC ExE 11` の答えではありません(`COMIC ExE` が括弧の中です)。
+  `COMIC快楽天 2018年8月号 (デジタル特装版)` と `COMIC快楽天 (2018年8月号)` は答えです。角括弧(`[ ]`、`【 】`)は括弧に数えません。
+- そのため、`快楽天 2026 7` は `COMIC快楽天 2026年07月号`(クエリ `kairakuten 2026 7` を `comic kairakuten 2026-07` と照合)を、
+  `exe 11` は `COMIC ExE 11` を見つけます。ローマ字で書いたクエリは、同じ語を日本語で書いたクエリと同じ作品を見つけます。
 
-## Request
+## リクエスト
 
-| Query | |
+| クエリ | |
 |---|---|
-| `q` | The words. Required, at most `[search] max_query_chars` characters. |
-| `live=off` | Ask no site: answer from the database alone, even when what it has is out of date. |
-| `live=diff` (default) | Ask only the combinations of query and site that are missing or older than `ttl_hours` (a month); for the others the database answers (`cached`). |
-| `live=force` | Ask every site, cached or not (`searched`; a failure of an earlier try is asked again). `on` (the old name), `1`, `true` and `yes` mean the same. |
-| `limit=n` | The most works in the answer (at most `[search] max_results`). |
-| `exclude=A,B` | The sites (names as `GET /okazuri/sites` lists them, case does not matter, separated by commas) that are left out: they are not asked, their saved works are not in the answer, and they are not in `sites`. A name that is no site is a 422. The translation is not affected: `translator` says where it comes from. |
-| `translator=auto` (default) | A query with Japanese in it is searched in English too: the English title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translation` says the title (`{"text", "source"}`). |
+| `q` | 検索語。必須で、最大 `[search] max_query_chars` 文字。 |
+| `live=off` | どのサイトにも尋ねません。データベースが持っているものが古くても、それだけで答えます。 |
+| `live=diff`(既定) | 答えがない、または `ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかはデータベースが答えます(`cached`)。 |
+| `live=force` | キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。`on`(以前の名前)、`1`、`true`、`yes` も同じ意味です。 |
+| `limit=n` | 応答に入れる作品の最大数(最大 `[search] max_results`)。 |
+| `exclude=A,B` | 除外するサイト(`GET /okazuri/sites` に出る名前。大文字小文字は区別せず、カンマで区切ります)。そのサイトには尋ねず、保存済みの作品も応答に入れず、`sites` にも出ません。サイトにない名前は 422 です。翻訳には影響しません(出どころは `translator` が決めます)。 |
+| `translator=auto`(既定) | 日本語を含むクエリは、英語でも検索します。英語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、Hitomi.La が失敗するか何も返さないときは Google 翻訳(`/google/translate`)から取ります。両方の検索の作品が `results` に入り、`translation` がそのタイトルを示します(`{"text", "source"}`)。 |
+| `translator=hitomi` | Hitomi.La だけを使います。失敗するか何も返さないときは英語の検索をしません(`translation` は `null`)。 |
+| `translator=google` | Google 翻訳だけを使います。 |
+| `translator=none` | 英語の検索をしません。 |
 
-A query **without Japanese** (English, or romaji) is searched in Japanese the same way, the other way round: the Japanese title comes from Hitomi.La (`/hitomila/translate`), and from Google Translate when Hitomi.La fails or has nothing. The works of both searches are in `results`, and `translationJa` says the title (`{"text", "source"}`; `null` when there is none, and when the query has Japanese or no letter). `translator` and `live` choose the source in the same way.
-| `translator=hitomi` | Hitomi.La only: when it fails or has nothing, the English search is left out (`translation` is `null`). |
-| `translator=google` | Google Translate only. |
-| `translator=none` | No English search. |
+**日本語を含まない**クエリ(英語やローマ字)も、逆向きに、同じ方法で日本語でも検索します。日本語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、
+Hitomi.La が失敗するか何も返さないときは Google 翻訳から取ります。両方の検索の作品が `results` に入り、`translationJa` がそのタイトルを示します
+(`{"text", "source"}`。ないとき、およびクエリに日本語がある、または文字がないときは `null`)。出どころは `translator` と `live` が
+同じように決めます。
 
-`live` also tells the translation what to do: the saved translation is used (`diff`), only the saved one (`off`), or the source is asked again (`force`).
+`live` は翻訳にも働きます。`diff` は保存済みの翻訳を使い、`off` は保存済みのものだけを使い、`force` は出どころに改めて尋ねます。
 
-The answer:
+応答は次のとおりです。
 
 ```json
 {
@@ -92,18 +94,27 @@ The answer:
 }
 ```
 
-`status` is `searched` (asked now), `failed` (the `error` says why) or `not searched` (`live=0`); `queries` are the queries the site is asked
-(one or two, see above) and `count` the works they listed together. A site that fails does not stop the others. `total` is the number of works that have all the words; `results` may be shorter. A page is one work in the database and one result: a page that a site writes with and without the slash at the end (`/g/1/`, `/g/1`) is saved once. A page saved with the slash that the site lists without it later is **renamed** to the path without (the same row, so `first_seen` stays, and the lists that name it follow); one listed in both forms at once is saved without the slash (a site that writes it that way does not need it); one that is saved without the slash stays so; one that is only ever listed with the slash keeps it, and works with the same address (also with or without the `/` at the end, or the `#` part, in lower case) are one, the first stays, and it is `isNew` when any of them is.
+`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=0`)、`unavailable`(Hitomi.La の一覧が全件保存される
+までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
+失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数で、`results` はそれより短いことがあります。
+ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
+スラッシュ付きで保存したページを、サイトが後からスラッシュなしで挙げたときは、スラッシュなしの path に**名前が変わります**(同じ行なので `first_seen` は残り、
+そのページを指す一覧も追従します)。両方の形が同時に挙がったページは、スラッシュなしで保存します(そう書くサイトに、スラッシュは要りません)。
+スラッシュなしで保存したページはそのままです。スラッシュ付きでしか挙がらないページは、スラッシュ付きのままです。同じアドレスの作品(末尾の `/` や `#` 以降の
+有無、大文字小文字だけが違うもの)は 1 つの作品で、最初に保存したものが残り、どれかが新しければ `isNew` になります。
 
-## The sites
+## サイト
 
-### `GET /hitomila/translate?q=<text>`: Japanese to English, English to Japanese
+### `GET /hitomila/translate?q=<文>`: 日本語から英語、英語から日本語
 
-Hitomi.La is used (here, in `/auto/translate`, and in the search) only when its **whole list is saved** (`import --mark-done Hitomi.La`, or a crawl that reached the end): asked live, a search or a translation takes far too long. Before, `/hitomila/translate` is a `503`, `/auto/translate` goes to Google, and the search leaves Hitomi.La out (`unavailable`). When the list is saved, `import --mark-done Hitomi.La` (or `okazuri-search-api translations`) also makes the translations from the titles that have both (`English | 日本語`), so `live=off` has an answer.
+Hitomi.La は、**一覧が全件保存されているとき**だけ(`import --mark-done Hitomi.La`、または最後まで届いたクロールのあと)、ここでも
+`/auto/translate` でも検索でも使います。その場で尋ねると、検索も翻訳も時間がかかりすぎるからです。それまでは、`/hitomila/translate` は `503` で、
+`/auto/translate` は Google に回り、検索は Hitomi.La を外します(`unavailable`)。一覧が保存されると、`import --mark-done Hitomi.La`
+(または `okazuri-search-api translations`)が、両方の言語を持つタイトル(`English | 日本語`)から翻訳も作るので、`live=off` でも答えられます。
 
-A translation of the title of a work, from the titles of Hitomi.La: a gallery has its title in English and in Japanese, and the
-site keeps the words of both in one index. The language of `q` says the direction: Japanese (it has kana or kanji) to English, or
-English (its letters are all Latin) to Japanese. Any other text is a 422: only these two are translated.
+作品のタイトルの翻訳を、Hitomi.La のタイトルから作ります。ギャラリーには英語と日本語のタイトルがあり、サイトは両方の語を 1 つのインデックスに
+持っています。`q` の言語が向きを決めます。日本語(かなか漢字を含む)なら英語へ、英語(文字がすべてラテン文字)なら日本語へです。
+それ以外の文は 422 です。翻訳するのはこの 2 つだけです。
 
 ```json
 {
@@ -125,198 +136,179 @@ English (its letters are all Latin) to Japanese. Any other text is a 422: only t
 }
 ```
 
-**Only the title of the work is translated**: what the site puts around it is left out before Hitomi.La is asked (and before the translation is saved), and `title` says what was left: the event, the circle and the artist at the front (`(C103) [Circle (Artist)]`), the series, the tags and the language at the back (`(Series) [English] [DL版]`), and the other title after ` | ` or ` / ` (the one in the language of the text is kept). `[Yamamoto Zenzen] 学園サポ日記 comix 第1話 (COMIC Kuriberon DUMA 2025-09 Vol.76) [MTL]` is asked as `学園サポ日記 comix 第1話`. A text with nothing left (`【推しの子】`) is asked as it is. Google Translate gets the whole text.
+**翻訳するのは作品のタイトルだけ**です。サイトがタイトルの前後に付けるものは、Hitomi.La に尋ねる前(翻訳を保存する前)に取り除き、`title` に残った部分を
+示します。取り除くのは、前にあるイベント、サークル、作者(`(C103) [Circle (Artist)]`)、後ろにあるシリーズ、タグ、言語(`(Series) [English] [DL版]`)、
+そして ` | ` や ` / ` の後ろにある別のタイトル(文と同じ言語のものを残します)です。`[Yamamoto Zenzen] 学園サポ日記 comix 第1話 (COMIC Kuriberon DUMA 2025-09 Vol.76) [MTL]` は
+`学園サポ日記 comix 第1話` として尋ねます。何も残らない文(`【推しの子】`)は、そのまま尋ねます。Google 翻訳には、文全体を渡します。
 
-`translation` is the text of the first result in the other language (`null` when nothing answered). The Japanese gallery has the
-Japanese title, the galleries in English have the English one (the site has the Japanese words in the index of the galleries of
-the other languages too, so a text in Japanese finds them all). The galleries are **the same work** when their artists, groups,
-parodies and kind are the same and the pages are about as many (3 at most apart: a translation can add a page of credits); the
-tags (`big ass`, `paizuri`...) are not compared, they differ from one upload to another, and the romaji in the titles is not
-needed. So:
+`translation` は、もう一方の言語の最初の結果の文です(何も返らなければ `null`)。日本語のギャラリーには日本語のタイトルがあり、英語のギャラリーには
+英語のタイトルがあります(サイトは、ほかの言語のギャラリーの日本語の語もインデックスに持っているので、日本語の文ならそれらがすべて見つかります)。
+ギャラリーが**同じ作品**とみなされるのは、作者、グループ、パロディ、種類が同じで、ページ数がほぼ同じとき(差が 3 以内。翻訳ではクレジットのページが
+増えることがあります)です。タグ(`big ass`、`paizuri` など)は、アップロードごとに違うので比べません。タイトルの中のローマ字も要りません。つまり次のようになります。
 
-- Japanese to English: the gallery whose Japanese title has the text, and the galleries in English that are the same work;
-- English to Japanese: the galleries in English whose title has the text, and the Japanese gallery that is the same work (when the
-  first search does not have it, the romaji after the bar of `English | romaji` is looked up).
+- 日本語から英語: 日本語のタイトルにその文を含むギャラリーと、それと同じ作品の英語のギャラリー。
+- 英語から日本語: 英語のタイトルにその文を含む英語のギャラリーと、それと同じ作品の日本語のギャラリー(最初の検索で見つからないときは、
+  `English | romaji` の縦線の後ろのローマ字を調べます)。
 
-A gallery with neither an artist nor a group is never the same work as another. `exact` says the text is the whole title (spaces,
-marks and case aside); those come first.
+作者もグループもないギャラリーは、ほかのギャラリーと同じ作品にはなりません。`exact` は、その文がタイトル全体だったこと(空白、記号、大文字小文字は除く)を
+表し、そうした結果が先に来ます。
 
-The answer is **saved** in its own tables of the search database: `translation_lookups` (`key`: the text as it is compared, letters
-and digits in lower case; `text`; `from_lang`; `looked_at`; `count`: a note of the last time the text was asked) and
-`translations` (`key`, `gallery_id`, `position`, `url`, `english`, `japanese`, `exact`). `live` is the one of the search: `diff`
-(default) answers with the saved translations, **however old** (they are kept for good), and asks the site for a text that has none saved: a text
-that was never asked, and a text that nothing answered (it is asked every time, the site may have the work now); `force` asks the site always. There is **no `live=off`** here (a 422): the saved answer is the answer of `diff`. `saved` says that the answer is the saved one.
-A site that does not answer is a 502; no `q`, a `q` that is not Japanese or English, or a `live` that is not diff or force is a
-422. The route is there when `[search]` is on.
+応答は、検索データベースの専用のテーブルに**保存**されます。`translation_lookups`(`key`: 比べるときの文で、文字と数字を小文字にしたもの、`text`、
+`from_lang`、`looked_at`、`count`: その文を最後に尋ねたときの記録)と `translations`(`key`、`gallery_id`、`position`、`url`、`english`、`japanese`、`exact`)です。
+`live` は検索のものと同じです。`diff`(既定)は、保存済みの翻訳で、**どれほど古くても**(永久に残します)答え、保存済みの翻訳がない文(一度も尋ねていない文と、
+何も返らなかった文。後者は、サイトにその作品があるかもしれないので、毎回尋ねます)だけサイトに尋ねます。`force` は、いつもサイトに尋ねます。
+ここには **`live=off` はありません**(422 です)。保存済みの答えは `diff` の答えだからです。`saved` は、保存済みの答えだったことを表します。
+サイトが答えないときは 502 です。`q` がない、`q` が日本語でも英語でもない、`live` が diff か force でない場合は 422 です。
+このルートは `[search]` がオンのときにあります。
 
-### `GET /google/translate?q=<text>`: the same from Google Translate
+### `GET /google/translate?q=<文>`: Google 翻訳による同じ翻訳
 
-The same rules for `q` (Japanese or English, the direction follows), and the same tables: the translation is saved with the source
-`google` (kept for good). `live=diff` (default) answers with the saved one, and `live=force` asks Google again. There is **no
-`live=off`** for Google Translate (a 422): it is asked whenever nothing is saved (in the search, `off` is `diff` for the Google part; `/auto/translate` refuses it too). A translation that was saved for the other direction answers too, when its title is the whole text
-(`十` → `Ten` saved, so `Ten` → `十`). A translation from Japanese to English does not start with `The` (`The Phaethon Assault` →
-`Phaethon Assault`): it is taken off before it is saved; the translation of Hitomi.La is left as the site writes it.
+`q` の規則(日本語か英語で、向きはそれに従う)も、使うテーブルも同じです。翻訳は、出どころ `google` で保存されます(永久に残します)。`live=diff`(既定)は保存済みの
+翻訳で答え、`live=force` は Google に改めて尋ねます。Google 翻訳には **`live=off` はありません**(422 です)。保存済みの翻訳がなければ、いつも尋ねるからです
+(検索では、Google の部分に限り `off` は `diff` として扱います。`/auto/translate` も `off` を断ります)。反対向きに保存された翻訳も、そのタイトルが文全体なら
+答えに使います(`十` → `Ten` を保存済みなら、`Ten` → `十` も答えられます)。日本語から英語への翻訳は `The` で始めません(`The Phaethon Assault` →
+`Phaethon Assault`)。保存する前に取り除きます。Hitomi.La の翻訳は、サイトの書いたままにします。
 
-Google Translate is asked the way its web page asks (the RPC `MkEWBc` of `translate.google.com`, the request of the model that the
-page calls Advanced, "Gemini による正確性重視の翻訳"): there is no key and no promise, and Google can change it. Only the Advanced model is used, and the test
-`gtranslate::tests::the_advanced_model_...` (`cargo test -- --ignored`, it asks Google) is how a change is noticed: it works when
-`パエトーン強襲戦` comes back as `The Phaethon Assault` (the classic model says `The Battle of Phaeton`), and any other answer means that
-Google changed. Without the bridge the test fails: the page's own request has the same URL parameters and body as this program's, plus the
-header `x-goog-batchexecute-bgr` (a token of Google's bot check); with it the answer is `The Phaethon Assault` (`[[3],[[6,3]]]`), without it
-`Assault on Phaeton` (`[[0],[[6,1]]]`). The token is made for one text (the same text again is accepted, also with another `_reqid`) and is
-checked with the `User-Agent` and `Referer` of the page, not with its cookies. It cannot be made without running Google's script, so
-`tools/google-translate-bridge` (a Chrome with no window, `node server.mjs`, see its README) makes it: `GET /token` opens the page with the
-text, holds back the page's own request and hands it over, and this program sends it (`reqwest`, with gzip). `[search] google_bridge_url`
-(and `google_bridge_token`) is its address; when it is set and it is down, Google Translate fails (there is no fallback to the classic answer,
-which would be saved for good). To run the test with the bridge: `OKAZURI_GOOGLE_BRIDGE=http://127.0.0.1:8130 cargo test -- --ignored`.
+Google 翻訳には、その Web ページと同じ方法で尋ねます(`translate.google.com` の RPC `MkEWBc`。ページが Advanced と呼ぶモデル「Gemini による正確性重視の翻訳」の
+リクエストです)。キーはなく、保証もなく、Google は変更できます。使うのは Advanced モデルだけで、変更に気づくための手段が、
+`gtranslate::tests::the_advanced_model_...` のテスト(`cargo test -- --ignored`。Google に尋ねます)です。`パエトーン強襲戦` が `The Phaethon Assault`
+(クラシックなモデルは `The Battle of Phaeton`)で返れば動いていて、それ以外の答えは Google が変更したことを意味します。ブリッジなしではテストは失敗します。
+ページ自身のリクエストは、URL のパラメータと本文がこのプログラムのものと同じで、さらに `x-goog-batchexecute-bgr` ヘッダー(Google のボット判定のトークン)が付きます。
+それがあれば答えは `The Phaethon Assault`(`[[3],[[6,3]]]`)で、なければ `Assault on Phaeton`(`[[0],[[6,1]]]`)です。トークンは 1 つの文のために作られ(同じ文なら、
+別の `_reqid` でも受け付けられます)、Cookie ではなく、ページの `User-Agent` と `Referer` で検査されます。Google のスクリプトを動かさないと作れないので、
+`tools/google-translate-bridge`(ウィンドウのない Chrome。`node server.mjs`。その README を見てください)が作ります。`GET /token` が文を付けてページを開き、
+ページ自身のリクエストを止めて渡し、このプログラムがそれを送ります(`reqwest`、gzip)。`[search] google_bridge_url`(と `google_bridge_token`)がそのアドレスで、
+設定されているのに止まっているときは、Google 翻訳は失敗します(クラシックな答えへのフォールバックはありません。それは永久に保存されてしまうからです)。
+ブリッジを使ってテストを動かすには、`OKAZURI_GOOGLE_BRIDGE=http://127.0.0.1:8130 cargo test -- --ignored` です。
 
 ```json
 { "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "Assault on Phaeton", "saved": false }
 ```
 
-The saved rows of Hitomi.La and of Google are separate (`translations.source`).
+Hitomi.La の保存済みの行と Google の保存済みの行は別です(`translations.source`)。
 
-### `GET /auto/translate?q=<text>`
+### `GET /auto/translate?q=<文>`
 
-Hitomi.La first (`/hitomila/translate`), and Google Translate (`/google/translate`) when Hitomi.La fails or has nothing. The same
-rules for `q` and `live`; the answer is the first translation, and `source` says who gave it:
+最初に Hitomi.La(`/hitomila/translate`)を使い、Hitomi.La が失敗するか何も返さないときは Google 翻訳(`/google/translate`)を使います。`q` と `live` の規則は
+同じで、応答は最初の翻訳です。`source` が出どころを示します。
 
 ```json
 { "input": "パエトーン強襲戦", "from": "ja", "to": "en", "translation": "ZenZero Gyaku Ra Goudou \"Phaethon Assault\"", "source": "hitomi", "saved": false }
 ```
 
-Both are saved as above; a 502 when neither has a translation. `live=off` is a 422 here too (Google is asked when nothing is saved). This is what `translator=auto` of the search uses.
+どちらも上のとおり保存されます。どちらにも翻訳がなければ 502 です。ここでも `live=off` は 422 です(保存がなければ Google に尋ねるからです)。検索の `translator=auto` が使うのは、これです。
 
-`GET /okazuri/sites` lists them. Checked in 2026-10 from a home connection:
+`GET /okazuri/sites` が一覧を返します。2026 年 10 月に、家庭の回線から確認しました。
 
-| | Sites |
+| | サイト |
 |---|---|
-| Searched | DLsite, FANZA, momon:GA, Nya:Hentai (now nyahentai.one), 同人の森, JComic, R18Best, Sukebei, RokuHentai, HentaiEnvy, HentaiEra, 177Picyy, Wnacg, AsmHentai, EHentai, Hitomi.La (16; all in Japanese and romaji, but HentaiEra and EHentai in romaji only) |
-| Cloudflare challenge | IMHentai, HentaiOMG, HentaiCore, NijiGazo, NukiBooks, HentaiName, HentaiPaw: a browser is needed |
-| JavaScript | Anime-Sharing (analysed, see below) |
-| Closed | MasDr, JMwu, BatoTo, HentaiDesi |
+| 検索する | DLsite、FANZA、momon:GA、Nya:Hentai(現在は nyahentai.one)、同人の森、JComic、R18Best、Sukebei、RokuHentai、HentaiEnvy、HentaiEra、177Picyy、Wnacg、AsmHentai、EHentai、Hitomi.La(16 サイト。すべて日本語とローマ字ですが、HentaiEra と EHentai はローマ字のみ) |
+| Cloudflare のチャレンジ | IMHentai、HentaiOMG、HentaiCore、NijiGazo、NukiBooks、HentaiName、HentaiPaw: ブラウザが必要 |
+| JavaScript | Anime-Sharing(分析済み。下を見てください) |
+| 閉鎖 | MasDr、JMwu、BatoTo、HentaiDesi |
 
-The ones that cannot be searched are left out (`try_unsupported = true` tries them, and they fail). A site is one entry
-of `SITES` in `src/sites.rs`: the pattern of `websites.ts`, a search URL with `{q}` in it (`{q+}` writes a space as `+`:
-DLsite answers 403 to `%20` in a path), and, if the title is not the text of the link, where it is (`TITLES`).
+検索できないサイトは対象から外します(`try_unsupported = true` なら試しますが、失敗します)。サイトは `src/sites.rs` の `SITES` の 1 項目で、
+`websites.ts` のパターン、`{q}` を含む検索 URL(`{q+}` は空白を `+` にします。DLsite はパスの `%20` に 403 を返します)、
+そして、タイトルがリンクのテキストではないときは、その場所(`TITLES`)から成ります。
 
-### The sites that need JavaScript (analysed 2026-10)
+### JavaScript が必要なサイト(2026 年 10 月に分析)
 
-- **RokuHentai**: the page is drawn by JavaScript, but from a JSON answer of the same address (`/_search?q=`: `manga-cards` holds
-  the cards as HTML, `next` the next page). That answer is read, so the site is searched. The reader (`/id/0`) and the details
-  (`/id`) are one work.
-- **Hitomi.La** (`src/hitomi.rs`): the search is JavaScript over binary index files on `ltn.gold-usergeneratedcontent.net`, and the program reads
-  the same files, with no browser. The SHA-256 of a word (first 4 bytes) is looked up in a B-tree (`galleriesindex/galleries.<version>.index`,
-  nodes of 464 bytes read with Range requests; the version is in `galleriesindex/version`), which gives where the list of the
-  galleries that have the word in their title is (in the `.data` file); the ids of the words are intersected (the shortest list first;
-  a word that is in no title is left out, a word in more than 500,000 titles is too), the newest `[search] max_results_per_site`
-  are kept, and the title of each is read from `galleries/<id>.js`. One query is some 20 requests of the index plus one per gallery,
-  each 150 ms after the last (this site has its own delay, not `min_delay_ms`); the index is a static host that answers quickly.
-  The words of the Japanese titles and of the English titles are in the same index, so a query in Japanese finds the English titles
-  too, and the other way round. The work is saved as `/galleries/<id>.html` (the site redirects it to the page) with the title
-  `<title> | <Japanese title>`: the romaji of that title has the Japanese words and the English ones, so a query in Japanese, in
-  romaji or in English matches it.
-- **Anime-Sharing**: the search is a POST with a token (XenForo), and the site answers a guest with its own 503 page.
-- **A Cloudflare challenge** (7 sites) is not passed by asking again: it was tried 4 times for each of the 7 sites, and every
-  answer was a challenge. A browser is needed.
+- **RokuHentai**: ページは JavaScript で描かれますが、同じアドレスの JSON の応答(`/_search?q=`。`manga-cards` にカードが HTML で、`next` に次のページが
+  入っています)から作られます。その応答を読むので、このサイトは検索できます。リーダー(`/id/0`)と詳細(`/id`)は、1 つの作品です。
+- **Hitomi.La**(`src/hitomi.rs`): 検索は、`ltn.gold-usergeneratedcontent.net` にあるバイナリのインデックスファイルに対する JavaScript で、このプログラムも
+  同じファイルをブラウザなしで読みます。語の SHA-256(先頭 4 バイト)を B 木(`galleriesindex/galleries.<version>.index`。464 バイトのノードを Range リクエストで読みます。
+  バージョンは `galleriesindex/version` にあります)で引くと、その語をタイトルに持つギャラリーのリストの場所が分かります(`.data` ファイルの中)。
+  語ごとの ID を突き合わせ(短いリストから先に。どのタイトルにもない語は外し、50 万を超えるタイトルにある語も外します)、新しい `[search] max_results_per_site` 件を残して、
+  それぞれのタイトルを `galleries/<id>.js` から読みます。1 つのクエリは、インデックスへの約 20 リクエストとギャラリーごとの 1 リクエストで、
+  どれも前のリクエストの 150 ms 後に送ります(このサイトには独自の間隔があり、`min_delay_ms` ではありません)。インデックスは静的ホストで、速く答えます。
+  日本語のタイトルの語と英語のタイトルの語は同じインデックスにあるので、日本語のクエリは英語のタイトルも見つけ、その逆も同じです。作品は
+  `/galleries/<id>.html`(サイトがページにリダイレクトします)として、`<title> | <日本語のタイトル>` というタイトルで保存します。そのローマ字は、日本語の語と英語の語の
+  両方を含むので、日本語、ローマ字、英語のどのクエリも一致します。
+- **Anime-Sharing**: 検索はトークン付きの POST(XenForo)で、サイトはゲストに独自の 503 ページを返します。
+- **Cloudflare のチャレンジ**(7 サイト)は、もう一度尋ねても通りません。7 サイトのそれぞれに 4 回試し、すべての応答がチャレンジでした。ブラウザが必要です。
 
-## The two database files
+## 2 つのデータベースファイル
 
-Both are read and written with SeaORM. The tables are the entities in `src/entity/` (`work`, `search` for `search.db`; `magazine`,
-`number`, `mirror_meta` for the mirror), `src/store.rs` is the search database and `src/mirror.rs` the copy of D1. The tables of
-the search database are made when the file is opened (`CREATE TABLE IF NOT EXISTS`, from the entities), so there is nothing to
-migrate. The entities of `magazine` and `number` list only the columns that are read, because D1 owns that schema.
+どちらも SeaORM で読み書きします。テーブルは `src/entity/` のエンティティです(`search.db` は `work` と `search`、写しは `magazine`、`number`、`mirror_meta`)。
+`src/store.rs` が検索データベース、`src/mirror.rs` が D1 の写しです。検索データベースのテーブルは、ファイルを開くときにエンティティから作られる
+(`CREATE TABLE IF NOT EXISTS`)ので、マイグレーションはありません。`magazine` と `number` のエンティティには、読む列だけを載せています。そのスキーマは D1 のものだからです。
 
-| File | Setting | Content |
+| ファイル | 設定 | 内容 |
 |---|---|---|
-| `search.db` | `[search] db_path` | `works` (site, path, **title** as the site writes it, **title_romaji** its romaji, title_key the romaji folded to narrow the search, when it was first saved and last changed), `works_fts` (an FTS5 index with the trigram tokenizer over title_key: it finds the works whose key has a piece of 3 characters or more without reading every row; the table `works` is its content, and triggers keep it up to date; it is made again at the start when it has not as many works as the table) and `searches` (when each query was asked to each site, and whether it worked) |
-| `d1-mirror.db` | `[d1] mirror_path` | the `magazines` and `numbers` tables of the Worker's D1 database, and the bookmark of the data they were copied from |
+| `search.db` | `[search] db_path` | `works`(サイト、path、サイトが書いた**タイトル**、そのローマ字の **title_romaji**、検索を絞る title_key(ローマ字を整えたもの)、最初に保存した日時と最後に変わった日時)、`works_fts`(title_key に対する、trigram トークナイザーの FTS5 インデックス。キーに 3 文字以上の断片を含む作品を、すべての行を読まずに見つけます。`works` テーブルがその内容で、トリガーが最新に保ちます。起動時に、テーブルより作品が少なければ作り直します)、`searches`(どのクエリをどのサイトにいつ尋ねたか、成功したか) |
+| `d1-mirror.db` | `[d1] mirror_path` | Worker の D1 データベースの `magazines` と `numbers` のテーブルと、それを写したデータのブックマーク |
 
-## The copy of D1 (`[d1]`)
+## D1 の写し(`[d1]`)
 
-D1 can export a database as an SQL file through the Cloudflare API: `POST .../d1/database/{id}/export` with
-`output_format: "polling"` is polled until it is `complete`, and the SQL is downloaded from the signed URL it gives.
-The Worker's database has a virtual table (`works_fts`, FTS5), which D1 refuses to export, so the tables to export are
-named (`dump_options.tables`): `wrangler d1 export okazuri --remote --table=numbers` does the same.
+D1 は、Cloudflare API で、データベースを SQL ファイルとしてエクスポートできます。`output_format: "polling"` で `POST .../d1/database/{id}/export` を呼び、
+`complete` になるまでポーリングして、返ってきた署名付き URL から SQL をダウンロードします。Worker のデータベースには、D1 がエクスポートを拒否する仮想テーブル
+(`works_fts`、FTS5)があるので、エクスポートするテーブルを指定します(`dump_options.tables`)。`wrangler d1 export okazuri --remote --table=numbers` も同じです。
 
-Whether to export is told by the Time Travel bookmark (`GET .../time_travel/bookmark`), which costs no row reads and
-moves on with every write **to any table** (the Worker writes its works all day). The bookmark of the data in the copy is kept in the copy.
-When the two differ, the two tables are exported, and a hash of the SQL is compared with the one of the copy: the same
-hash means that `magazines` and `numbers` did not change (only another table did), so the copy is left as it is, with the new
-bookmark noted, and the prefetch is not told. Only a different hash builds the copy in a temporary file and replaces the old one in one step, so a broken export leaves the old copy alone.
+エクスポートするかどうかは、Time Travel のブックマーク(`GET .../time_travel/bookmark`)で判断します。行の読み取りがかからず、**どのテーブルへの**書き込みでも進みます
+(Worker は作品を一日中書いています)。写したデータのブックマークは、写しの中に残しておきます。2 つが違うときは、2 つのテーブルをエクスポートし、SQL のハッシュを写しのものと比べます。
+同じハッシュなら `magazines` と `numbers` は変わっていない(別のテーブルが変わっただけ)ので、写しはそのままにして新しいブックマークだけを記録し、事前検索には知らせません。
+ハッシュが違うときだけ、一時ファイルに写しを作って 1 回の操作で古いファイルと置き換えるので、エクスポートが壊れても古い写しは無傷です。
 
-An export blocks the database while it runs (a second or so for these two tables).
+エクスポートは、実行中データベースをロックします(この 2 つのテーブルなら 1 秒ほど)。
 
-## Searching ahead (`[prefetch]`)
+## 事前検索(`[prefetch]`)
 
-The name of every issue of the copy is turned into a query the way `okazuri_bot` does it (`COMIC快楽天 2026年07月号` is
-`COMIC快楽天 2026 07`), newest first, and searched like a request: the sites are asked and the works saved. The engine
-turns each into romaji like any query. Queries that are searched already and young (`[search] ttl_hours`, a month by default, the same as for a request; a failure: `retry_failed_minutes`) are skipped, so a round only does what
-is new. A change of the data of the copy (not a mere move of the bookmark) **stops the round that is running and starts a new one** at
-once. What was searched is remembered (`searches`: a query is skipped while it is younger than `ttl_hours` for every site, and
-only the sites that are missing or old are asked), so a restart of the program, or of a round, goes on where it stopped. The log
-says `prefetch: n/total "query"` for each query. A slow site (177Picyy: one request in 20 seconds) is left out of the prefetch,
-because every query would wait for it; a request to `/okazuri/search` asks it, with one form of the query.
+写しにあるすべての号の名前を、`okazuri_bot` が作るのと同じ形のクエリにして(`COMIC快楽天 2026年07月号` は `COMIC快楽天 2026 07`)、新しい順に、リクエストと同じように検索します。
+サイトに尋ね、作品を保存します。エンジンが、どのクエリも通常どおりローマ字にします。すでに検索済みで新しい(`[search] ttl_hours`。既定は 1 か月で、リクエストと同じ。
+失敗は `retry_failed_minutes`)クエリは飛ばすので、1 ラウンドがするのは新しいことだけです。写しのデータが変わると(ブックマークが進んだだけでは変わりません)、
+**動いているラウンドを止めて、すぐ新しいラウンドを始めます**。検索したことは記録されているので(`searches`。クエリは、すべてのサイトについて `ttl_hours` より新しい間は飛ばされ、
+ないか古いサイトだけに尋ねます)、プログラムやラウンドを再起動しても、止まったところから続きます。ログには、クエリごとに `prefetch: n/total "query"` と出ます。
+遅いサイト(177Picyy: 20 秒に 1 リクエスト)は、すべてのクエリがそれを待つことになるので、事前検索から外します。`/okazuri/search` へのリクエストは、
+クエリの形を 1 つだけにして、そのサイトにも尋ねます。
 
-A query with Japanese in it is searched three ways: as written, in romaji (both by the search itself), and **in English**: when Hitomi.La is one of the sites, the prefetch asks Hitomi.La (as `/hitomila/translate` does; saved for good; never Google Translate), and searches the sites for the English titles it gives (3 at most), saving the works. This is also done for a query that was searched before, so the works of the English titles come after the update too. The log says `prefetch: "query" in English "title"`. A failure of the translation is a warning; the query itself is done.
+日本語を含むクエリは、3 とおりに検索します。書かれたとおり、ローマ字(どちらも検索そのもの)、そして**英語**です。Hitomi.La がサイトに含まれているときは、事前検索が
+Hitomi.La に尋ね(`/hitomila/translate` と同じ。永久に保存。Google 翻訳は使いません)、返ってきた英語のタイトル(最大 3 つ)でサイトを検索して、作品を保存します。
+以前に検索したクエリにも行うので、更新のあとは、英語のタイトルの作品も入ります。ログには `prefetch: "query" in English "title"` と出ます。翻訳の失敗は警告で、クエリ自体は完了します。
 
-### After the rules of the romaji changed (`reromanize`)
+### ローマ字の規則が変わったあと(`reromanize`)
 
-A work is saved with the romaji it had when it was listed, so after an update of the rules the saved romaji is the old one
-until the work is listed again (a month). `okazuri-search-api reromanize` (the server stopped) makes the romaji of every saved
-work again; a work whose romaji came out different is rewritten (title, dates and the order of the results stay), and the
-searches that listed it are forgotten. It asks no site: the prefetch of the server, when it starts, finds those queries not
-searched and asks the sites again, newest issue first. The queries that are not issues are asked again when somebody searches
-for them.
+作品は、一覧に出たときのローマ字で保存されるので、規則を更新したあとも、その作品がもう一度一覧に出るまで(1 か月)、保存済みのローマ字は古いままです。
+`okazuri-search-api reromanize`(サーバーを止めて実行)は、保存済みのすべての作品のローマ字を作り直します。ローマ字が変わった作品は書き直され
+(タイトル、日時、結果の順序は変わりません)、それを挙げていた検索の記録は消えます。サイトには尋ねません。サーバーの事前検索が、起動したときにそれらのクエリを
+未検索とみなして、新しい号から順にサイトへ改めて尋ねます。号でないクエリは、誰かが検索したときに改めて尋ねます。
 
-## The language of a work (`works.language`)
+## 作品の言語(`works.language`)
 
-`language.rs` reads the languages from the title: the flag a site puts first, the marks of a translation (`[中国翻訳]`, `[汉化]`) and the
-brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). The answer is the two-letter codes joined with `,` in the order the title
-names them (`zh`, `en,ja`, `zh,en,ja,ko`), and NULL when the title says none (most titles are Japanese and do not say so). The search
-answers it as `language`, a list of the codes in that order (`["zh", "en"]`; `[]` when there is none). A database from before this has the column added, and the titles read, when it is opened. The
-file of `export` does not have it: `import` makes it (as it makes the romaji and the key). When the rules change,
-`okazuri-search-api relanguage` reads every title again and writes the works that came out different (`reromanize` also writes it for the works whose romaji changed). A flag (🇯🇵, 🇨🇳, ...) anywhere in a title names its language and is **taken out of the title** (and its romaji and key): new works are saved without it, and `relanguage` does it for the works saved before. Since the flag is gone afterwards, a language that a title no longer names is kept, not cleared (to clear a wrong one: `UPDATE works SET language = NULL WHERE ...`, then `relanguage`).
+`language.rs` が、タイトルから言語を読みます。サイトがタイトルの先頭に付ける国旗、翻訳の印(`[中国翻訳]`、`[汉化]`)、言語だけを表す括弧(`[EN]`、`[English]`、`[CN,EN,JP,KR]`)です。
+答えは、タイトルが示した順に `,` でつないだ 2 文字のコードです(`zh`、`en,ja`、`zh,en,ja,ko`)。タイトルに言語がなければ NULL です(ほとんどのタイトルは日本語で、そうは書きません)。
+検索は、これをコードのリストを同じ順にした `language` として返します(`["zh", "en"]`。ないときは `[]`)。この機能より前のデータベースは、開くときに列が追加され、タイトルが読まれます。
+`export` のファイルにはこの列がありません。`import` が作ります(ローマ字とキーを作るのと同じです)。規則が変わったときは、`okazuri-search-api relanguage` がすべてのタイトルを
+読み直し、結果が変わった作品を書き込みます(`reromanize` も、ローマ字が変わった作品には書き込みます)。タイトルのどこかにある国旗(🇯🇵、🇨🇳 など)はその言語を示し、
+**タイトルから取り除かれます**(ローマ字とキーからも)。新しい作品は、国旗なしで保存され、それ以前に保存した作品には `relanguage` が同じことをします。国旗がなくなった後は、
+タイトルがもう示していない言語は、消さずに残します(間違った言語を消すには、`UPDATE works SET language = NULL WHERE ...` を実行してから `relanguage` を実行します)。
 
-## Crawling (`[crawl]`)
+## クロール(`[crawl]`)
 
-The searches only know the works that a query listed. With `[crawl] enabled = true` the server also walks the list of each site that has one
-(`crawl.rs`: the index of Hitomi.La and the file of each gallery, the WordPress API of momon:GA and Nya:Hentai, the list pages of DLsite, Wnacg,
-AsmHentai, HentaiEra and HentaiEnvy, the JSON of RokuHentai, the list of E-Hentai) and saves the title of every work, with no query. The
-sites are walked at the same time, each one page after page, newest first.
+検索が知っているのは、クエリが挙げた作品だけです。`[crawl] enabled = true` にすると、サーバーは、一覧を持つ各サイトの一覧も歩き(`crawl.rs`: Hitomi.La のインデックスと各ギャラリーのファイル、
+momon:GA と Nya:Hentai の WordPress API、DLsite、Wnacg、AsmHentai、HentaiEra、HentaiEnvy の一覧ページ、RokuHentai の JSON、E-Hentai の一覧)、クエリなしですべての作品のタイトルを保存します。
+サイトは同時に、それぞれ新しい順に 1 ページずつ歩きます。
 
-- **Where it is:** table `crawls` (a row per site: the cursor of the walk, `done`, how many works it saved). A restart goes on from the cursor.
-- **After the first walk:** at the `schedule` the newest pages are read again, up to a page with nothing new in it (`refresh_pages` at the most).
-- **The prefetch** leaves out the sites whose first walk is done, and goes on asking the sites that have no list (Sukebei, JComic, ...).
-- **Answering from the lists:** `[search] skip_crawled = true` stops a request from asking the sites whose list is read (`crawls.done`); the database answers for them
-  (`live=force` still asks). The other sites are asked as before. Turn it on when the database has the whole lists (after `import --mark-done` for a sharded crawl).
-- **The delay** of a site is kept by every request of the program together (`[search] min_delay_ms`, or `[search.site_delay_ms]` for one site).
-- **More than one machine:** `shard = "k/N"` on each, then `export` on each (`okazuri-search-api export out.jsonl.br`; JSON Lines, brotli) and
-  `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` on the server. A work that is saved already stays as it is.
+- **記録する場所:** テーブル `crawls`(サイトごとに 1 行。歩いた位置を示すカーソル、`done`、保存した作品の数)。再起動すると、カーソルから続けます。
+- **最初に歩き終えたあと:** `schedule` の時刻に、新しいページを読み直し、新しいものがないページまで読みます(最大 `refresh_pages` ページ)。
+- **事前検索**は、最初に歩き終えたサイトを外し、一覧を持たないサイト(Sukebei、JComic など)には尋ね続けます。
+- **一覧からの応答:** `[search] skip_crawled = true` にすると、リクエストは、一覧を読み終えたサイト(`crawls.done`)に尋ねなくなり、データベースが代わりに答えます
+  (`live=force` はそれでも尋ねます)。ほかのサイトには、これまでどおり尋ねます。データベースに一覧が全件入ったとき(分割したクロールなら、`import --mark-done` のあと)にオンにしてください。
+- **サイトの間隔**は、プログラムのすべてのリクエストを合わせて守ります(`[search] min_delay_ms`、またはサイトごとに `[search.site_delay_ms]`)。
+- **複数のマシンで:** それぞれに `shard = "k/N"` を指定し、それぞれで `export`(`okazuri-search-api export out.jsonl.br`。JSON Lines を brotli で圧縮)を行い、サーバーで
+  `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` を実行します。保存済みの作品はそのままです。
 
-## Works whose page is gone (`[verify]`)
+## ページがなくなった作品(`[verify]`)
 
-Some sites keep listing a work after its page is gone. With `[verify] enabled = true` the server looks at the page of every saved work of the
-sites that tell (RokuHentai, DLsite, HentaiEnvy, Nya:Hentai, momon:GA, Sukebei: 404, RokuHentai also a 503 with "temporarily unavailable ...
-Here are some results that might be useful to you"; AsmHentai and HentaiEra: a redirect to `/404/`; Wnacg: the sentence "您要訪問的漫畫不存在")
-once in `interval_days` (30). Each site is asked on its own, one page every `interval_days / works` (never closer than `min_pause_ms`, 5 s, so a site with more than 518 400 works takes longer than `interval_days`, and than the delay of the
-site); the works that were never looked at first, then the oldest look. A work whose page is gone is marked in `works` (`deleted = 1`; its
-title, romaji and key are blanked, so no search finds it and it is not exported): a list, the crawl and an import do not save it again, since the
-site still lists it. `works.checked_at` is when its page was looked at. A page that cannot be read (a failure, another 503, 429) is looked
-at again later. Not looked at: Hitomi.La (the page is the same shell for any id; its index file says which galleries there are) and E-Hentai (a
-short text with status 200, and an address that asks more than a page every few seconds is banned).
+サイトによっては、ページがなくなった作品を一覧に出し続けます。`[verify] enabled = true` にすると、サーバーは、それが分かるサイト(RokuHentai、DLsite、HentaiEnvy、Nya:Hentai、
+momon:GA、Sukebei は 404。RokuHentai は "temporarily unavailable ... Here are some results that might be useful to you" という 503 も。AsmHentai と HentaiEra は `/404/` へのリダイレクト。
+Wnacg は「您要訪問的漫畫不存在」という文)の、保存済みのすべての作品のページを、`interval_days`(30)に 1 回見に行きます。サイトごとに独立に、`interval_days / 作品数` ごとに
+1 ページずつ見ます(`min_pause_ms`(5 秒)より短くしないので、作品が 518,400 を超えるサイトでは `interval_days` より長くかかり、サイトの間隔より長くもなります)。順番は、
+一度も見ていない作品が先で、次に見たのが古い順です。ページがなくなった作品は、`works` で印を付けます(`deleted = 1`。タイトル、ローマ字、キーは空にするので、どの検索にも出ず、
+エクスポートもされません)。サイトは今もその作品を一覧に出すので、一覧、クロール、インポートは、その作品を改めて保存しません。`works.checked_at` は、そのページを見た日時です。
+読めなかったページ(失敗、ほかの 503、429)は、あとでもう一度見ます。見ないのは、Hitomi.La(ページは、どの ID でも同じ殻で、どのギャラリーがあるかはインデックスファイルが示します)と
+E-Hentai(ステータス 200 で短い文を返し、数秒に 1 ページより多く尋ねるアドレスは禁止されます)です。
 
-## Not done
+## やっていないこと
 
-- A site behind a Cloudflare challenge and Anime-Sharing are not searched: this is plain HTTP requests, not a browser.
-- The `[d1]` calls were written from the API as wrangler uses it and tested against a mock of it; run
-  `okazuri-search-api sync` once with the token to see them work.
-
-### How the works are narrowed (`SearchStore::candidates`)
-
-The engine reads the works that have **every** word of the query (a number is not one: it is matched by value) in their title key, and
-matches the words again with them in the program. The words of 3 characters or more go into one `works_fts` query (FTS5, trigram: `"a" AND "b"`),
-when no more than 50 000 works have all of them; so two words that are common alone find the few works that have both. The works are then the
-ones of the index, the newest first, and a word shorter than 3 characters is looked for (`instr`) in those. When more than 50 000 works have all
-the words, or no word has 3 characters, the works are read with `instr(title_key, word)` for every word by walking them from the newest, which
-stops after 50 000. The answer is the same either way. (Measured on 5 million works: a rare word 12 to 80 ms instead of 2 to 3.4 s; a word that most works have 30 ms as before.)
+- Cloudflare のチャレンジの向こうのサイトと Anime-Sharing は、検索しません。これは普通の HTTP リクエストで、ブラウザではないからです。
+- `[d1]` の呼び出しは、wrangler が使う API を見て書き、そのモックに対してテストしました。トークンを付けて `okazuri-search-api sync` を 1 回実行して、実際の動作を確かめてください。
