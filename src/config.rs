@@ -140,7 +140,7 @@ impl Default for D1Config {
             account_id: String::new(),
             database_id: String::new(),
             api_token: "${CLOUDFLARE_API_TOKEN}".to_string(),
-            tables: vec!["magazines".to_string(), "numbers".to_string()],
+            tables: ["magazines", "numbers", "authors", "works"].map(String::from).to_vec(),
             mirror_path: PathBuf::from("d1-mirror.db"),
             check_interval_minutes: 10,
         }
@@ -318,7 +318,7 @@ mod tests {
         assert!(config.cron.jobs.is_empty());
         // the search engine and what feeds it are off
         assert!(!config.search.enabled && !config.d1.enabled && !config.prefetch.enabled);
-        assert_eq!(config.d1.tables, ["magazines", "numbers"]);
+        assert_eq!(config.d1.tables, ["magazines", "numbers", "authors", "works"]);
         assert_ne!(config.search.db_path, config.d1.mirror_path, "two database files");
     }
 

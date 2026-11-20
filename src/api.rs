@@ -29,6 +29,8 @@ pub struct AppState {
     pub max_query_chars: usize,
     /// The search engine; `None` when `[search]` is off.
     pub search: Option<Arc<Engine>>,
+    /// The copy of the Worker's D1 database (`[d1] mirror_path`); `None` when `[d1]` is off and there is no file.
+    pub mirror_path: Option<std::path::PathBuf>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -36,6 +38,10 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     if state.search.is_some() {
         router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
+    }
+
+    if state.mirror_path.is_some() {
+        router = router.route("/okazuri/magazine", get(magazine));
     }
 
     // The same routes are under `/api/v1` too (https://okazuri.nae.quest/api/v1/...), so a proxy in front needs no rewrite.
@@ -54,6 +60,7 @@ async fn cache_control(request: axum::extract::Request, next: axum::middleware::
         "/okazuri/search" if !forced => 300,
         "/hitomila/translate" | "/google/translate" | "/auto/translate" | "/romaji" => 86_400,
         "/okazuri/sites" => 3_600,
+        "/okazuri/magazine" => 300,
         _ => 0,
     };
     let value = if seconds > 0 && response.status() == StatusCode::OK { format!("public, max-age=60, s-maxage={seconds}") } else { "no-store".to_string() };
@@ -270,6 +277,60 @@ async fn auto_translate(State(state): State<Arc<AppState>>, Query(params): Query
     }
 }
 
+#[derive(Deserialize)]
+struct MagazineQuery {
+    q: Option<String>,
+    limit: Option<u64>,
+}
+
+/// The magazine issues a work was printed in, from the copy of the Worker's D1 database: the work is found by its
+/// exact title, the way the bot's `/from_work` finds it.
+async fn magazine(State(state): State<Arc<AppState>>, Query(params): Query<MagazineQuery>) -> Response {
+    let Some(path) = &state.mirror_path else { return StatusCode::NOT_FOUND.into_response() };
+    let title = params.q.as_deref().map(str::trim).unwrap_or_default();
+
+    if title.is_empty() || title.chars().count() > state.max_query_chars {
+        return invalid(&format!("q is required, 1 to {} characters", state.max_query_chars));
+    }
+
+    let limit = params.limit.unwrap_or(10);
+
+    if limit == 0 || limit > crate::mirror::MAX_PRINTED_WORKS {
+        return invalid(&format!("limit is 1 to {}", crate::mirror::MAX_PRINTED_WORKS));
+    }
+
+    let found = match crate::mirror::mirror_find_works(path, title, limit).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "detail": "the copy of the works is not ready yet" })),
+        Err(e) => {
+            log::error!("cannot look up the work {:?}: {}", title, e);
+            return json(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "detail": "cannot read the copy of the catalogue" }));
+        }
+    };
+
+    if found.is_empty() {
+        return json(StatusCode::NOT_FOUND, &serde_json::json!({ "detail": "no such work" }));
+    }
+
+    let product = |id: &str| format!("https://www.dlsite.com/books/work/=/product_id/{id}.html");
+    let results: Vec<_> = found
+        .iter()
+        .map(|work| {
+            serde_json::json!({
+                "id": work.id,
+                "title": work.name,
+                "url": product(&work.id),
+                "author": work.author,
+                "position": work.position,
+                "magazine": { "id": work.issue.magazine_id, "name": work.issue.magazine_name },
+                "issue": { "id": work.issue.id, "name": work.issue.name, "url": product(&work.issue.id), "date": work.issue.date },
+            })
+        })
+        .collect();
+
+    json(StatusCode::OK, &serde_json::json!({ "input": title, "total": results.len(), "results": results }))
+}
+
 async fn sites(State(state): State<Arc<AppState>>) -> Response {
     let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
 
@@ -429,6 +490,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_magazine_route_finds_the_issues_of_a_work_in_the_copy() {
+        let dir = std::env::temp_dir().join(format!("okazuri-search-api-test-magazine-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("d1-mirror.db");
+        let sql = "CREATE TABLE `magazines` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL);
+CREATE TABLE `numbers` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL, `date` integer NOT NULL, `magazine_id` text NOT NULL);
+CREATE TABLE `authors` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL);
+CREATE TABLE `works` (`id` text PRIMARY KEY NOT NULL, `name` text NOT NULL, `date` integer NOT NULL, `position` integer NOT NULL, `number_id` text NOT NULL, `author_id` text NOT NULL);
+INSERT INTO magazines VALUES('LBL1','COMIC快楽天');
+INSERT INTO numbers VALUES('BJ2','COMIC快楽天 2026年07月号',2000,'LBL1');
+INSERT INTO authors VALUES('A1','作者');
+INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
+        crate::mirror::rebuild_mirror(&path, sql, "bm", 1).await.unwrap();
+        let state = Arc::new(AppState { mirror_path: Some(path), ..Arc::into_inner(romanizer_state()).unwrap() });
+
+        // the route is there only when there is a copy
+        assert_eq!(get_path("/okazuri/magazine?q=a").await.0, StatusCode::NOT_FOUND);
+
+        let (status, content_type, body) = get_from(state.clone(), &format!("/okazuri/magazine?q={}", encode("作品名"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("application/json"));
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["total"], 1);
+        assert_eq!(value["results"][0]["issue"]["name"], "COMIC快楽天 2026年07月号");
+        assert_eq!(value["results"][0]["magazine"]["name"], "COMIC快楽天");
+        assert_eq!(value["results"][0]["position"], 4);
+        assert_eq!(value["results"][0]["author"], "作者");
+        assert_eq!(value["results"][0]["issue"]["url"], "https://www.dlsite.com/books/work/=/product_id/BJ2.html");
+
+        assert_eq!(get_from(state.clone(), &format!("/okazuri/magazine?q={}", encode("ない"))).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_from(state.clone(), "/okazuri/magazine").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), "/okazuri/magazine?q=a&limit=0").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state, "/api/v1/okazuri/magazine?q=x").await.0, StatusCode::NOT_FOUND, "also under /api/v1 (and no such work)");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn the_translate_route_needs_a_text_and_says_when_the_site_does_not_answer() {
         // the engine of the tests has no Hitomi.La among its sites
         let (state, _) = search_state().await;
@@ -461,7 +560,7 @@ mod tests {
     async fn search_state() -> (Arc<AppState>, Arc<crate::engine::tests::Hits>) {
         let (engine, hits, _) = crate::engine::tests::setup(&SearchConfig { min_delay_ms: 0, ..SearchConfig::default() }).await;
 
-        (Arc::new(AppState { romanizer: romanizer_state().romanizer.clone(), max_query_chars: 300, search: Some(engine) }), hits)
+        (Arc::new(AppState { romanizer: romanizer_state().romanizer.clone(), max_query_chars: 300, search: Some(engine), mirror_path: None }), hits)
     }
 
     #[tokio::test]

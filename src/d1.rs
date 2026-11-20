@@ -246,7 +246,7 @@ INSERT INTO \"numbers\" (\"id\",\"name\",\"date\",\"magazine_id\") VALUES('BJ1',
                         return unauthorized();
                     }
                     assert_eq!(body["output_format"], "polling");
-                    assert_eq!(body["dump_options"]["tables"], json!(["magazines", "numbers"]));
+                    assert_eq!(body["dump_options"]["tables"], json!(["magazines", "numbers", "authors", "works"]));
 
                     s.polls.fetch_add(1, Ordering::SeqCst);
 
