@@ -70,6 +70,9 @@ export <file>                          Write the saved works to a file (JSON Lin
     --site <name>        Only the works of this site (more than once for more sites)
     --since <unix time>  Only the works saved at this time or later
     --config <path>      Config file
+dataset <directory>                    Write the saved works as a public dataset: works.jsonl.gz (the site, whether it is legal, the
+                                       address, the title, the language, first_seen, checked_at) and meta.json. No searches, no romaji
+    --config <path>      Config file
 import <file>...                        Read the files that `export` wrote into the database; the works saved already stay as they are
     --mark-done <name>   The whole list of this site is read now (the files of every shard are in): the crawl then reads only its
                          newest pages again, and the prefetch leaves the site to it (more than once for more sites)
@@ -101,6 +104,7 @@ pub enum Command {
     Translations { config: Option<PathBuf> },
     Export { file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf> },
     Import { files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf> },
+    Dataset { dir: PathBuf, config: Option<PathBuf> },
     Help,
 }
 
@@ -126,6 +130,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "translations" => parse_translations(rest),
         "export" => parse_export(rest),
         "import" => parse_import(rest),
+        "dataset" => parse_dataset(rest),
         // options with no command are the options of `serve`
         arg if arg.starts_with("--") => parse_serve(args),
         other => Err(format!("unknown command: {other}\n\n{USAGE}").into()),
@@ -356,6 +361,22 @@ fn parse_export(args: &[String]) -> Result<Command> {
     Ok(Command::Export { file: file.ok_or("export needs the file to write")?, sites, since, config })
 }
 
+fn parse_dataset(args: &[String]) -> Result<Command> {
+    let (mut dir, mut config) = (None, None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other if dir.is_none() => dir = Some(PathBuf::from(other)),
+            other => return Err(format!("dataset takes one directory, not also {other}\n\n{USAGE}").into()),
+        }
+    }
+
+    Ok(Command::Dataset { dir: dir.ok_or("dataset needs the directory to write")?, config })
+}
+
 fn parse_import(args: &[String]) -> Result<Command> {
     let (mut files, mut mark_done, mut config) = (Vec::new(), Vec::new(), None);
     let mut iter = args.iter();
@@ -407,6 +428,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Translations { config } => translations(config).await,
         Command::Export { file, sites, since, config } => export(file, sites, since, config).await,
         Command::Import { files, mark_done, config } => import(files, mark_done, config).await,
+        Command::Dataset { dir, config } => dataset(dir, config).await,
     }
 }
 
@@ -786,6 +808,16 @@ async fn export(file: PathBuf, sites: Vec<String>, since: i64, config: Option<Pa
     Ok(())
 }
 
+async fn dataset(dir: PathBuf, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let written = crate::dataset::write(&store, &crate::sites::all(), &dir).await?;
+
+    println!("{} works of {} sites written to {}", written.works, written.sites, dir.display());
+
+    Ok(())
+}
+
 async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
     let store = SearchStore::open(&config.search.db_path).await?;
@@ -946,6 +978,9 @@ mod tests {
             Command::Works { issue: "COMIC 2026".into(), config: None }
         );
         assert!(parse(&args(&["works"])).is_err());
+        assert_eq!(parse(&args(&["dataset", "out"])).unwrap(), Command::Dataset { dir: PathBuf::from("out"), config: None });
+        assert!(parse(&args(&["dataset"])).is_err());
+        assert!(parse(&args(&["dataset", "a", "b"])).is_err());
         assert_eq!(
             parse(&args(&["prefetch", "--limit", "20"])).unwrap(),
             Command::Prefetch { limit: Some(20), config: None }
