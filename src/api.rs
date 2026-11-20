@@ -39,7 +39,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         router = router.route("/okazuri/search", get(search)).route("/hitomila/search", get(hitomila_search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
     }
 
-    router.layer(axum::middleware::from_fn(cache_control)).with_state(state)
+    // The same routes are under `/api/v1` too (https://okazuri.nae.quest/api/v1/...), so a proxy in front needs no rewrite.
+    let router = router.layer(axum::middleware::from_fn(cache_control));
+    Router::new().nest("/api/v1", router.clone()).merge(router).with_state(state)
 }
 
 /// Says how long a cache (Cloudflare in front of this server, a browser) may keep an answer. Only a `200` is kept;
@@ -406,6 +408,13 @@ mod tests {
         assert_eq!(cache("/romaji?q=a").await, "public, max-age=60, s-maxage=86400");
         assert_eq!(cache("/romaji?q=").await, "no-store", "an error is not kept");
         assert_eq!(cache("/health").await, "no-store");
+    }
+
+    #[tokio::test]
+    async fn the_routes_are_under_api_v1_too() {
+        assert_eq!(get_path("/api/v1/romaji?q=a").await, get_path("/romaji?q=a").await);
+        assert_eq!(get_path("/api/v1/health").await.2, "ok");
+        assert_eq!(get_path("/api/v1/nothing").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
