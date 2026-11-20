@@ -51,6 +51,9 @@ reromanize                             Make the romaji of the saved works again 
 relanguage                             Read the language of every saved title again with the rules of this version (`works.language`),
                                        and write the works whose language is different now. Safe while the server runs
     --config <path>      Config file
+translations                           Make the translations of Hitomi.La from the saved works (the titles `English | 日本語`), so
+                                       `/hitomila/translate` can answer from the database (`import --mark-done Hitomi.La` does it too)
+    --config <path>      Config file
 export <file>                          Write the saved works to a file (JSON Lines, compressed with brotli), to put the works
                                        that a machine crawled into the database of another (`import`)
     --site <name>        Only the works of this site (more than once for more sites)
@@ -80,6 +83,7 @@ pub enum Command {
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
     Relanguage { config: Option<PathBuf> },
+    Translations { config: Option<PathBuf> },
     Export { file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf> },
     Import { files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf> },
     Help,
@@ -100,6 +104,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
         "relanguage" => parse_relanguage(rest),
+        "translations" => parse_translations(rest),
         "export" => parse_export(rest),
         "import" => parse_import(rest),
         // options with no command are the options of `serve`
@@ -216,6 +221,13 @@ fn parse_reromanize(args: &[String]) -> Result<Command> {
     Ok(Command::Reromanize { config })
 }
 
+fn parse_translations(args: &[String]) -> Result<Command> {
+    match parse_reromanize(args)? {
+        Command::Reromanize { config } => Ok(Command::Translations { config }),
+        other => Ok(other),
+    }
+}
+
 fn parse_relanguage(args: &[String]) -> Result<Command> {
     match parse_reromanize(args)? {
         Command::Reromanize { config } => Ok(Command::Relanguage { config }),
@@ -288,6 +300,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
         Command::Relanguage { config } => relanguage(config).await,
+        Command::Translations { config } => translations(config).await,
         Command::Export { file, sites, since, config } => export(file, sites, since, config).await,
         Command::Import { files, mark_done, config } => import(files, mark_done, config).await,
     }
@@ -540,6 +553,16 @@ async fn reromanize(config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Makes the translations of Hitomi.La from the saved works.
+async fn translations(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+
+    println!("{} translations made", store.build_hitomi_translations().await?);
+
+    Ok(())
+}
+
 /// Reads the language of every saved title again.
 async fn relanguage(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
@@ -576,6 +599,11 @@ async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<Path
     for site in &mark_done {
         store.mark_crawled(site, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)).await?;
         println!("{site}: marked as read to its end");
+
+        // the whole of Hitomi.La is in the database now: its translations are made from it
+        if site == "Hitomi.La" {
+            println!("Hitomi.La: {} translations made", store.build_hitomi_translations().await?);
+        }
     }
 
     Ok(())

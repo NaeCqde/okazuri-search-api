@@ -327,6 +327,16 @@ pub async fn search(fetch: &mut impl Fetch, query: &str, limit: usize) -> Result
     Ok(galleries(fetch, query, limit).await?.iter().map(Gallery::link).collect())
 }
 
+/// The English and the Japanese title of a work whose Hitomi.La title has both (`English | 日本語`): the Japanese side has kana
+/// (a side with only Han characters may be Chinese, which Hitomi.La puts the same way), the English side has none.
+pub fn title_pair(title: &str) -> Option<(String, String)> {
+    let (english, japanese) = title.split_once(" | ")?;
+    let (english, japanese) = (english.trim(), japanese.trim());
+    let kana = |text: &str| text.chars().any(|c| ('\u{3040}'..='\u{30FF}').contains(&c));
+
+    (!english.is_empty() && kana(japanese) && !kana(english)).then(|| (english.to_string(), japanese.to_string()))
+}
+
 /// Letters and digits in lower case, without the spaces and the marks between them: how a title is compared with the text.
 pub fn squash(text: &str) -> String {
     text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
@@ -442,6 +452,18 @@ mod tests {
                 (5, r#"{"id":"5","title":"Ane to Otouto | 姉弟","japanese_title":"姉弟"}"#),
             ],
         )
+    }
+
+    #[test]
+    fn the_two_titles_of_a_work_are_the_pair_when_the_other_side_is_japanese() {
+        assert_eq!(title_pair("COMIC Orga Vol. 76 | COMICオルガ vol.76"), Some(("COMIC Orga Vol. 76".to_string(), "COMICオルガ vol.76".to_string())));
+        assert_eq!(title_pair("Kyoudai de Shitara Ikemasen | 姉弟でシたらいけません").unwrap().1, "姉弟でシたらいけません");
+        // Chinese (Han only), no second title, nothing in front
+        assert_eq!(title_pair("Luluhawa | 雖然來了永久長夏祭典"), None);
+        assert_eq!(title_pair("Merry Tentacle Christmas!"), None);
+        assert_eq!(title_pair(" | ひらがな"), None);
+        // the English side that has kana is not English
+        assert_eq!(title_pair("ひらがな | カタカナ"), None);
     }
 
     #[test]

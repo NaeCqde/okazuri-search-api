@@ -35,11 +35,14 @@ struct Line {
     title: String,
     first_seen: i64,
     updated_at: i64,
+    /// The language (the flags are taken out of the titles, so it is sent along; a file of an older version has none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
 }
 
 impl From<work::Model> for Line {
     fn from(row: work::Model) -> Self {
-        Self { website: row.website, path: row.path, title: row.title, first_seen: row.first_seen, updated_at: row.updated_at }
+        Self { website: row.website, path: row.path, title: row.title, first_seen: row.first_seen, updated_at: row.updated_at, language: row.language }
     }
 }
 
@@ -119,16 +122,17 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
         lines
             .into_iter()
             .map(|line| {
-                let converted = romaji(&line.title, &romanizer).unwrap_or_else(|_| line.title.clone());
-
-                let language = crate::language::detect(&line.title);
+                // the language is read from the title with its flags; the title is kept without them
+                let language = crate::language::detect(&line.title).or(line.language.clone());
+                let title = crate::language::strip_flags(&line.title);
+                let converted = romaji(&title, &romanizer).unwrap_or_else(|_| title.clone());
 
                 work::Model {
                     website: line.website,
                     path: line.path,
                     title_key: crate::query::title_key(&converted),
                     title_romaji: converted,
-                    title: line.title,
+                    title,
                     first_seen: line.first_seen,
                     updated_at: line.updated_at,
                     language,
@@ -149,7 +153,7 @@ mod tests {
     use crate::store::NewWork;
 
     fn work(path: &str, title: &str) -> NewWork {
-        NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string() }
+        NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string(), language: crate::language::detect(title) }
     }
 
     async fn filled() -> SearchStore {

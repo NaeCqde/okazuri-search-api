@@ -105,6 +105,8 @@ when Hitomi.La is left out of `[search]`.
 
 ### `GET /hitomila/translate?q=<text>`: Japanese to English, English to Japanese
 
+Hitomi.La is used (here, in `/auto/translate`, and in the search) only when its **whole list is saved** (`import --mark-done Hitomi.La`, or a crawl that reached the end): asked live, a search or a translation takes far too long. Before, `/hitomila/translate` is a `503`, `/auto/translate` goes to Google, and the search leaves Hitomi.La out (`unavailable`). When the list is saved, `import --mark-done Hitomi.La` (or `okazuri-search-api translations`) also makes the translations from the titles that have both (`English | 日本語`), so `live=off` has an answer.
+
 A translation of the title of a work, from the titles of Hitomi.La: a gallery has its title in English and in Japanese, and the
 site keeps the words of both in one index. The language of `q` says the direction: Japanese (it has kana or kanji) to English, or
 English (its letters are all Latin) to Japanese. Any other text is a 422: only these two are translated.
@@ -280,7 +282,7 @@ brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). The an
 names them (`zh`, `en,ja`, `zh,en,ja,ko`), and NULL when the title says none (most titles are Japanese and do not say so). The search
 answers it as `language`, a list of the codes in that order (`["zh", "en"]`; `[]` when there is none). A database from before this has the column added, and the titles read, when it is opened. The
 file of `export` does not have it: `import` makes it (as it makes the romaji and the key). When the rules change,
-`okazuri-search-api relanguage` reads every title again and writes the works that came out different (`reromanize` also writes it for the works whose romaji changed).
+`okazuri-search-api relanguage` reads every title again and writes the works that came out different (`reromanize` also writes it for the works whose romaji changed). A flag (🇯🇵, 🇨🇳, ...) anywhere in a title names its language and is **taken out of the title** (and its romaji and key): new works are saved without it, and `relanguage` does it for the works saved before. Since the flag is gone afterwards, a language that a title no longer names is kept, not cleared (to clear a wrong one: `UPDATE works SET language = NULL WHERE ...`, then `relanguage`).
 
 ## Crawling (`[crawl]`)
 

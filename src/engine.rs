@@ -51,6 +51,12 @@ pub struct Hit {
     pub title: String,
     /// The romaji of the title: what the query was matched with.
     pub title_romaji: String,
+    /// The English title: the title itself when it is English, the English side of a title that has both (`English | 日本語`), or a
+    /// saved translation (Hitomi.La's, else Google's); None when there is none. It is never asked for: only what is saved.
+    pub title_english: Option<String>,
+    /// Where `title_english` comes from: `official` (the title, or Hitomi.La's, which is the work's own title) or `google` (a machine
+    /// translation); None with it.
+    pub title_english_source: Option<String>,
     /// The languages the title names (`language.rs`), as two-letter codes in the order it names them (`["zh", "en"]`); `[]` when it
     /// names none.
     pub language: Vec<String>,
@@ -197,7 +203,7 @@ pub struct Fetched {
 pub struct SiteReport {
     pub website: String,
     /// `searched` (asked now), `cached` (asked less than `ttl_hours` ago, so the database answers), `failed` (a query
-    /// failed), or `not searched` (the request said not to ask the sites).
+    /// failed), `not searched` (the request said not to ask the sites) or `unavailable` (Hitomi.La, while its whole list is not saved).
     pub status: &'static str,
     /// The queries the site is asked: the query as it was written and its romaji for a site that finds Japanese
     /// titles (when the query has Japanese in it), the romaji alone otherwise.
@@ -442,9 +448,12 @@ impl Engine {
         links
             .into_iter()
             .map(|link| {
-                let converted = romaji(&link.title, &self.romanizer).unwrap_or_else(|_| link.title.clone());
+                // the language is read from the title with its flags; the title is kept without them
+                let language = crate::language::detect(&link.title);
+                let title = crate::language::strip_flags(&link.title);
+                let converted = romaji(&title, &self.romanizer).unwrap_or_else(|_| title.clone());
 
-                NewWork { path: link.path, title: link.title, romaji: converted }
+                NewWork { path: link.path, title, romaji: converted, language }
             })
             .collect()
     }
@@ -732,17 +741,25 @@ impl Engine {
             return Err("the query is empty".into());
         }
 
+        // Hitomi.La is searched only when its whole list is saved: asked live (its index files, a few dozen requests) a search takes far too long
+        let mut exclude: Vec<usize> = request.exclude.to_vec();
+        let unlisted = self.hitomi_unlisted().await?;
+        if let Some(index) = unlisted {
+            exclude.push(index);
+        }
+        let exclude = exclude.as_slice();
+
         let fetched = match request.live {
             Live::Off => Fetched::default(),
-            Live::Diff => self.fetch_with(request.query, true, false, request.exclude).await?,
-            Live::Force => self.fetch_with(request.query, true, true, request.exclude).await?,
+            Live::Diff => self.fetch_with(request.query, true, false, exclude).await?,
+            Live::Force => self.fetch_with(request.query, true, true, exclude).await?,
         };
 
         let mut hits: Vec<Hit> = Vec::new();
         for work in self.store.candidates(&terms.prefilters()).await? {
             // a site that is left out does not answer, whatever was saved of it
             let Some(&index) = self.active.iter().find(|&&i| self.sites[i].def.name == work.website) else { continue };
-            if request.exclude.contains(&index) {
+            if exclude.contains(&index) {
                 continue;
             }
 
@@ -758,6 +775,8 @@ impl Engine {
                     path: work.path,
                     title: work.title,
                     title_romaji: work.title_romaji,
+                    title_english: None,
+                    title_english_source: None,
                     language: work.language.map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
                     is_new,
                 });
@@ -771,9 +790,23 @@ impl Engine {
         let total = hits.len();
         let mut hits = hits;
         hits.truncate(request.limit.max(1));
+        self.fill_english(&mut hits).await?;
 
         Ok(Outcome {
-            sites: self.reports(&plan, &fetched.asked, request.live != Live::Off, request.exclude).await?,
+            sites: {
+                let mut sites = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
+                if let Some(index) = unlisted.filter(|index| !request.exclude.contains(index)) {
+                    sites.push(SiteReport {
+                        website: self.sites[index].def.name.to_string(),
+                        status: "unavailable",
+                        queries: Vec::new(),
+                        count: 0,
+                        error: Some("the whole list of the site is not saved yet".to_string()),
+                        searched_at: None,
+                    });
+                }
+                sites
+            },
             input: plan.input,
             terms: terms.keys().into_iter().map(str::to_string).collect(),
             total,
@@ -782,6 +815,61 @@ impl Engine {
             translation: None,
             translation_ja: None,
         })
+    }
+
+    /// Whether Hitomi.La is one of the sites and its whole list is not saved yet (its crawl has not reached the end): its search and its
+    /// translations are not used then.
+    pub async fn hitomi_waits_for_its_list(&self) -> Result<bool> {
+        let Some(site) = self.sites.iter().find(|site| site.def.format == Format::Hitomi) else { return Ok(false) };
+        let done = self.store.crawl_done().await?;
+
+        Ok(!done.iter().any(|name| name == site.def.name))
+    }
+
+    /// The index of Hitomi.La when it is one of the searched sites and its whole list is not saved (the crawl has not reached the end):
+    /// it is not searched then.
+    async fn hitomi_unlisted(&self) -> Result<Option<usize>> {
+        let Some(&index) = self.active.iter().find(|&&index| self.sites[index].def.format == Format::Hitomi) else { return Ok(None) };
+        let done = self.store.crawl_done().await?;
+
+        Ok((!done.iter().any(|name| name == self.sites[index].def.name)).then_some(index))
+    }
+
+    /// Writes the English title of the works (`Hit::title_english`) from what is saved: no request to a site.
+    async fn fill_english(&self, hits: &mut [Hit]) -> Result<()> {
+        let key_of = |title: &str| crate::hitomi::squash(&crate::query::work_title(title, true));
+        let mut wanted: Vec<String> = Vec::new();
+
+        for hit in hits.iter_mut() {
+            if let Some((english, _)) = crate::hitomi::title_pair(&hit.title) {
+                // both titles are the work's own
+                hit.title_english = Some(english);
+                hit.title_english_source = Some("official".to_string());
+            } else if !crate::query::has_japanese(&hit.title) {
+                // a title in Latin letters, or in the language it names: only an English one is the English title
+                if hit.language.is_empty() || hit.language.iter().any(|code| code == "en") {
+                    hit.title_english = Some(hit.title.clone());
+                    hit.title_english_source = Some("official".to_string());
+                }
+            } else {
+                wanted.push(key_of(&hit.title));
+            }
+        }
+
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let found = self.store.english_titles(&wanted).await?;
+
+        for hit in hits.iter_mut().filter(|hit| hit.title_english.is_none() && crate::query::has_japanese(&hit.title)) {
+            if let Some((english, source)) = found.get(&key_of(&hit.title)) {
+                hit.title_english = Some(english.clone());
+                // Hitomi.La's English title is the work's own; Google's is a translation
+                hit.title_english_source = Some(if source == "google" { "google" } else { "official" }.to_string());
+            }
+        }
+
+        Ok(())
     }
 
     async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool, exclude: &[usize]) -> Result<Vec<SiteReport>> {
@@ -970,6 +1058,12 @@ impl Engine {
 
         if key.is_empty() {
             return Ok((Vec::new(), false));
+        }
+
+        // Hitomi.La is used only when its whole list is saved (asked live, a translation takes far too long): nothing is answered
+        // before, and `translate_auto` goes on to Google
+        if self.hitomi_waits_for_its_list().await? {
+            return Ok((Vec::new(), true));
         }
 
         let saved = self.store.translations(&key, "hitomi").await?;
@@ -1558,7 +1652,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_work_whose_romaji_changed_is_written_again_and_its_search_is_forgotten() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into() };
+        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None };
 
         // saved by an older version: the romaji of 彼女を was "kanojo wo"; the second work is the same as now
         store.save("q1", "Good", 7, &Ok(vec![work("/work/1", "彼女を", "kanojo wo")]), false).await.unwrap();
@@ -1582,7 +1676,7 @@ pub(crate) mod tests {
         let (engine, _, store) = setup(&config()).await;
 
         // an earlier search saved a work of the same words that this request will not find again
-        store.save("old", "Good", 1, &Ok(vec![NewWork { path: "/work/77".into(), title: "q earlier".into(), romaji: "q earlier".into() }]), false).await.unwrap();
+        store.save("old", "Good", 1, &Ok(vec![NewWork { path: "/work/77".into(), title: "q earlier".into(), romaji: "q earlier".into(), language: None }]), false).await.unwrap();
 
         let outcome = engine.search(&Request::new("q")).await.unwrap();
         let by_path = |path: &str| outcome.results.iter().find(|h| h.path == path).map(|h| h.is_new);
@@ -1738,7 +1832,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_same_address_is_one_result() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None };
 
         // one page saved with and without the slash at the end, and a different page
         store.save("a", "Good", 1, &Ok(vec![work("/work/10/", "alpha one"), work("/work/11", "alpha two")]), false).await.unwrap();
@@ -1756,8 +1850,8 @@ pub(crate) mod tests {
         let (engine, _, store) = setup(&config()).await;
 
         // pages that are not the same page, as different queries find them
-        store.save("a", "Good", 1, &Ok(vec![NewWork { path: "/work/10".into(), title: "alpha beta one".into(), romaji: "alpha beta one".into() }]), false).await.unwrap();
-        store.save("b", "Good", 2, &Ok(vec![NewWork { path: "/work/11".into(), title: "gamma one".into(), romaji: "gamma one".into() }]), false).await.unwrap();
+        store.save("a", "Good", 1, &Ok(vec![NewWork { path: "/work/10".into(), title: "alpha beta one".into(), romaji: "alpha beta one".into(), language: None }]), false).await.unwrap();
+        store.save("b", "Good", 2, &Ok(vec![NewWork { path: "/work/11".into(), title: "gamma one".into(), romaji: "gamma one".into(), language: None }]), false).await.unwrap();
 
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("beta alpha") }).await.unwrap();
         assert_eq!(outcome.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["alpha beta one"], "any order");
@@ -1895,7 +1989,7 @@ pub(crate) mod tests {
     async fn a_title_that_has_the_query_in_parentheses_is_not_an_answer() {
         let (engine, _, store) = setup(&config()).await;
 
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase() };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: None };
         store
             .save(
                 "q",
@@ -2012,7 +2106,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_works_of_a_site_that_is_left_out_are_not_in_the_answer() {
         let (engine, _, store) = setup(&SearchConfig { disabled_sites: vec!["good".into()], ..config() }).await;
-        store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/1".into(), title: "saved title".into(), romaji: "saved title".into() }]), false).await.unwrap();
+        store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/1".into(), title: "saved title".into(), romaji: "saved title".into(), language: None }]), false).await.unwrap();
 
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("saved") }).await.unwrap();
 
@@ -2067,7 +2161,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_language_of_a_result_is_a_list_and_empty_when_the_title_names_none() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title) };
 
         store.save_crawled("Good", 1, &[work("/work/1", "kanojo [CN,EN,JP,KR]"), work("/work/2", "kanojo plain")], None).await.unwrap();
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
@@ -2076,5 +2170,41 @@ pub(crate) mod tests {
         assert!(languages.contains(&("/work/1", vec!["zh".to_string(), "en".to_string(), "ja".to_string(), "ko".to_string()])), "{languages:?}");
         assert!(languages.contains(&("/work/2", Vec::new())), "{languages:?}");
         assert_eq!(serde_json::to_value(&outcome.results[0]).unwrap()["language"].is_array(), true);
+    }
+
+    #[tokio::test]
+    async fn the_english_title_of_a_result_is_the_title_a_pair_or_a_saved_translation_and_says_where_it_is_from() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title) };
+        let row = |english: &str, japanese: &str, source: &str| crate::entity::translation::Model {
+            key: crate::hitomi::squash(japanese),
+            gallery_id: 0,
+            position: 0,
+            url: String::new(),
+            english: english.into(),
+            japanese: japanese.into(),
+            english_key: crate::hitomi::squash(english),
+            japanese_key: crate::hitomi::squash(japanese),
+            exact: true,
+            source: source.into(),
+        };
+
+        store
+            .save_crawled("Good", 1, &[work("/1", "kanojo plain"), work("/2", "kanojo | 彼女です"), work("/3", "彼女A kanojo"), work("/4", "彼女B kanojo"), work("/5", "彼女C kanojo")], None)
+            .await
+            .unwrap();
+        store.save_translations("k3", "hitomi", "彼女A kanojo", "ja", 1, &[row("Her A", "彼女A kanojo", "hitomi")]).await.unwrap();
+        store.save_translations("k4", "google", "彼女B kanojo", "ja", 1, &[row("Her B", "彼女B kanojo", "google")]).await.unwrap();
+
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
+        let english: Vec<_> = outcome.results.iter().map(|hit| (hit.path.as_str(), hit.title_english.as_deref(), hit.title_english_source.as_deref())).collect();
+
+        assert!(english.contains(&("/1", Some("kanojo plain"), Some("official"))), "{english:?}");
+        assert!(english.contains(&("/2", Some("kanojo"), Some("official"))), "{english:?}");
+        assert!(english.contains(&("/3", Some("Her A"), Some("official"))), "Hitomi.La's is the work's own title: {english:?}");
+        assert!(english.contains(&("/4", Some("Her B"), Some("google"))), "{english:?}");
+        assert!(english.contains(&("/5", None, None)), "nothing saved, nothing asked: {english:?}");
+        let json = serde_json::to_value(&outcome.results[0]).unwrap();
+        assert!(json.get("titleEnglish").is_some() && json.get("titleEnglishSource").is_some());
     }
 }

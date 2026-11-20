@@ -41,8 +41,11 @@ impl From<search::Model> for SiteState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewWork {
     pub path: String,
+    /// The title without its flags (`language::strip_flags`).
     pub title: String,
     pub romaji: String,
+    /// The language, read from the title *with* its flags (`language::detect`).
+    pub language: Option<String>,
 }
 
 /// A saved work.
@@ -495,7 +498,7 @@ impl SearchStore {
                     title_key: Set(title_key(&item.romaji)),
                     first_seen: Set(now),
                     updated_at: Set(now),
-                    language: Set(language::detect(&item.title)),
+                    language: Set(item.language.clone()),
                     deleted: Set(false),
                     checked_at: Set(None),
                 }),
@@ -506,7 +509,7 @@ impl SearchStore {
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
                     changed.title_key = Set(title_key(&item.romaji));
-                    changed.language = Set(language::detect(&item.title));
+                    changed.language = Set(item.language.clone());
                     changed.updated_at = Set(now);
                     changed.update(db).await?;
                 }
@@ -575,13 +578,84 @@ impl SearchStore {
         Ok(())
     }
 
+    /// The saved English titles of Japanese titles (`squash`ed): the English side of a translation that has the title as its Japanese
+    /// side, as (English, source). Hitomi.La's is the one when both have it. Nothing is asked.
+    pub async fn english_titles(&self, japanese_keys: &[String]) -> Result<HashMap<String, (String, String)>> {
+        let rows = translation::Entity::find().filter(translation::Column::JapaneseKey.is_in(japanese_keys.to_vec())).order_by_desc(translation::Column::GalleryId).all(&self.db).await?;
+        let mut found: HashMap<String, (String, String)> = HashMap::new();
+
+        for row in rows {
+            let better = found.get(&row.japanese_key).is_none_or(|(_, source)| source != "hitomi" && row.source == "hitomi");
+
+            if better && !row.english.is_empty() {
+                found.insert(row.japanese_key.clone(), (row.english, row.source));
+            }
+        }
+
+        Ok(found)
+    }
+
+    /// Makes the translations of Hitomi.La (`translations`, source `hitomi`) from the saved works: the title of a gallery that has both
+    /// (`English | 日本語`, `hitomi::title_pair`) is its translation in both directions. It is what `/hitomila/translate` answers
+    /// with `live=off`, with no request to the site. A pair that is saved already stays. Returns how many pairs were new.
+    pub async fn build_hitomi_translations(&self) -> Result<usize> {
+        let mut new = 0;
+        let mut after: Option<String> = None;
+
+        loop {
+            let mut query = work::Entity::find().filter(work::Column::Website.eq("Hitomi.La")).filter(work::Column::Deleted.eq(false));
+            if let Some(path) = &after {
+                query = query.filter(work::Column::Path.gt(path.as_str()));
+            }
+            let page = query.order_by_asc(work::Column::Path).limit(5000).all(&self.db).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.path.clone());
+
+            let rows: Vec<translation::ActiveModel> = page
+                .iter()
+                .filter_map(|row| {
+                    let (english, japanese) = crate::hitomi::title_pair(&row.title)?;
+                    let id: i64 = row.path.strip_prefix("/galleries/")?.split('.').next()?.parse().ok()?;
+                    let (english_key, japanese_key) = (crate::hitomi::squash(&english), crate::hitomi::squash(&japanese));
+
+                    (!english_key.is_empty() && !japanese_key.is_empty()).then(|| {
+                        translation::Model {
+                            key: english_key.clone(),
+                            gallery_id: id,
+                            position: 0,
+                            url: format!("https://hitomi.la{}", row.path),
+                            english,
+                            japanese,
+                            english_key,
+                            japanese_key,
+                            exact: true,
+                            source: "hitomi".to_string(),
+                        }
+                        .into_active_model()
+                    })
+                })
+                .collect();
+
+            if !rows.is_empty() {
+                let transaction = self.db.begin().await?;
+                new += translation::Entity::insert_many(rows)
+                    .on_conflict(OnConflict::columns([translation::Column::Key, translation::Column::GalleryId]).do_nothing().to_owned())
+                    .exec_without_returning(&transaction)
+                    .await? as usize;
+                transaction.commit().await?;
+            }
+        }
+
+        Ok(new)
+    }
+
     /// Where the crawl of a site stands (None: it never ran).
     pub async fn crawl_state(&self, website: &str) -> Result<Option<crawl_state::Model>> {
         Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?)
     }
 
-    /// Reads the language of every title again (`language.rs`), for when its rules changed. Only the works whose language is
-    /// different now are written. Returns how many works were looked at and how many were written.
+    /// Reads the language of every title again (`language.rs`), for when its rules changed, and takes the flags out of the titles
+    /// (and their romaji and key). Only the works that are different now are written. Returns how many works were looked at and how many were written.
     pub async fn relanguage(&self) -> Result<(usize, usize)> {
         let (mut looked, mut changed) = (0, 0);
         let mut after: Option<(String, String)> = None;
@@ -594,9 +668,24 @@ impl SearchStore {
 
             let transaction = self.db.begin().await?;
             for row in page {
-                let now = language::detect(&row.title);
+                // the flags are taken out of the titles (the language they name stays in `language`), so a title that names nothing
+                // keeps the language it has: the flag that named it is gone
+                let now = language::detect(&row.title).or(row.language.clone());
+                let title = language::strip_flags(&row.title);
 
-                if now != row.language {
+                if title != row.title {
+                    let romaji = language::strip_flags(&row.title_romaji);
+                    work::Entity::update_many()
+                        .col_expr(work::Column::Title, Expr::value(title))
+                        .col_expr(work::Column::TitleKey, Expr::value(title_key(&romaji)))
+                        .col_expr(work::Column::TitleRomaji, Expr::value(romaji))
+                        .col_expr(work::Column::Language, Expr::value(now))
+                        .filter(work::Column::Website.eq(row.website.as_str()))
+                        .filter(work::Column::Path.eq(row.path.as_str()))
+                        .exec(&transaction)
+                        .await?;
+                    changed += 1;
+                } else if now != row.language {
                     work::Entity::update_many()
                         .col_expr(work::Column::Language, Expr::value(now))
                         .filter(work::Column::Website.eq(row.website.as_str()))
@@ -799,7 +888,7 @@ impl SearchStore {
             let mut changed = known.clone().into_active_model();
             changed.title_romaji = Set(romaji.clone());
             changed.title_key = Set(title_key(romaji));
-            changed.language = Set(language::detect(&known.title));
+            changed.language = Set(language::detect(&known.title).or(known.language.clone()));
             changed.update(&transaction).await?;
 
             for row in listing::Entity::find()
@@ -907,7 +996,7 @@ mod tests {
     use std::fs;
 
     fn link(path: &str, title: &str) -> NewWork {
-        NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase() }
+        NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: language::detect(title) }
     }
 
     fn titles(works: &[Work]) -> Vec<&str> {
@@ -1005,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn a_work_whose_page_is_gone_is_removed_and_not_saved_again_by_a_list_the_crawl_or_an_import() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |path: &str| NewWork { path: path.to_string(), title: format!("title {path}"), romaji: format!("title {path}") };
+        let work = |path: &str| NewWork { path: path.to_string(), title: format!("title {path}"), romaji: format!("title {path}"), language: None };
 
         store.save("q", "Site", 100, &Ok(vec![work("/a"), work("/b")]), false).await.unwrap();
         assert_eq!(store.due_checks("Site", 0, 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
@@ -1331,7 +1420,7 @@ mod tests {
 
         let store = SearchStore::open(&path).await.unwrap();
         store
-            .save_crawled("A", 1, &[NewWork { path: "/g/1/".into(), title: "[x] y [中国翻訳]".into(), romaji: "y".into() }, NewWork { path: "/g/2/".into(), title: "plain".into(), romaji: "plain".into() }], None)
+            .save_crawled("A", 1, &[NewWork { path: "/g/1/".into(), title: "[x] y [中国翻訳]".into(), romaji: "y".into(), language: Some("zh".into()) }, NewWork { path: "/g/2/".into(), title: "plain".into(), romaji: "plain".into(), language: None }], None)
             .await
             .unwrap();
         // a database of a version that had no language
@@ -1348,23 +1437,63 @@ mod tests {
     #[tokio::test]
     async fn relanguage_writes_only_the_works_whose_language_changed() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into() };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: language::detect(title) };
 
         store.save_crawled("A", 1, &[work("/1", "x [English]"), work("/2", "plain"), work("/3", "y [中国翻訳]")], None).await.unwrap();
         // the rules were different when these were saved
         store.db.execute_unprepared("UPDATE works SET language = 'ko' WHERE path = '/1'").await.unwrap();
         store.db.execute_unprepared("UPDATE works SET language = 'fr' WHERE path = '/2'").await.unwrap();
 
-        assert_eq!(store.relanguage().await.unwrap(), (3, 2));
+        // a language that the title no longer names stays (the flag that named it was taken out of the title): '/2' keeps its 'fr'
+        assert_eq!(store.relanguage().await.unwrap(), (3, 1));
         let found: Vec<_> = store.works_after(None, 10).await.unwrap().into_iter().map(|w| w.language).collect();
-        assert_eq!(found, [Some("en".to_string()), None, Some("zh".to_string())]);
+        assert_eq!(found, [Some("en".to_string()), Some("fr".to_string()), Some("zh".to_string())]);
         assert_eq!(store.relanguage().await.unwrap(), (3, 0), "nothing changed the second time");
+    }
+
+    #[tokio::test]
+    async fn relanguage_takes_the_flags_out_of_the_titles_and_keeps_the_language_they_named() {
+        let store = SearchStore::in_memory().await.unwrap();
+        // saved by a version that kept the flags in the title and in the romaji
+        let old = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: language::detect(title) };
+
+        store.save_crawled("A", 1, &[old("/1", "\u{1F1EF}\u{1F1F5} COMIC Shitsurakuten 2026-11"), old("/2", "\u{1F1E8}\u{1F1F3} Title B"), old("/3", "plain")], None).await.unwrap();
+
+        assert_eq!(store.relanguage().await.unwrap(), (3, 2));
+        let found: Vec<_> = store.works_after(None, 10).await.unwrap().into_iter().map(|w| (w.title, w.title_romaji, w.language)).collect();
+        assert_eq!(
+            found,
+            [
+                ("COMIC Shitsurakuten 2026-11".to_string(), "comic shitsurakuten 2026-11".to_string(), Some("ja".to_string())),
+                ("Title B".to_string(), "title b".to_string(), Some("zh".to_string())),
+                ("plain".to_string(), "plain".to_string(), None),
+            ]
+        );
+        assert_eq!(store.relanguage().await.unwrap(), (3, 0), "the second time nothing changes, and the language stays");
+    }
+
+    #[tokio::test]
+    async fn the_translations_of_hitomi_are_made_from_the_titles_that_have_both() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None };
+
+        store
+            .save_crawled("Hitomi.La", 1, &[work("/galleries/10.html", "Kyoudai | きょうだい"), work("/galleries/11.html", "Only English"), work("/galleries/12.html", "Chinese | 雖然來了")], None)
+            .await
+            .unwrap();
+        store.save_crawled("Other", 1, &[work("/galleries/13.html", "Other | 別のサイト")], None).await.unwrap();
+
+        assert_eq!(store.build_hitomi_translations().await.unwrap(), 1);
+        assert_eq!(store.build_hitomi_translations().await.unwrap(), 0, "the same pair is not made twice");
+        let by_english = store.translations("kyoudai", "hitomi").await.unwrap();
+        assert_eq!((by_english.len(), by_english[0].japanese.as_str(), by_english[0].gallery_id), (1, "きょうだい", 10));
+        assert_eq!(store.translations_with("hitomi", false, "きょうだい", false, 5).await.unwrap().len(), 1, "and from the Japanese side");
     }
 
     #[tokio::test]
     async fn words_that_are_common_alone_find_the_few_works_that_have_all_of_them() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into() };
+        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into(), language: language::detect(title) };
         let mut works: Vec<NewWork> = (0..30).map(|n| work(n, &format!("alpha item {n}"))).collect();
         works.extend((30..60).map(|n| work(n, &format!("beta item {n}"))));
         // the oldest work is the only one with both

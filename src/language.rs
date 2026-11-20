@@ -68,6 +68,30 @@ fn is_indicator(c: char) -> bool {
     ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
 }
 
+/// The title without its flags (two regional indicators, 🇯🇵 🇨🇳 ...), wherever they are: the language they name is in
+/// `works.language` (`detect`), so the title does not need them. The white space they leave is tidied up: one space where a
+/// flag was between two words, none at the start or the end.
+pub fn strip_flags(title: &str) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    let mut out = String::with_capacity(title.len());
+    let mut at = 0;
+
+    while at < chars.len() {
+        if at + 1 < chars.len() && is_indicator(chars[at]) && is_indicator(chars[at + 1]) {
+            at += 2;
+            // the white space after the flag goes when nothing (or white space) is before it
+            while at < chars.len() && chars[at].is_whitespace() && (out.is_empty() || out.ends_with(char::is_whitespace)) {
+                at += 1;
+            }
+        } else {
+            out.push(chars[at]);
+            at += 1;
+        }
+    }
+
+    out.trim().to_string()
+}
+
 struct Patterns {
     chinese: Regex,
     chinese_label: Regex,
@@ -148,23 +172,22 @@ pub fn detect_all(title: &str) -> Vec<&'static str> {
     let mut found: Vec<&'static str> = Vec::new();
     // the title says Japanese itself (in a bracket), not only the flag a site put first
     let mut japanese_tag = false;
-    let mut text = title.trim();
 
-    // the flags that the site put first
-    loop {
-        let rest = text.trim_start();
-        let mut chars = rest.chars();
-
-        match (chars.next(), chars.next()) {
-            (Some(first), Some(second)) if is_indicator(first) && is_indicator(second) => {
-                if let Some(code) = code_of_flag(first, second) {
-                    add(&mut found, code);
-                }
-                text = &rest[first.len_utf8() + second.len_utf8()..];
+    // the flags the title has (a site puts one first, RokuHentai; one may be anywhere), and the title without them
+    let chars: Vec<char> = title.chars().collect();
+    let mut at = 0;
+    while at + 1 < chars.len() {
+        if is_indicator(chars[at]) && is_indicator(chars[at + 1]) {
+            if let Some(code) = code_of_flag(chars[at], chars[at + 1]) {
+                add(&mut found, code);
             }
-            _ => break,
+            at += 2;
+        } else {
+            at += 1;
         }
     }
+    let without_flags = strip_flags(title);
+    let text = without_flags.as_str();
 
     if patterns.chinese.is_match(text) {
         add(&mut found, "zh");
@@ -254,6 +277,20 @@ mod tests {
         is("🇯🇵 A", "ja");
         is("🇺🇸🇰🇷 A", "en,ko");
         is("🇹🇼 A", "zh");
+    }
+
+    #[test]
+    fn a_flag_anywhere_names_its_language_and_is_taken_out_of_the_title() {
+        is("A [Hamao] 🇨🇳", "zh");
+        is("A 🇰🇷 B", "ko");
+        assert_eq!(strip_flags("🇯🇵 COMIC Shitsurakuten 2026-11"), "COMIC Shitsurakuten 2026-11");
+        assert_eq!(strip_flags("🇺🇸🇰🇷 A"), "A");
+        assert_eq!(strip_flags("A 🇰🇷 B"), "A B");
+        assert_eq!(strip_flags("A B 🇰🇷"), "A B");
+        assert_eq!(strip_flags("A🇰🇷B"), "AB");
+        assert_eq!(strip_flags("No flag  here"), "No flag  here");
+        // one indicator alone is not a flag
+        assert_eq!(strip_flags("A \u{1F1E8} B"), "A \u{1F1E8} B");
     }
 
     #[test]
