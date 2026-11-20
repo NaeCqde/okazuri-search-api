@@ -47,11 +47,12 @@ GET /okazuri/search?q=快楽天 2026 7
   parameters of the query string that name the work); `url` is the domain of the site put before it.
 - `input` is `q` as it was sent (tidied up), and `query` is its **romaji**: what the sites were asked, and what the
   titles were matched with. A `q` without Japanese in it is its own romaji. `titleRomaji` is the romaji of `title`.
+- `titleEnglish` is the English title of a result and `titleEnglishSource` where it is from (`{"official"|"google"}`, both `null` when there is none): the title itself when it is English, the English side of a title that has both (`English | 日本語`) or a saved translation: Hitomi.La's is the work's own title (`official`), Google's is a machine translation (`google`). Nothing is asked for it.
 - `translation` is the English title of a query with Japanese in it, and `translationJa` the Japanese title of a query without Japanese (`{"text", "source"}`, or `null`): the works with that title are in `results` too ([SEARCH.md](SEARCH.md)).
 - `total` is how many saved works have all the words; `results` is cut to `limit`.
 - `isNew` is true for a work that this request found on a site and saved: it was not in the database before. A work that is
   found again is not new, and its row is left as it is (it is written again only if its title changed).
-- `sites` says what came of each site: `searched` (asked now), `cached` (`live=diff`, and asked less than `ttl_hours` ago: the database answers), `failed` (with the `error`) or `not searched` (`live=off`), with the `queries`
+- `sites` says what came of each site: `searched` (asked now), `cached` (`live=diff`, and asked less than `ttl_hours` ago: the database answers), `failed` (with the `error`), `not searched` (`live=off`) or `unavailable` (Hitomi.La while its whole list is not saved: it is then not searched at all), with the `queries`
   the site is asked: `["快楽天", "kairakuten"]` for a site that finds Japanese titles when `q` has Japanese in it, `["kairakuten"]`
   otherwise (a `q` without Japanese, or a site that does not find Japanese titles: EHentai, HentaiEra). `count` is the works the queries listed together.
   The request is `200` even if some sites failed.

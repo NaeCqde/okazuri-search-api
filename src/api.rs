@@ -190,6 +190,12 @@ async fn hitomila_translate(State(state): State<Arc<AppState>>, Query(params): Q
     if live == Live::Off {
         return invalid("live=off is not available for /hitomila/translate: diff or force");
     }
+    // Hitomi.La is used only when its whole list is saved
+    match engine.hitomi_waits_for_its_list().await {
+        Ok(false) => {}
+        Ok(true) => return json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "detail": "the whole list of Hitomi.La is not saved yet" })),
+        Err(_) => return server_error(),
+    }
 
     match engine.translate_hitomi(&text, from, live).await {
         Ok((results, saved)) => {
