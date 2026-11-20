@@ -1032,6 +1032,35 @@ impl Engine {
         crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
     }
 
+    /// The title of the work whose page is at `url`, the way the bot reads it: the page of the site is asked for (Hitomi.La:
+    /// the file of the gallery) and the title is read from it. `Err(None)`: no site has such a page; `Err(Some(why))`: the
+    /// site did not give a title.
+    pub async fn title_of(&self, url: &str) -> std::result::Result<(&'static str, String), Option<String>> {
+        let Some((index, site)) = self.sites.iter().enumerate().find(|(_, site)| site.matches(url)) else { return Err(None) };
+        let name = site.def.name;
+
+        if site.def.format == Format::Hitomi {
+            static ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let id = ID.get_or_init(|| regex::Regex::new(r"/(?:[^/]*-)?(\d+)\.html").unwrap());
+            let id: u32 = id.captures(url).and_then(|c| c[1].parse().ok()).ok_or_else(|| Some("no gallery id in the address".to_string()))?;
+            use crate::hitomi::Fetch as _;
+            let body = HitomiFetch { engine: self, index }.get(&format!("/galleries/{id}.js"), None).await.map_err(Some)?;
+            let gallery = crate::hitomi::parse_gallery(id, &String::from_utf8_lossy(&body)).ok_or_else(|| Some("the gallery has no title".to_string()))?;
+            let mut title = gallery.japanese_title.clone().unwrap_or_else(|| gallery.title.clone());
+
+            if let Some(artist) = gallery.artists.first() {
+                title.push(' ');
+                title.push_str(artist);
+            }
+
+            return Ok((name, title));
+        }
+
+        let (_, page) = self.get_page(index, &site.clean(url)).await.map_err(Some)?;
+
+        crate::titles::title_of_page(name, &page).map(|title| (name, title)).ok_or_else(|| Some("the page has no title".to_string()))
+    }
+
     /// Whether the translation can be asked: Hitomi.La is one of the sites.
     pub fn can_translate(&self) -> bool {
         self.sites.iter().any(|site| site.def.format == Format::Hitomi)
@@ -1712,6 +1741,14 @@ pub(crate) mod tests {
         assert_eq!(titles.len(), 0, "the paths are the same for every query, so a page keeps the last title the site gave");
         assert_eq!(outcome.sites[0].status, "not searched");
         assert_eq!(requests(&hits), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn an_address_that_no_site_owns_has_no_title() {
+        let (engine, hits, _) = setup(&config()).await;
+
+        assert_eq!(engine.title_of("https://example.com/some/page").await, Err(None));
+        assert_eq!(requests(&hits), (0, 0, 0), "no site is asked");
     }
 
     #[test]

@@ -65,6 +65,27 @@ GET /okazuri/search?q=快楽天 2026 7
 - 作品はサイトの順に並び、サイトの中では、最後に保存したものが先に来ます。
 - `q` がない、または長すぎるとき、および `live` が `off`、`diff`、`force`(または上の別名)でないときは `422` です。
 
+## `GET /okazuri/title`(`[search]`)
+
+作品ページのアドレスから、タイトルを取り出します。BOT の「これらを検索」が使っているのと同じ処理です。アドレスを `okazuri_bot/src/websites.ts` の
+パターンに照らして対応するサイトを決め、そのページ(Hitomi.La は作品の情報ファイル)を取得して、サイトごとの規則でタイトルを読みます。
+`<h1>` や `og:title` のほか、サイトによっては作者名をタイトルの後ろに付けます。
+
+| クエリ | |
+|---|---|
+| `url` | 作品ページのアドレス。必須で、1 回から 10 回まで繰り返せます(パーセントエンコードしてください)。 |
+
+```
+GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fproduct_id%2FBJ03044883.html&url=https%3A%2F%2Fexample.com%2Fx
+{ "total": 2, "results": [
+    { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html", "website": "DLsite", "title": "COMIC快楽天 2026年11月号", "error": null },
+    { "url": "https://example.com/x", "website": null, "title": null, "error": "unsupported website" } ] }
+```
+
+結果は、渡した `url` と同じ順です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります(`unsupported website`、
+`blocked by a Cloudflare challenge`、`HTTP 404`、`the page has no title` など)。一部が失敗しても、リクエストは `200` です。`url` がない、または 11 個以上のときは `422` です。
+サイトへの間隔(`min_delay_ms`)は、検索と同じように守ります。
+
 ## `GET /okazuri/sites`(`[search]`)
 
 `okazuri_bot/src/websites.ts` のサイトと、それぞれを検索するかどうかを返します。
