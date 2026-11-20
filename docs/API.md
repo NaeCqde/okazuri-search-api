@@ -84,11 +84,15 @@ GET /okazuri/search?q=快楽天 2026 7
 ```
 GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fproduct_id%2FBJ03044883.html%3Futm_source%3Dx&url=https%3A%2F%2Fexample.com%2Fx
 { "total": 2, "results": [
-    { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html?utm_source=x", "website": "DLsite", "title": "COMIC快楽天 2026年11月号", "source": "database", "error": null },
-    { "url": "https://example.com/x", "website": null, "title": null, "source": null, "error": "unsupported website" } ] }
+    { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html?utm_source=x", "website": "DLsite", "title": "COMIC快楽天 2026年11月号",
+      "title_japanese": "COMIC快楽天 2026年11月号", "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou", "title_english": null, "title_english_source": null,
+      "source": "database", "error": null },
+    { "url": "https://example.com/x", "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "title_english_source": null, "source": null, "error": "unsupported website" } ] }
 ```
 
-結果は、渡した `url` と同じ順です。`source` は `database`(保存済みの作品)か `page`(ページを取得)です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります
+結果は、渡した `url` と同じ順です。`title_japanese` は日本語のタイトル(タイトルが日本語ならそれ自身、`English | 日本語` なら日本語側。なければ `null`)、
+`title_romaji` はタイトルのローマ字、`title_english` と `title_english_source` は、検索結果と同じ規則の英語のタイトルとその出どころです(保存済みのものだけで、このために
+どこにも尋ねません)。`source` は `database`(保存済みの作品)か `page`(ページを取得)です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります
 (`unsupported website`、`the work is not saved`(`live=off`)、`blocked by a Cloudflare challenge`、`HTTP 404`、`the page has no title` など)。
 一部が失敗しても、リクエストは `200` です。`url` がない、11 個以上、`live` が不正なときは `422` です。ページの取得は、検索と同じ `min_delay_ms` を守ります。
 

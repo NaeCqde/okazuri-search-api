@@ -300,9 +300,19 @@ async fn title(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> R
 
         tasks.spawn(async move {
             let found = match engine.title_of(&url, live).await {
-                Ok((website, title, source)) => serde_json::json!({ "url": url, "website": website, "title": title, "source": source, "error": null }),
-                Err(None) => serde_json::json!({ "url": url, "website": null, "title": null, "source": null, "error": "unsupported website" }),
-                Err(Some(why)) => serde_json::json!({ "url": url, "website": null, "title": null, "source": null, "error": why }),
+                Ok(info) => serde_json::json!({
+                    "url": url,
+                    "website": info.website,
+                    "title": info.title,
+                    "title_japanese": info.title_japanese,
+                    "title_romaji": info.title_romaji,
+                    "title_english": info.title_english,
+                    "title_english_source": info.title_english_source,
+                    "source": info.source,
+                    "error": null,
+                }),
+                Err(None) => serde_json::json!({ "url": url, "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "title_english_source": null, "source": null, "error": "unsupported website" }),
+                Err(Some(why)) => serde_json::json!({ "url": url, "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "title_english_source": null, "source": null, "error": why }),
             };
 
             (place, found)

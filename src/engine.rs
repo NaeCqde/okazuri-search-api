@@ -63,6 +63,22 @@ pub struct Hit {
     pub is_new: bool,
 }
 
+/// The title of a work from the address of its page (`Engine::title_of`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleInfo {
+    pub website: &'static str,
+    /// The title the way the bot reads it (a saved work: as the site lists it).
+    pub title: String,
+    /// `database` (a saved work) or `page` (the page was asked for).
+    pub source: &'static str,
+    /// The Japanese title: the title itself, or the Japanese side of a title that has both (`English | 日本語`); None when it has none.
+    pub title_japanese: Option<String>,
+    pub title_romaji: String,
+    pub title_english: Option<String>,
+    /// `official` or `google`, as in a search result.
+    pub title_english_source: Option<String>,
+}
+
 /// A query as the sites are asked it: with `×` written as `x`, and for the sites that need it (`keep_times`) with the `×`
 /// put back (as it was typed, or where an `x` stands between capitals: `ExE`).
 struct Plan {
@@ -1027,6 +1043,33 @@ impl Engine {
         crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
     }
 
+    /// The title of the work whose page is at `url` (`read_title`), with its Japanese title, its romaji and its English title
+    /// (what is saved: nothing is asked for them, as in a search).
+    pub async fn title_of(&self, url: &str, live: Live) -> std::result::Result<TitleInfo, Option<String>> {
+        let (website, title, source) = self.read_title(url, live).await?;
+        let title_romaji = self.romanize_query(&title).map_err(|e| Some(e.to_string()))?;
+        let title_japanese = match crate::hitomi::title_pair(&title) {
+            Some((_, japanese)) => Some(japanese),
+            None => crate::query::has_japanese(&title).then(|| title.clone()),
+        };
+        let mut hits = [Hit {
+            website: website.to_string(),
+            is_legal: false,
+            path: String::new(),
+            url: url.to_string(),
+            language: crate::language::detect_all(&title).into_iter().map(str::to_string).collect(),
+            title: title.clone(),
+            title_romaji: title_romaji.clone(),
+            title_english: None,
+            title_english_source: None,
+            is_new: false,
+        }];
+        self.fill_english(&mut hits).await.map_err(|e| Some(e.to_string()))?;
+        let [hit] = hits;
+
+        Ok(TitleInfo { website, title, source, title_japanese, title_romaji, title_english: hit.title_english, title_english_source: hit.title_english_source })
+    }
+
     /// The title of the work whose page is at `url`. The saved works answer first: the address is cleaned (the fragment, the
     /// locale and the parameters that do not name the work are dropped, `/view/1/2` is `/gallery/1`) and looked up by its path,
     /// with and without the slash at the end, so an address with more in it than the page needs still finds the work. A work
@@ -1034,7 +1077,7 @@ impl Engine {
     /// `off` answers from the database alone, `diff` (the default) falls back to the page, `force` always asks the page.
     /// Returns the site, the title and where it is from (`database` or `page`). `Err(None)`: no site has such a page;
     /// `Err(Some(why))`: no title.
-    pub async fn title_of(&self, url: &str, live: Live) -> std::result::Result<(&'static str, String, &'static str), Option<String>> {
+    async fn read_title(&self, url: &str, live: Live) -> std::result::Result<(&'static str, String, &'static str), Option<String>> {
         let Some((index, site)) = self.sites.iter().enumerate().find(|(_, site)| site.matches(url)) else { return Err(None) };
         let name = site.def.name;
         let hitomi = site.def.format == Format::Hitomi;
@@ -1791,7 +1834,9 @@ pub(crate) mod tests {
 
         // a fragment, a query string and a slash at the end do not matter
         for url in [page.clone(), format!("{page}/"), format!("{page}?utm_source=x&ref=y#top")] {
-            assert_eq!(engine.title_of(&url, Live::Diff).await, Ok(("Good", "Saved title".to_string(), "database")), "{url}");
+            let info = engine.title_of(&url, Live::Diff).await.unwrap();
+            assert_eq!((info.website, info.title.as_str(), info.source, info.title_romaji.as_str()), ("Good", "Saved title", "database", "saved title"), "{url}");
+            assert_eq!((info.title_japanese, info.title_english.as_deref()), (None, Some("Saved title")), "a title in Latin letters is its own English title");
         }
         assert_eq!(requests(&hits), (0, 0, 0), "the database answered, no page was asked");
 
