@@ -501,13 +501,6 @@ impl Engine {
             .collect()
     }
 
-    /// The indexes of every site but Hitomi.La, and whether Hitomi.La is searched at all (`GET /hitomila/search`).
-    pub fn all_but_hitomi(&self) -> Option<Vec<usize>> {
-        let hitomi = self.sites.iter().position(|site| site.def.format == Format::Hitomi)?;
-
-        self.active.contains(&hitomi).then(|| (0..self.sites.len()).filter(|&index| index != hitomi).collect())
-    }
-
     pub fn sites_info(&self) -> Vec<SiteInfo> {
         self.sites
             .iter()

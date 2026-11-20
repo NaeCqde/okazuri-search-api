@@ -3,7 +3,6 @@
 //! - `GET /romaji?q=`: the romaji of the text as `text/plain`. This is what
 //!   `okazuri_bot` called when it was the romaji API alone (`src/romaji.ts`).
 //! - `GET /okazuri/search?q=` (`[search] enabled`): the works found on the sites for the query, as JSON.
-//! - `GET /hitomila/search?q=` (`[search] enabled`): the same search, on Hitomi.La alone, with the same answer.
 //! - `GET /okazuri/sites` (`[search] enabled`): the sites, and whether each can be searched.
 //! - `GET /hitomila/translate?q=` (`[search] enabled`): Japanese to English or English to Japanese, from the titles of Hitomi.La, as JSON.
 //! - `GET /google/translate?q=` (`[search] enabled`): the same, from Google Translate.
@@ -36,7 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new().route("/health", get(health)).route("/romaji", get(romaji));
 
     if state.search.is_some() {
-        router = router.route("/okazuri/search", get(search)).route("/hitomila/search", get(hitomila_search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
+        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
     }
 
     // The same routes are under `/api/v1` too (https://okazuri.nae.quest/api/v1/...), so a proxy in front needs no rewrite.
@@ -52,7 +51,7 @@ async fn cache_control(request: axum::extract::Request, next: axum::middleware::
     let forced = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(request.uri()).map_or(true, |query| query.0.iter().any(|(key, value)| key == "live" && Live::parse(value) == Some(Live::Force)));
     let mut response = next.run(request).await;
     let seconds = match path.as_str() {
-        "/okazuri/search" | "/hitomila/search" if !forced => 300,
+        "/okazuri/search" if !forced => 300,
         "/hitomila/translate" | "/google/translate" | "/auto/translate" | "/romaji" => 86_400,
         "/okazuri/sites" => 3_600,
         _ => 0,
@@ -113,15 +112,6 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQ
         Ok(indexes) => indexes,
         Err(unknown) => return invalid(&format!("exclude has a site that does not exist: {unknown} (GET /okazuri/sites lists them)")),
     };
-
-    run_search(engine, params, &exclude).await
-}
-
-/// The same search on Hitomi.La alone (every other site is left out), with the same answer.
-async fn hitomila_search(State(state): State<Arc<AppState>>, Query(params): Query<SearchQuery>) -> Response {
-    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
-    // Hitomi.La is not a site of this server (it is left out of `[search]`): no route
-    let Some(exclude) = engine.all_but_hitomi() else { return StatusCode::NOT_FOUND.into_response() };
 
     run_search(engine, params, &exclude).await
 }
@@ -454,7 +444,6 @@ mod tests {
         // the sites that are left out of a search
         assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&exclude=Nowhere").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // Hitomi.La is not one of the sites of the tests: no route
-        assert_eq!(get_from(state.clone(), "/hitomila/search?q=a").await.0, StatusCode::NOT_FOUND);
         // the translator of a search
         assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}&live=force", encode("姉弟"))).await;
