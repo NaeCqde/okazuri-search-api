@@ -259,6 +259,102 @@ pub async fn mirror_issues(path: &Path) -> Result<Vec<Issue>> {
         .collect())
 }
 
+/// A magazine of the catalogue, with how many issues the copy has and the newest one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagazineSummary {
+    pub id: String,
+    pub name: String,
+    pub issues: u64,
+    /// The newest issue; `None` for a magazine that has no issue yet.
+    pub latest: Option<Issue>,
+}
+
+/// Every magazine of the copy, by name. `None` when there is no copy yet.
+pub async fn mirror_magazines(path: &Path) -> Result<Option<Vec<MagazineSummary>>> {
+    // the issues come newest first, so the first one of a magazine is its latest
+    let issues = mirror_issues(path).await?;
+    let _reading = MIRROR.read().await;
+    let Some(db) = open(path).await? else { return Ok(None) };
+    let magazines = magazine::Entity::find().order_by_asc(magazine::Column::Name).order_by_asc(magazine::Column::Id).all(&db).await;
+    let _ = db.close().await;
+
+    Ok(Some(
+        magazines?
+            .into_iter()
+            .map(|m| {
+                let own = issues.iter().filter(|i| i.magazine_id == m.id);
+                MagazineSummary { issues: own.clone().count() as u64, latest: own.cloned().next(), id: m.id, name: m.name }
+            })
+            .collect(),
+    ))
+}
+
+/// A work of an issue (its issue is known by the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueWork {
+    pub id: String,
+    pub name: String,
+    pub author: String,
+    pub position: i64,
+}
+
+/// The works of the issue with this name (or id), in the order of the issue. The outer `None`: no copy, or a copy
+/// without works yet; the inner `None`: no such issue.
+#[allow(clippy::type_complexity)]
+pub async fn mirror_issue_works(path: &Path, name: &str) -> Result<Option<Option<(Issue, Vec<IssueWork>)>>> {
+    let _reading = MIRROR.read().await;
+    let Some(db) = open(path).await? else { return Ok(None) };
+
+    let issue = number::Entity::find()
+        .filter(number::Column::Name.eq(name))
+        .order_by_desc(number::Column::Date)
+        .one(&db)
+        .await?;
+    let issue = match issue {
+        Some(issue) => Some(issue),
+        None => number::Entity::find_by_id(name.to_string()).one(&db).await?,
+    };
+    let Some(issue) = issue else {
+        let _ = db.close().await;
+        return Ok(Some(None));
+    };
+
+    let rows = catalog_work::Entity::find()
+        .filter(catalog_work::Column::NumberId.eq(issue.id.clone()))
+        .order_by_asc(catalog_work::Column::Position)
+        .order_by_asc(catalog_work::Column::Id)
+        .all(&db)
+        .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) if e.to_string().contains("no such table") => {
+            let _ = db.close().await;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let magazine = magazine::Entity::find_by_id(issue.magazine_id.clone()).one(&db).await?;
+    let mut works = Vec::with_capacity(rows.len());
+
+    for work in rows {
+        let author = catalog_author::Entity::find_by_id(work.author_id).one(&db).await?;
+        works.push(IssueWork { id: work.id, name: work.name, author: author.map(|a| a.name).unwrap_or_default(), position: work.position });
+    }
+
+    let _ = db.close().await;
+
+    let issue = Issue {
+        id: issue.id,
+        name: issue.name,
+        magazine_id: issue.magazine_id,
+        magazine_name: magazine.map(|m| m.name).unwrap_or_default(),
+        date: issue.date,
+    };
+
+    Ok(Some(Some((issue, works))))
+}
+
 /// A work printed in an issue, with the issue and the magazine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrintedWork {
@@ -465,6 +561,22 @@ INSERT INTO \"works\" (\"id\",\"name\",\"date\",\"position\",\"number_id\",\"aut
         assert_eq!(mirror_find_works(&path, "same title", 10).await.unwrap().unwrap().len(), 0, "the title is exact");
         // a work whose author is not in the copy is still a work
         assert_eq!(mirror_find_works(&path, "Other", 10).await.unwrap().unwrap()[0].author, "");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_magazines_are_listed_with_their_issue_count_and_newest_issue() {
+        let dir = temp_dir("magazines");
+        let path = dir.join("d1-mirror.db");
+
+        assert_eq!(mirror_magazines(&path).await.unwrap(), None, "no mirror yet");
+        rebuild_mirror(&path, &format!("{EXPORT}INSERT INTO \"magazines\" (\"id\",\"name\") VALUES('LBL2','Empty');"), "bm", 1).await.unwrap();
+
+        let magazines = mirror_magazines(&path).await.unwrap().unwrap();
+        assert_eq!(magazines.iter().map(|m| (m.name.as_str(), m.issues)).collect::<Vec<_>>(), [("COMIC快楽天", 2), ("Empty", 0)]);
+        assert_eq!(magazines[0].latest.as_ref().unwrap().name, "COMIC快楽天 2026年07月号");
+        assert_eq!(magazines[1].latest, None);
 
         let _ = fs::remove_dir_all(dir);
     }

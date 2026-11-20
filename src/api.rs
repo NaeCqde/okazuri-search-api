@@ -41,7 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     }
 
     if state.mirror_path.is_some() {
-        router = router.route("/okazuri/magazine", get(magazine));
+        router = router.route("/okazuri/magazine", get(magazine)).route("/okazuri/magazines", get(magazines)).route("/okazuri/works", get(issue_works));
     }
 
     // The same routes are under `/api/v1` too (https://okazuri.nae.quest/api/v1/...), so a proxy in front needs no rewrite.
@@ -60,7 +60,7 @@ async fn cache_control(request: axum::extract::Request, next: axum::middleware::
         "/okazuri/search" if !forced => 300,
         "/hitomila/translate" | "/google/translate" | "/auto/translate" | "/romaji" => 86_400,
         "/okazuri/sites" => 3_600,
-        "/okazuri/magazine" => 300,
+        "/okazuri/magazine" | "/okazuri/magazines" | "/okazuri/works" => 300,
         _ => 0,
     };
     let value = if seconds > 0 && response.status() == StatusCode::OK { format!("public, max-age=60, s-maxage={seconds}") } else { "no-store".to_string() };
@@ -331,6 +331,77 @@ async fn magazine(State(state): State<Arc<AppState>>, Query(params): Query<Magaz
     json(StatusCode::OK, &serde_json::json!({ "input": title, "total": results.len(), "results": results }))
 }
 
+/// The magazines of the copy of the Worker's D1 database, with how many issues each has and its newest issue.
+async fn magazines(State(state): State<Arc<AppState>>) -> Response {
+    let Some(path) = &state.mirror_path else { return StatusCode::NOT_FOUND.into_response() };
+
+    match crate::mirror::mirror_magazines(path).await {
+        Ok(Some(found)) => {
+            let results: Vec<_> = found
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "name": m.name,
+                        "issues": m.issues,
+                        "latest": m.latest.as_ref().map(|i| serde_json::json!({
+                            "id": i.id,
+                            "name": i.name,
+                            "url": format!("https://www.dlsite.com/books/work/=/product_id/{}.html", i.id),
+                            "date": i.date,
+                        })),
+                    })
+                })
+                .collect();
+
+            json(StatusCode::OK, &serde_json::json!({ "total": results.len(), "results": results }))
+        }
+        Ok(None) => json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "detail": "the copy of the catalogue is not ready yet" })),
+        Err(e) => {
+            log::error!("cannot list the magazines: {}", e);
+            json(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "detail": "cannot read the copy of the catalogue" }))
+        }
+    }
+}
+
+/// The works printed in an issue, in the order of the issue (the bot's `/works`). `q` is the name of the issue as the
+/// Worker keeps it (`COMIC快楽天 2026年07月号`), or its id.
+async fn issue_works(State(state): State<Arc<AppState>>, Query(params): Query<MagazineQuery>) -> Response {
+    let Some(path) = &state.mirror_path else { return StatusCode::NOT_FOUND.into_response() };
+    let name = params.q.as_deref().map(str::trim).unwrap_or_default();
+
+    if name.is_empty() || name.chars().count() > state.max_query_chars {
+        return invalid(&format!("q is required, 1 to {} characters", state.max_query_chars));
+    }
+
+    match crate::mirror::mirror_issue_works(path, name).await {
+        Ok(Some(Some((issue, works)))) => {
+            let product = |id: &str| format!("https://www.dlsite.com/books/work/=/product_id/{id}.html");
+            let results: Vec<_> = works
+                .iter()
+                .map(|w| serde_json::json!({ "id": w.id, "title": w.name, "url": product(&w.id), "author": w.author, "position": w.position }))
+                .collect();
+
+            json(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "input": name,
+                    "issue": { "id": issue.id, "name": issue.name, "url": product(&issue.id), "date": issue.date },
+                    "magazine": { "id": issue.magazine_id, "name": issue.magazine_name },
+                    "total": results.len(),
+                    "results": results,
+                }),
+            )
+        }
+        Ok(Some(None)) => json(StatusCode::NOT_FOUND, &serde_json::json!({ "detail": "no such issue" })),
+        Ok(None) => json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "detail": "the copy of the works is not ready yet" })),
+        Err(e) => {
+            log::error!("cannot list the works of {:?}: {}", name, e);
+            json(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "detail": "cannot read the copy of the catalogue" }))
+        }
+    }
+}
+
 async fn sites(State(state): State<Arc<AppState>>) -> Response {
     let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
 
@@ -518,6 +589,22 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(value["results"][0]["position"], 4);
         assert_eq!(value["results"][0]["author"], "作者");
         assert_eq!(value["results"][0]["issue"]["url"], "https://www.dlsite.com/books/work/=/product_id/BJ2.html");
+
+        let (status, _, body) = get_from(state.clone(), "/okazuri/magazines").await;
+        assert_eq!(status, StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((value["total"].clone(), value["results"][0]["name"].clone(), value["results"][0]["issues"].clone()), (1.into(), "COMIC快楽天".into(), 1.into()));
+        assert_eq!(value["results"][0]["latest"]["name"], "COMIC快楽天 2026年07月号");
+        assert_eq!(get_path("/okazuri/magazines").await.0, StatusCode::NOT_FOUND, "only with a copy");
+
+        // the works of an issue, by the name of the issue (or its id), in the order of the issue
+        let (status, _, body) = get_from(state.clone(), &format!("/okazuri/works?q={}", encode("COMIC快楽天 2026年07月号"))).await;
+        assert_eq!(status, StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((value["issue"]["id"].clone(), value["total"].clone(), value["results"][0]["title"].clone(), value["results"][0]["author"].clone()), ("BJ2".into(), 1.into(), "作品名".into(), "作者".into()));
+        assert_eq!(get_from(state.clone(), "/okazuri/works?q=BJ2").await.0, StatusCode::OK, "the id of the issue works too");
+        assert_eq!(get_from(state.clone(), "/okazuri/works?q=none").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_from(state.clone(), "/okazuri/works").await.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         assert_eq!(get_from(state.clone(), &format!("/okazuri/magazine?q={}", encode("ない"))).await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_from(state.clone(), "/okazuri/magazine").await.0, StatusCode::UNPROCESSABLE_ENTITY);
