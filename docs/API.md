@@ -67,24 +67,32 @@ GET /okazuri/search?q=快楽天 2026 7
 
 ## `GET /okazuri/title`(`[search]`)
 
-作品ページのアドレスから、タイトルを取り出します。BOT の「これらを検索」が使っているのと同じ処理です。アドレスを `okazuri_bot/src/websites.ts` の
-パターンに照らして対応するサイトを決め、そのページ(Hitomi.La は作品の情報ファイル)を取得して、サイトごとの規則でタイトルを読みます。
-`<h1>` や `og:title` のほか、サイトによっては作者名をタイトルの後ろに付けます。
+作品ページのアドレスから、タイトルを取り出します。BOT の「これらを検索」が使っているのと同じ用途です。まず**保存済みの作品**(`search.db`)から答え、
+保存されていない作品だけ、ページを取得してタイトルを読みます。アドレスを `okazuri_bot/src/websites.ts` のパターンに照らして対応するサイトを決め、
+次のように作品を探します。
+
+- アドレスを整えます。`#` 以降、`locale` のパラメータ、作品を指さないクエリ文字列(`utm_source` など)を捨て、`/view/1/2` のような閲覧用のアドレスは作品のページに直します。
+- 残った path を、末尾の `/` の有無の両方で、保存済みの作品から探します。余計なものが付いたアドレスでも、同じ作品に当たります。
+- 見つからなければ、そのページ(Hitomi.La は作品の情報ファイル)を取得し、サイトごとの規則でタイトルを読みます(`<h1>`、`og:title` など。サイトによっては作者名をタイトルの後ろに付けます)。
+  Hitomi.La は、保存済みの `English | 日本語` のうち日本語側を返します。
 
 | クエリ | |
 |---|---|
 | `url` | 作品ページのアドレス。必須で、1 回から 10 回まで繰り返せます(パーセントエンコードしてください)。 |
+| `live` | `off`: 保存済みの作品だけで答えます(ページは取得しません)。`diff`(既定): 保存済みの作品、なければページ。`force`: 保存済みの作品を見ず、いつもページを取得します。 |
 
 ```
-GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fproduct_id%2FBJ03044883.html&url=https%3A%2F%2Fexample.com%2Fx
+GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fproduct_id%2FBJ03044883.html%3Futm_source%3Dx&url=https%3A%2F%2Fexample.com%2Fx
 { "total": 2, "results": [
-    { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html", "website": "DLsite", "title": "COMIC快楽天 2026年11月号", "error": null },
-    { "url": "https://example.com/x", "website": null, "title": null, "error": "unsupported website" } ] }
+    { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html?utm_source=x", "website": "DLsite", "title": "COMIC快楽天 2026年11月号", "source": "database", "error": null },
+    { "url": "https://example.com/x", "website": null, "title": null, "source": null, "error": "unsupported website" } ] }
 ```
 
-結果は、渡した `url` と同じ順です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります(`unsupported website`、
-`blocked by a Cloudflare challenge`、`HTTP 404`、`the page has no title` など)。一部が失敗しても、リクエストは `200` です。`url` がない、または 11 個以上のときは `422` です。
-サイトへの間隔(`min_delay_ms`)は、検索と同じように守ります。
+結果は、渡した `url` と同じ順です。`source` は `database`(保存済みの作品)か `page`(ページを取得)です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります
+(`unsupported website`、`the work is not saved`(`live=off`)、`blocked by a Cloudflare challenge`、`HTTP 404`、`the page has no title` など)。
+一部が失敗しても、リクエストは `200` です。`url` がない、11 個以上、`live` が不正なときは `422` です。ページの取得は、検索と同じ `min_delay_ms` を守ります。
+
+保存済みのタイトルは、サイトの一覧に載っていたとおりの文字列なので、ページの `<h1>` と少し違うことがあります。
 
 ## `GET /okazuri/sites`(`[search]`)
 

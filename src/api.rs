@@ -273,12 +273,21 @@ async fn auto_translate(State(state): State<Arc<AppState>>, Query(params): Query
 }
 
 /// The title of the work at each address (`url`, once or more): what the bot reads from the page of a work. An address that
-/// is no page of a site, or a page that gives no title, has `title: null` and says why in `error`.
+/// is no page of a site, or a page that gives no title, has `title: null` and says why in `error`. The saved works answer first
+/// (`source: "database"`); `live=off` never asks a page, `live=force` always does.
 async fn title(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
     let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
-    let urls: Vec<String> = Query::<Vec<(String, String)>>::try_from_uri(&format!("/?{}", raw.unwrap_or_default()).parse().unwrap_or_default())
-        .map(|query| query.0.into_iter().filter(|(key, _)| key == "url").map(|(_, value)| value.trim().to_string()).filter(|url| !url.is_empty()).collect())
+    let pairs: Vec<(String, String)> = Query::<Vec<(String, String)>>::try_from_uri(&format!("/?{}", raw.unwrap_or_default()).parse().unwrap_or_default())
+        .map(|query| query.0)
         .unwrap_or_default();
+    let urls: Vec<String> = pairs.iter().filter(|(key, _)| key == "url").map(|(_, value)| value.trim().to_string()).filter(|url| !url.is_empty()).collect();
+    let live = match pairs.iter().find(|(key, _)| key == "live") {
+        None => Live::Diff,
+        Some((_, value)) => match Live::parse(value) {
+            Some(live) => live,
+            None => return invalid("live is off, diff or force"),
+        },
+    };
 
     if urls.is_empty() || urls.len() > MAX_TITLE_URLS {
         return invalid(&format!("url is required, 1 to {MAX_TITLE_URLS} times"));
@@ -290,10 +299,10 @@ async fn title(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> R
         let engine = engine.clone();
 
         tasks.spawn(async move {
-            let found = match engine.title_of(&url).await {
-                Ok((website, title)) => serde_json::json!({ "url": url, "website": website, "title": title, "error": null }),
-                Err(None) => serde_json::json!({ "url": url, "website": null, "title": null, "error": "unsupported website" }),
-                Err(Some(why)) => serde_json::json!({ "url": url, "website": null, "title": null, "error": why }),
+            let found = match engine.title_of(&url, live).await {
+                Ok((website, title, source)) => serde_json::json!({ "url": url, "website": website, "title": title, "source": source, "error": null }),
+                Err(None) => serde_json::json!({ "url": url, "website": null, "title": null, "source": null, "error": "unsupported website" }),
+                Err(Some(why)) => serde_json::json!({ "url": url, "website": null, "title": null, "source": null, "error": why }),
             };
 
             (place, found)
@@ -485,6 +494,7 @@ mod tests {
         assert_eq!(value["results"][0]["url"], "https://example.com/x");
         assert_eq!(value["results"][1]["error"], "unsupported website");
         assert!(value["results"][0]["title"].is_null());
+        assert_eq!(get_from(state.clone(), "/okazuri/title?url=https%3A%2F%2Fexample.com&live=maybe").await.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         let many: String = (0..11).map(|n| format!("url=https%3A%2F%2Fexample.com%2F{n}&")).collect();
         assert_eq!(get_from(state, &format!("/okazuri/title?{many}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);

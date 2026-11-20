@@ -747,6 +747,19 @@ impl SearchStore {
         Ok(crawl_state::Entity::find().filter(crawl_state::Column::Done.eq(true)).all(&self.db).await?.into_iter().map(|row| row.website).collect())
     }
 
+    /// The saved title of the page of a work at one of `paths` (the same page written with and without the slash at the end).
+    /// `None` when no such work is saved, or its page is gone.
+    pub async fn title_at(&self, website: &str, paths: &[String]) -> Result<Option<String>> {
+        Ok(work::Entity::find()
+            .filter(work::Column::Website.eq(website))
+            .filter(work::Column::Path.is_in(paths.iter().map(String::as_str)))
+            .filter(work::Column::Deleted.eq(false))
+            .filter(work::Column::Title.ne(""))
+            .one(&self.db)
+            .await?
+            .map(|row| row.title))
+    }
+
     /// The paths among `paths` that are saved already.
     pub async fn known_paths(&self, website: &str, paths: &[String]) -> Result<HashSet<String>> {
         Ok(work::Entity::find()

@@ -1032,18 +1032,54 @@ impl Engine {
         crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
     }
 
-    /// The title of the work whose page is at `url`, the way the bot reads it: the page of the site is asked for (Hitomi.La:
-    /// the file of the gallery) and the title is read from it. `Err(None)`: no site has such a page; `Err(Some(why))`: the
-    /// site did not give a title.
-    pub async fn title_of(&self, url: &str) -> std::result::Result<(&'static str, String), Option<String>> {
+    /// The title of the work whose page is at `url`. The saved works answer first: the address is cleaned (the fragment, the
+    /// locale and the parameters that do not name the work are dropped, `/view/1/2` is `/gallery/1`) and looked up by its path,
+    /// with and without the slash at the end, so an address with more in it than the page needs still finds the work. A work
+    /// that is not saved is read from its page, the way the bot reads it (Hitomi.La: from the file of the gallery). `live`:
+    /// `off` answers from the database alone, `diff` (the default) falls back to the page, `force` always asks the page.
+    /// Returns the site, the title and where it is from (`database` or `page`). `Err(None)`: no site has such a page;
+    /// `Err(Some(why))`: no title.
+    pub async fn title_of(&self, url: &str, live: Live) -> std::result::Result<(&'static str, String, &'static str), Option<String>> {
         let Some((index, site)) = self.sites.iter().enumerate().find(|(_, site)| site.matches(url)) else { return Err(None) };
         let name = site.def.name;
-
-        if site.def.format == Format::Hitomi {
+        let hitomi = site.def.format == Format::Hitomi;
+        let gallery_id: Option<u32> = if hitomi {
             static ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
             let id = ID.get_or_init(|| regex::Regex::new(r"/(?:[^/]*-)?(\d+)\.html").unwrap());
-            let id: u32 = id.captures(url).and_then(|c| c[1].parse().ok()).ok_or_else(|| Some("no gallery id in the address".to_string()))?;
+
+            id.captures(url).and_then(|c| c[1].parse().ok())
+        } else {
+            None
+        };
+        let cleaned = site.clean(url);
+        let path = match gallery_id {
+            Some(id) => Some(format!("/galleries/{id}.html")),
+            None => site.path_of(&cleaned),
+        };
+
+        if live != Live::Force {
+            if let Some(path) = &path {
+                let paths = [path.clone(), sites::toggle_slash(path)];
+
+                if let Some(saved) = self.store.title_at(name, &paths).await.map_err(|e| Some(e.to_string()))? {
+                    // Hitomi.La saves `English | 日本語`: the bot reads the Japanese title
+                    let title = match hitomi.then(|| crate::hitomi::title_pair(&saved)).flatten() {
+                        Some((_, japanese)) => japanese,
+                        None => saved,
+                    };
+
+                    return Ok((name, title, "database"));
+                }
+            }
+        }
+
+        if live == Live::Off {
+            return Err(Some("the work is not saved".to_string()));
+        }
+
+        if hitomi {
             use crate::hitomi::Fetch as _;
+            let id = gallery_id.ok_or_else(|| Some("no gallery id in the address".to_string()))?;
             let body = HitomiFetch { engine: self, index }.get(&format!("/galleries/{id}.js"), None).await.map_err(Some)?;
             let gallery = crate::hitomi::parse_gallery(id, &String::from_utf8_lossy(&body)).ok_or_else(|| Some("the gallery has no title".to_string()))?;
             let mut title = gallery.japanese_title.clone().unwrap_or_else(|| gallery.title.clone());
@@ -1053,12 +1089,12 @@ impl Engine {
                 title.push_str(artist);
             }
 
-            return Ok((name, title));
+            return Ok((name, title, "page"));
         }
 
-        let (_, page) = self.get_page(index, &site.clean(url)).await.map_err(Some)?;
+        let (_, page) = self.get_page(index, &cleaned).await.map_err(Some)?;
 
-        crate::titles::title_of_page(name, &page).map(|title| (name, title)).ok_or_else(|| Some("the page has no title".to_string()))
+        crate::titles::title_of_page(name, &page).map(|title| (name, title, "page")).ok_or_else(|| Some("the page has no title".to_string()))
     }
 
     /// Whether the translation can be asked: Hitomi.La is one of the sites.
@@ -1747,8 +1783,25 @@ pub(crate) mod tests {
     async fn an_address_that_no_site_owns_has_no_title() {
         let (engine, hits, _) = setup(&config()).await;
 
-        assert_eq!(engine.title_of("https://example.com/some/page").await, Err(None));
+        assert_eq!(engine.title_of("https://example.com/some/page", Live::Diff).await, Err(None));
         assert_eq!(requests(&hits), (0, 0, 0), "no site is asked");
+    }
+
+    #[tokio::test]
+    async fn a_saved_work_answers_whatever_the_address_carries_besides_the_page() {
+        let (engine, hits, _) = setup(&config()).await;
+        engine.store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/12".into(), title: "Saved title".into(), romaji: "saved title".into(), language: None }]), false).await.unwrap();
+        let origin = engine.sites[0].search_url("q").unwrap().split("/ok").next().unwrap().to_string();
+        let page = format!("{origin}/work/12");
+
+        // a fragment, a query string and a slash at the end do not matter
+        for url in [page.clone(), format!("{page}/"), format!("{page}?utm_source=x&ref=y#top")] {
+            assert_eq!(engine.title_of(&url, Live::Diff).await, Ok(("Good", "Saved title".to_string(), "database")), "{url}");
+        }
+        assert_eq!(requests(&hits), (0, 0, 0), "the database answered, no page was asked");
+
+        // a work that is not saved is not answered by `off`
+        assert!(matches!(engine.title_of(&format!("{origin}/work/13"), Live::Off).await, Err(Some(_))));
     }
 
     #[test]
