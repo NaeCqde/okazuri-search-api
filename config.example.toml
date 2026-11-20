@@ -59,11 +59,12 @@ min_delay_ms = 1000
 # The most works kept from one site's list page, and the most in one answer (a request may use limit=).
 max_results_per_site = 50
 max_results = 100
-# Sites to leave out (the names of GET /okazuri/sites).
-disabled_sites = []
+# Sites to leave out (the names of GET /okazuri/sites). The demo server leaves out these three.
+disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 # A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The
-# other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`).
-skip_crawled = false
+# other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`); a site
+# that is not crawled yet is asked as before, so it does no harm to leave it on.
+skip_crawled = true
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
 try_unsupported = false
 # A copy of the magazine tables (magazines, numbers, authors and works) of the Worker's D1 database. The server asks D1 whether
