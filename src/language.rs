@@ -88,7 +88,7 @@ fn patterns() -> &'static Patterns {
 
 /// Characters of Chinese that Japanese does not write: the simplified forms, and the traditional forms that are not the kanji of Japanese.
 const CHINESE_ONLY: &str = "们这个说吗么还对见书车长门问间马东开关电时经为产业华从众传优伤价兴册军凉动务劳势协单卫历县变叹听启员响团园图坏场坚处备头夸夺奋妇决净发\
-    這個們說嗎麼點沒對關經產從眾傳價淨勞歷縣變聽啟團圖壞處";
+    這們說嗎麼點沒對關經產從眾傳價淨勞歷縣變聽啟團圖壞處";
 
 /// The languages whose script the text is written in (see the top of the file), in the order of their first letter.
 fn by_script(text: &str) -> Vec<&'static str> {
@@ -265,7 +265,7 @@ mod tests {
         is("عنوان عربي", "ar");
         is("Tình yêu của chúng ta", "vi");
         is("[A] 这个故事 [DL版]", "zh");
-        is("這個故事", "zh");
+        is("這們故事", "zh");
         is("[Автор] 这个 [English]", "en,ru,zh");
         // the flag of Japan stays out when the script names another language
         is("🇯🇵 Название", "ru");
