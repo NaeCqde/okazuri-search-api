@@ -1,8 +1,8 @@
-# Okazuri Search API
+# オカズリ検索 API
 
 [English](README.en.md) | 日本語
 
-[Okazuri BOT](https://github.com/NaeCqde/okazuri_bot) の検索サーバーです。実行ファイル 1 つに、必要なものがすべて
+[オカズリBOT](https://github.com/NaeCqde/okazuri_bot) の検索サーバーです。実行ファイル 1 つに、必要なものがすべて
 入っています。機能は 2 つあり、`config.toml` でそれぞれオン・オフを切り替えられます。
 
 - **検索**(`[search]`、既定はオフ): `GET /okazuri/search?q=` は、BOT が対応しているすべてのサイト(DLsite、FANZA、

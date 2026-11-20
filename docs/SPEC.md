@@ -1,6 +1,6 @@
 # okazuri-search-api 仕様
 
-[Okazuri BOT](https://github.com/NaeCqde/okazuri_bot) のための検索サーバー。1 つの実行ファイルに、日本語→ローマ字変換、雑誌・作品の検索、Cloudflare D1 の写し、事前検索、定期リクエスト(cron)が入っている。
+[オカズリBOT](https://github.com/NaeCqde/okazuri_bot) のための検索サーバー。1 つの実行ファイルに、日本語→ローマ字変換、雑誌・作品の検索、Cloudflare D1 の写し、事前検索、定期リクエスト(cron)が入っている。
 仕様を変えたときは、このファイルも必ず更新する。細部は `docs/` にある:
 
 | 文書 | 内容 |
