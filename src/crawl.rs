@@ -392,6 +392,11 @@ impl Crawler {
                 };
                 let (page_url, body) = self.engine.get_page(index, &url).await?;
                 let links = site.read(&page_url, &body, MOST_LINKS)?;
+                // below an id that has galleries under it, a page with none is not the end of the list but an answer that is not a list:
+                // the walk is not ended by it (vultr was ended at 1 771 304 of 1 859 999 by one), and the page is asked again later
+                if links.is_empty() && cursor.parse::<u64>().is_ok_and(|id| id > 1000) {
+                    return Err(format!("E-Hentai answered a page with no gallery after the id {cursor}"));
+                }
                 // the walk of a range ends at its `lo`
                 let next = links.iter().filter_map(|link| gallery_id(&link.path)).min().filter(|id| self.ids.0.is_none_or(|lo| *id > lo)).map(|id| id.to_string());
 
