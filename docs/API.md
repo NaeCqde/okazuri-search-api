@@ -48,8 +48,8 @@ GET /okazuri/search?q=快楽天 2026 7
   クエリ文字列のパラメータを含みます)で、`url` はそれにサイトのドメインを付けたものです。
 - `input` は送られた `q`(整えたもの)で、`query` はその**ローマ字**です。サイトに尋ねた文字列で、タイトルとの照合にも使います。
   日本語を含まない `q` は、それ自体がローマ字です。`title_romaji` は `title` のローマ字です。
-- `title_english` は結果の英語のタイトルで、`title_english_source` はその出どころです(`"official"` か `"google"`。英語のタイトルがなければ
-  どちらも `null`)。タイトルが英語ならそのタイトル、両方を併記したタイトル(`English | 日本語`)ならその英語側、そうでなければ保存済みの翻訳です。
+- `title_english` は結果の英語のタイトルで、`{"text": "…", "source": "official" か "google"}` の形です(英語のタイトルがなければ
+  `null`)。タイトルが英語ならそのタイトル、両方を併記したタイトル(`English | 日本語`)ならその英語側、そうでなければ保存済みの翻訳です。
   Hitomi.La の翻訳は作品自身のタイトルなので `official`、Google の翻訳は機械翻訳なので `google` です。このために新しくサイトへ尋ねることはありません。
 - `translation` は、日本語を含むクエリの英語のタイトルで、`translation_ja` は、日本語を含まないクエリの日本語のタイトルです
   (`{"text", "source"}` または `null`)。そのタイトルを持つ作品も `results` に入ります([SEARCH.md](SEARCH.md))。
@@ -85,13 +85,13 @@ GET /okazuri/search?q=快楽天 2026 7
 GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fproduct_id%2FBJ03044883.html%3Futm_source%3Dx&url=https%3A%2F%2Fexample.com%2Fx
 { "total": 2, "results": [
     { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html?utm_source=x", "website": "DLsite", "title": "COMIC快楽天 2026年11月号",
-      "title_japanese": "COMIC快楽天 2026年11月号", "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou", "title_english": null, "title_english_source": null,
+      "title_japanese": "COMIC快楽天 2026年11月号", "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou", "title_english": null,
       "source": "database", "error": null },
-    { "url": "https://example.com/x", "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "title_english_source": null, "source": null, "error": "unsupported website" } ] }
+    { "url": "https://example.com/x", "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "source": null, "error": "unsupported website" } ] }
 ```
 
 結果は、渡した `url` と同じ順です。`title_japanese` は日本語のタイトル(タイトルが日本語ならそれ自身、`English | 日本語` なら日本語側。なければ `null`)、
-`title_romaji` はタイトルのローマ字、`title_english` と `title_english_source` は、検索結果と同じ規則の英語のタイトルとその出どころです(保存済みのものだけで、このために
+`title_romaji` はタイトルのローマ字、`title_english` は、検索結果と同じ規則の英語のタイトルとその出どころ(`{text, source}`)です(保存済みのものだけで、このために
 どこにも尋ねません)。`source` は `database`(保存済みの作品)か `page`(ページを取得)です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります
 (`unsupported website`、`the work is not saved`(`live=off`)、`blocked by a Cloudflare challenge`、`HTTP 404`、`the page has no title` など)。
 一部が失敗しても、リクエストは `200` です。`url` がない、11 個以上、`live` が不正なときは `422` です。ページの取得は、検索と同じ `min_delay_ms` を守ります。
