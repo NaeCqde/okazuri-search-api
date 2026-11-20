@@ -24,9 +24,13 @@ GET /romaji?q=チートアイテム管理局のお仕事
 ## 動かす
 
 ```
-okazuri-search-api                       127.0.0.1:8000 でサーバーを起動
+okazuri-search-api                       設定ファイルのポートでサーバーを起動
 okazuri-search-api serve --port 9000     オプション: --config <パス> --host <アドレス> --port <ポート>
 okazuri-search-api search <語>...        1 回だけ検索する(サーバーは使わない)。--live off|diff|force --limit <n>
+okazuri-search-api title <URL>...         ページのタイトルと、日本語名・ローマ字・英訳を表示する。--live off|diff|force
+okazuri-search-api magazines             雑誌の一覧と最新号を表示する
+okazuri-search-api magazine <題名>       作品が載っている号を表示する。--limit <n>
+okazuri-search-api works <号>            号の作品一覧を表示する
 okazuri-search-api sync                  D1 データベースの雑誌のテーブルを今すぐ写し取る
 okazuri-search-api prefetch              写しにある号を 1 周分、事前に検索する。--limit <n>
 okazuri-search-api reromanize            保存済み作品のローマ字を作り直し、変わった作品の検索履歴を消す(先にサーバーを止めてください)

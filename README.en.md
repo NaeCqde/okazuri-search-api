@@ -24,9 +24,13 @@ GET /romaji?q=チートアイテム管理局のお仕事
 ## Run it
 
 ```
-okazuri-search-api                       start the server on 127.0.0.1:8000
+okazuri-search-api                       start the server on the port of the config file
 okazuri-search-api serve --port 9000     options: --config <path> --host <address> --port <port>
 okazuri-search-api search <words>...     run one search (no server needed); --live off|diff|force --limit <n>
+okazuri-search-api title <url>...          print the title of each page, with its Japanese title, romaji and English; --live off|diff|force
+okazuri-search-api magazines              print the magazines and their newest issue
+okazuri-search-api magazine <title>       print the issues that printed a work; --limit <n>
+okazuri-search-api works <issue>          print the works of an issue
 okazuri-search-api sync                  copy the magazine tables of the D1 database right now
 okazuri-search-api prefetch              search for every issue in that copy, once through; --limit <n>
 okazuri-search-api reromanize            regenerate the romaji of the saved works and discard the search history of the ones that changed (stop the server first)
