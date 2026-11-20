@@ -77,7 +77,7 @@ Authorization = "Bearer ${CRON_SECRET}"   # 環境変数 CRON_SECRET
 
 ## 検索エンジン
 
-`[search]` は結果を SQLite ファイル(`search.db`)に、`[d1]` は雑誌のテーブルの写しを別のファイル(`d1-mirror.db`)に保存します。
+`[search]` は結果を SQLite ファイル(`search.db`)に、`[magazine]` は雑誌のテーブルの写しを別のファイル(`d1-mirror.db`)に保存します。
 どちらも、なければ作業ディレクトリの下に作られるので、サービスには、書き込める `WorkingDirectory=` を指定してください。
 SQLite のライブラリは実行ファイルに入っています(SeaORM が sqlx を使って、両方のファイルを読み書きします)。
 
@@ -85,7 +85,7 @@ SQLite のライブラリは実行ファイルに入っています(SeaORM が s
 [search]
 enabled = true
 
-[d1]
+[magazine]
 enabled = true
 account_id = "<Cloudflare のアカウント ID>"
 database_id = "<D1 データベースの ID>"

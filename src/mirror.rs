@@ -1,4 +1,4 @@
-//! The mirror (`[d1] mirror_path`): a copy of the magazine tables of the Worker's D1 database (`magazines` and
+//! The mirror (`[magazine] mirror_path`): a copy of the magazine tables of the Worker's D1 database (`magazines` and
 //! `numbers`), rebuilt from the SQL file that D1 exports whenever the data changed. It is only read, to know which
 //! issues to search for ahead of time. The tables are the entities `magazine` and `number`; `mirror_meta` keeps the
 //! bookmark of the data the copy was built from.

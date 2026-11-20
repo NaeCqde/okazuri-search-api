@@ -177,7 +177,7 @@ Google 翻訳には、その Web ページと同じ方法で尋ねます(`transl
 それがあれば答えは `The Phaethon Assault`(`[[3],[[6,3]]]`)で、なければ `Assault on Phaeton`(`[[0],[[6,1]]]`)です。トークンは 1 つの文のために作られ(同じ文なら、
 別の `_reqid` でも受け付けられます)、Cookie ではなく、ページの `User-Agent` と `Referer` で検査されます。Google のスクリプトを動かさないと作れないので、
 `tools/google-translate-bridge`(ウィンドウのない Chrome。`node server.mjs`。その README を見てください)が作ります。`GET /token` が文を付けてページを開き、
-ページ自身のリクエストを止めて渡し、このプログラムがそれを送ります(`reqwest`、gzip)。`[search] google_bridge_url`(と `google_bridge_token`)がそのアドレスで、
+ページ自身のリクエストを止めて渡し、このプログラムがそれを送ります(`reqwest`、gzip)。`[translation] google_bridge_url`(と `google_bridge_token`)がそのアドレスで、
 設定されているのに止まっているときは、Google 翻訳は失敗します(クラシックな答えへのフォールバックはありません。それは永久に保存されてしまうからです)。
 ブリッジを使ってテストを動かすには、`OKAZURI_GOOGLE_BRIDGE=http://127.0.0.1:8130 cargo test -- --ignored` です。
 
@@ -236,9 +236,9 @@ Hitomi.La の保存済みの行と Google の保存済みの行は別です(`tra
 | ファイル | 設定 | 内容 |
 |---|---|---|
 | `search.db` | `[search] db_path` | `works`(サイト、path、サイトが書いた**タイトル**、そのローマ字の **title_romaji**、検索を絞る title_key(ローマ字を整えたもの)、最初に保存した日時と最後に変わった日時)、`works_fts`(title_key に対する、trigram トークナイザーの FTS5 インデックス。キーに 3 文字以上の断片を含む作品を、すべての行を読まずに見つけます。`works` テーブルがその内容で、トリガーが最新に保ちます。起動時に、テーブルより作品が少なければ作り直します)、`searches`(どのクエリをどのサイトにいつ尋ねたか、成功したか) |
-| `d1-mirror.db` | `[d1] mirror_path` | Worker の D1 データベースの `magazines` と `numbers` のテーブルと、それを写したデータのブックマーク |
+| `d1-mirror.db` | `[magazine] mirror_path` | Worker の D1 データベースの `magazines` と `numbers` のテーブルと、それを写したデータのブックマーク |
 
-## D1 の写し(`[d1]`)
+## D1 の写し(`[magazine]`)
 
 D1 は、Cloudflare API で、データベースを SQL ファイルとしてエクスポートできます。`output_format: "polling"` で `POST .../d1/database/{id}/export` を呼び、
 `complete` になるまでポーリングして、返ってきた署名付き URL から SQL をダウンロードします。Worker のデータベースには、D1 がエクスポートを拒否する仮想テーブル
@@ -311,4 +311,4 @@ E-Hentai(ステータス 200 で短い文を返し、数秒に 1 ページより
 ## やっていないこと
 
 - Cloudflare のチャレンジの向こうのサイトと Anime-Sharing は、検索しません。これは普通の HTTP リクエストで、ブラウザではないからです。
-- `[d1]` の呼び出しは、wrangler が使う API を見て書き、そのモックに対してテストしました。トークンを付けて `okazuri-search-api sync` を 1 回実行して、実際の動作を確かめてください。
+- `[magazine]` の呼び出しは、wrangler が使う API を見て書き、そのモックに対してテストしました。トークンを付けて `okazuri-search-api sync` を 1 回実行して、実際の動作を確かめてください。

@@ -26,7 +26,7 @@ pub const USAGE: &str = "okazuri-search-api\n\n\
 Usage: okazuri-search-api [command]\n\n\
 (no command)                           Start the server (same as `serve`)\n\
 serve                                  Start the server, and what the config switches on: [search],\n\
-                                       [d1] with [prefetch], and [cron]\n\
+                                       [magazine] with [prefetch], and [cron]\n\
     --config <path>      Config file (default: config.toml in the current directory;\n\
                          a file that does not exist means the defaults)\n\
     --host <address>     Address to listen on (default: [server] host, 127.0.0.1)\n\
@@ -38,7 +38,7 @@ search <words>...                      Search the sites for the words (in romaji
                          site\n\
     --limit <n>          The most works to print (default: [search] max_results)\n\
     --config <path>      Config file\n\
-sync                                   Copy the magazine tables of the D1 database now ([d1])\n\
+sync                                   Copy the magazine tables of the D1 database now ([magazine])\n\
     --config <path>      Config file\n\
 prefetch                               Search for the issues of the copy once through ([prefetch])\n\
     --limit <n>          The most queries (default: [prefetch] max_queries_per_round)\n\
@@ -321,20 +321,25 @@ fn load_romanizer(config: &Config) -> Result<Arc<Romanizer>> {
 async fn open_engine(config: &Config, romanizer: Arc<Romanizer>) -> Result<Arc<Engine>> {
     let store = SearchStore::open(&config.search.db_path).await?;
 
-    Ok(Engine::new(&config.search, Arc::new(store), romanizer))
+    // the bridge of Google Translate is in [translation], the engine reads it with the settings of the search
+    let mut search = config.search.clone();
+    search.google_bridge_url = config.translation.google_bridge_url.clone();
+    search.google_bridge_token = config.translation.google_bridge_token.clone();
+
+    Ok(Engine::new(&search, Arc::new(store), romanizer))
 }
 
 fn d1_client(config: &Config) -> Result<D1Client> {
-    let d1 = &config.d1;
+    let d1 = &config.magazine;
 
     if d1.account_id.trim().is_empty() || d1.database_id.trim().is_empty() {
-        return Err("[d1] needs account_id and database_id".into());
+        return Err("[magazine] needs account_id and database_id".into());
     }
 
     let token = expand(&d1.api_token, &|name| std::env::var(name).ok())?;
 
     if token.trim().is_empty() {
-        return Err("[d1] api_token is empty".into());
+        return Err("[magazine] api_token is empty".into());
     }
 
     Ok(D1Client::new(d1, token.trim().to_string()))
@@ -350,14 +355,14 @@ struct Background {
 
 impl Background {
     fn check(config: &Config) -> Result<Self> {
-        let d1 = if config.d1.enabled { Some(Arc::new(d1_client(config)?)) } else { None };
+        let d1 = if config.magazine.enabled { Some(Arc::new(d1_client(config)?)) } else { None };
 
         if config.prefetch.enabled {
             if !config.search.enabled {
                 return Err("[prefetch] needs [search] enabled = true".into());
             }
-            if !config.d1.enabled && !config.d1.mirror_path.exists() {
-                log::warn!("[prefetch] is on, but there is no {} and [d1] is off", config.d1.mirror_path.display());
+            if !config.magazine.enabled && !config.magazine.mirror_path.exists() {
+                log::warn!("[prefetch] is on, but there is no {} and [magazine] is off", config.magazine.mirror_path.display());
             }
         }
 
@@ -378,15 +383,15 @@ async fn sync_loop(d1: Arc<D1Client>, mirror: PathBuf, interval: Duration, wake:
     loop {
         match d1.sync(&mirror).await {
             Ok(synced) if synced.changed => {
-                log::info!("d1: the data changed, the copy was rebuilt (bookmark {})", synced.bookmark);
+                log::info!("magazine: the data changed, the copy was rebuilt (bookmark {})", synced.bookmark);
                 wake.notify_one();
             }
             Ok(synced) if synced.exported => log::info!(
-                "d1: the bookmark moved ({}) but magazines and numbers are the same: the copy and the prefetch are left as they are",
+                "magazine: the bookmark moved ({}) but magazines and numbers are the same: the copy and the prefetch are left as they are",
                 synced.bookmark
             ),
-            Ok(_) => log::debug!("d1: the data did not change"),
-            Err(e) => log::warn!("d1: {e}"),
+            Ok(_) => log::debug!("magazine: the data did not change"),
+            Err(e) => log::warn!("magazine: {e}"),
         }
 
         tokio::time::sleep(interval).await;
@@ -418,9 +423,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     log::info!("listening on http://{}", listener.local_addr()?);
     log::info!(
-        "search: {}, d1: {}, prefetch: {}, crawl: {}, verify: {}, cron: {}",
+        "search: {}, magazine: {}, prefetch: {}, crawl: {}, verify: {}, cron: {}",
         on_off(config.search.enabled),
-        on_off(config.d1.enabled),
+        on_off(config.magazine.enabled),
         on_off(config.prefetch.enabled),
         on_off(config.crawl.enabled),
         on_off(config.verify.enabled),
@@ -434,9 +439,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         tasks.push(cron.spawn());
     }
     if let Some(d1) = background.d1 {
-        let interval = Duration::from_secs(config.d1.check_interval_minutes.max(1) * 60);
+        let interval = Duration::from_secs(config.magazine.check_interval_minutes.max(1) * 60);
 
-        tasks.push(tokio::spawn(sync_loop(d1, config.d1.mirror_path.clone(), interval, wake.clone())));
+        tasks.push(tokio::spawn(sync_loop(d1, config.magazine.mirror_path.clone(), interval, wake.clone())));
     }
     if let (true, Some(engine)) = (background.crawl, engine.clone()) {
         // checked here, with the engine: a site that is not known or a shard that is wrong stops the server before it listens
@@ -447,7 +452,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     }
     if let (true, Some(engine)) = (background.prefetch, engine) {
         let prefetcher =
-            Arc::new(Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled));
+            Arc::new(Prefetcher::new(engine, config.magazine.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled));
 
         tasks.push(tokio::spawn(prefetcher.run(wake)));
     }
@@ -520,7 +525,7 @@ async fn search(
 
 async fn sync(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let synced = Arc::new(d1_client(&config)?).sync(&config.d1.mirror_path).await?;
+    let synced = Arc::new(d1_client(&config)?).sync(&config.magazine.mirror_path).await?;
 
     println!(
         "{} (bookmark {}) -> {}",
@@ -530,7 +535,7 @@ async fn sync(config: Option<PathBuf>) -> Result<()> {
             (false, false) => "the data did not change",
         },
         synced.bookmark,
-        config.d1.mirror_path.display()
+        config.magazine.mirror_path.display()
     );
 
     Ok(())
@@ -618,7 +623,7 @@ async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
     }
 
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
-    let prefetcher = Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled);
+    let prefetcher = Prefetcher::new(engine, config.magazine.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled);
     let round = prefetcher.round().await?;
 
     println!(
@@ -769,13 +774,13 @@ mod tests {
 
         // a D1 copy needs the ids and a token
         let mut config = Config::default();
-        config.d1.enabled = true;
+        config.magazine.enabled = true;
         assert!(Background::check(&config).err().expect("an error").to_string().contains("account_id"));
-        config.d1.account_id = "a".into();
-        config.d1.database_id = "d".into();
-        config.d1.api_token = "${OKAZURI_SEARCH_API_TEST_TOKEN_THAT_IS_NOT_SET}".into();
+        config.magazine.account_id = "a".into();
+        config.magazine.database_id = "d".into();
+        config.magazine.api_token = "${OKAZURI_SEARCH_API_TEST_TOKEN_THAT_IS_NOT_SET}".into();
         assert!(Background::check(&config).err().expect("an error").to_string().contains("is not set"));
-        config.d1.api_token = "token".into();
+        config.magazine.api_token = "token".into();
         assert!(Background::check(&config).is_ok());
     }
 }

@@ -14,7 +14,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub romaji: RomajiConfig,
     pub search: SearchConfig,
-    pub d1: D1Config,
+    pub magazine: MagazineConfig,
+    pub translation: TranslationConfig,
     pub prefetch: PrefetchConfig,
     pub crawl: CrawlConfig,
     pub verify: VerifyConfig,
@@ -84,11 +85,14 @@ pub struct SearchConfig {
     pub skip_crawled: bool,
     /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
     pub try_unsupported: bool,
+    /// The bridge of Google Translate: not a key of `[search]`, it is `[translation]` (`open_engine` copies it here).
     /// The address of `tools/google-translate-bridge` (a Chrome that makes the token of Google Translate), such as
     /// `http://100.64.0.1:8130`. Empty: Google Translate is asked without the token, which gets the answer of the classic
     /// model.
+    #[serde(skip)]
     pub google_bridge_url: String,
     /// What the bridge wants in `Authorization: Bearer` (its `BRIDGE_TOKEN`); empty for none.
+    #[serde(skip)]
     pub google_bridge_token: String,
 }
 
@@ -115,10 +119,22 @@ impl Default for SearchConfig {
     }
 }
 
-/// The copy of the Worker's D1 database (`d1.rs`). Off unless `enabled` is true.
+/// Where the translations come from (`GET /hitomila/translate`, `/google/translate`, `/auto/translate`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TranslationConfig {
+    /// The address of `tools/google-translate-bridge` (a Chrome that makes the token of Google Translate), such as
+    /// `http://100.64.0.1:8130`. Empty: Google Translate is asked without the token, which gets the answer of the classic
+    /// model.
+    pub google_bridge_url: String,
+    /// What the bridge wants in `Authorization: Bearer` (its `BRIDGE_TOKEN`); empty for none.
+    pub google_bridge_token: String,
+}
+
+/// The magazines and the works of the Worker's D1 database, copied (`d1.rs`, `mirror.rs`). Off unless `enabled` is true.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct D1Config {
+pub struct MagazineConfig {
     pub enabled: bool,
     pub account_id: String,
     pub database_id: String,
@@ -133,7 +149,7 @@ pub struct D1Config {
     pub check_interval_minutes: u64,
 }
 
-impl Default for D1Config {
+impl Default for MagazineConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -317,20 +333,28 @@ mod tests {
         assert!(!config.cron.enabled);
         assert!(config.cron.jobs.is_empty());
         // the search engine and what feeds it are off
-        assert!(!config.search.enabled && !config.d1.enabled && !config.prefetch.enabled);
-        assert_eq!(config.d1.tables, ["magazines", "numbers"]);
-        assert_ne!(config.search.db_path, config.d1.mirror_path, "two database files");
+        assert!(!config.search.enabled && !config.magazine.enabled && !config.prefetch.enabled);
+        assert_eq!(config.magazine.tables, ["magazines", "numbers"]);
+        assert_ne!(config.search.db_path, config.magazine.mirror_path, "two database files");
+    }
+
+    #[test]
+    fn the_translation_has_its_own_section_and_the_old_keys_of_search_are_not_read() {
+        let config: Config = toml::from_str("[translation]\ngoogle_bridge_url = \"http://b\"\ngoogle_bridge_token = \"t\"\n[search]\ngoogle_bridge_url = \"http://old\"\n").unwrap();
+
+        assert_eq!((config.translation.google_bridge_url.as_str(), config.translation.google_bridge_token.as_str()), ("http://b", "t"));
+        assert_eq!(config.search.google_bridge_url, "", "the engine gets it from [translation] when it is opened");
     }
 
     #[test]
     fn the_functions_are_switched_in_the_file() {
         let config: Config = toml::from_str(
             "[search]\nenabled = true\nttl_hours = 1\ndisabled_sites = [\"Sukebei\"]\n\
-             [d1]\nenabled = true\naccount_id = \"a\"\ndatabase_id = \"d\"\n[prefetch]\nenabled = true\n",
+             [magazine]\nenabled = true\naccount_id = \"a\"\ndatabase_id = \"d\"\n[prefetch]\nenabled = true\n",
         )
         .unwrap();
 
-        assert!(config.search.enabled && config.d1.enabled && config.prefetch.enabled);
+        assert!(config.search.enabled && config.magazine.enabled && config.prefetch.enabled);
         assert_eq!((config.search.ttl_hours, config.search.concurrency), (1, 8));
         assert_eq!(config.search.disabled_sites, ["Sukebei"]);
     }

@@ -51,7 +51,8 @@ The query is percent-encoded UTF-8. The endpoints are in [docs/API.md](docs/API.
 |---|---|---|
 | `[server]` | `host` / `port`. `127.0.0.1` is reachable from this machine only; put a reverse proxy in front of it to expose it. | |
 | `[search]` | `/okazuri/search`, and the first SQLite file (`db_path`). | off |
-| `[d1]` | A copy of the magazine tables of the Worker's D1 database, stored in the second SQLite file (`mirror_path`). | off |
+| `[translation]` | Where the translations come from (the Google Translate bridge: `google_bridge_url`, `google_bridge_token`). | |
+| `[magazine]` | A copy of the magazine tables of the Worker's D1 database, stored in the second SQLite file (`mirror_path`). | off |
 | `[prefetch]` | Searches in advance for every issue in that copy. | off |
 | `[cron]` | HTTP requests the server sends on a schedule (`[[cron.jobs]]`). `${NAME}` in a value is an environment variable. | off |
 | `[romaji]`, `[romaji.exceptions]` | The maximum `/romaji` query length; words to spell as specified instead of looking them up in the dictionary. The conversion itself cannot be switched off. | **always on** |
