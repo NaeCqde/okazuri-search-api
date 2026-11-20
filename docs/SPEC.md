@@ -43,9 +43,13 @@
 ## サブコマンド
 
 ```
-okazuri-search-api                       127.0.0.1:8000 でサーバーを起動
+okazuri-search-api                       設定ファイルのポートでサーバーを起動
 okazuri-search-api serve --port 9000     --config <パス> --host <アドレス> --port <ポート>
 okazuri-search-api search <語>...        1 回検索(サーバーなし)。--live off|diff|force --limit <n>
+okazuri-search-api title <URL>...         ページのタイトルと、日本語名・ローマ字・英訳を表示する。--live off|diff|force
+okazuri-search-api magazines             雑誌の一覧と最新号を表示する
+okazuri-search-api magazine <題名>       作品が載っている号を表示する。--limit <n>
+okazuri-search-api works <号>            号の作品一覧を表示する
 okazuri-search-api sync                  D1 の雑誌のテーブルを今すぐ写す
 okazuri-search-api prefetch              写しの号を 1 周、事前検索する。--limit <n>
 okazuri-search-api convert "文"...       ローマ字を表示。文がなければ標準入力の各行

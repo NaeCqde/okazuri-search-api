@@ -25,12 +25,23 @@ use tokio::task::JoinHandle;
 pub const USAGE: &str = "okazuri-search-api\n\n\
 Usage: okazuri-search-api [command]\n\n\
 (no command)                           Start the server (same as `serve`)\n\
-serve                                  Start the server, and what the config switches on: [search],\n\
+serve                                  Start the server on the port of the config file, and what it switches on: [search],\n\
                                        [magazine] with [prefetch], and [cron]\n\
     --config <path>      Config file (default: config.toml in the current directory;\n\
                          a file that does not exist means the defaults)\n\
     --host <address>     Address to listen on (default: [server] host, 127.0.0.1)\n\
     --port <port>        Port to listen on (default: [server] port, 8000)\n\
+title <url>...                         Print the title of the page of each URL (a saved work first, else the page is asked for),\n\
+                                       with its Japanese title, romaji and English translation\n\
+    --live <off|diff|force> off: only saved works; diff (default): ask the page when the work is not saved; force: ask the page\n\
+    --config <path>      Config file\n\
+magazines                              Print the magazines of the copy of the catalogue ([magazine]), with their newest issue\n\
+    --config <path>      Config file\n\
+magazine <title>                       Print the issues that printed the work with this title (a part of the title is enough)\n\
+    --limit <n>          The most works (default: 10)\n\
+    --config <path>      Config file\n\
+works <issue>                          Print the works of the issue with this name or id, in the order of the issue\n\
+    --config <path>      Config file\n\
 search <words>...                      Search the sites for the words (in romaji), save what they list, and print the\n\
                                        saved works whose title has all the words\n\
     --live <off|diff|force> off: do not ask the sites, answer from the database; diff (default): ask the\n\
@@ -79,6 +90,10 @@ pub enum Command {
     Serve { config: Option<PathBuf>, host: Option<String>, port: Option<u16> },
     Convert { texts: Vec<String>, loanwords: Loanwords, config: Option<PathBuf> },
     Search { query: String, live: Live, limit: Option<usize>, config: Option<PathBuf> },
+    Title { urls: Vec<String>, live: Live, config: Option<PathBuf> },
+    Magazines { config: Option<PathBuf> },
+    Magazine { title: String, limit: u64, config: Option<PathBuf> },
+    Works { issue: String, config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
@@ -100,6 +115,10 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "serve" => parse_serve(rest),
         "convert" => parse_convert(rest),
         "search" => parse_search(rest),
+        "title" => parse_title(rest),
+        "magazines" => parse_config_only(rest, "magazines").map(|config| Command::Magazines { config }),
+        "magazine" => parse_magazine(rest),
+        "works" => parse_works(rest),
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
@@ -176,6 +195,87 @@ fn parse_search(args: &[String]) -> Result<Command> {
     }
 
     Ok(Command::Search { query: words.join(" "), live, limit, config })
+}
+
+fn parse_title(args: &[String]) -> Result<Command> {
+    let (mut urls, mut live, mut config) = (Vec::new(), Live::Diff, None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--live" => {
+                let text = value(&mut iter, arg)?;
+
+                live = Live::parse(&text).ok_or_else(|| format!("--live is off, diff or force, not {text:?}"))?;
+            }
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other => urls.push(other.to_string()),
+        }
+    }
+
+    if urls.is_empty() {
+        return Err(format!("title needs the URLs of the pages\n\n{USAGE}").into());
+    }
+
+    Ok(Command::Title { urls, live, config })
+}
+
+fn parse_config_only(args: &[String], command: &str) -> Result<Option<PathBuf>> {
+    let mut config = None;
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other => return Err(format!("{command} takes only --config, not {other}\n\n{USAGE}").into()),
+        }
+    }
+
+    Ok(config)
+}
+
+fn parse_magazine(args: &[String]) -> Result<Command> {
+    let (mut words, mut limit, mut config) = (Vec::new(), 10, None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--limit" => limit = number(&mut iter, arg)? as u64,
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other => words.push(other.to_string()),
+        }
+    }
+
+    if words.is_empty() {
+        return Err(format!("magazine needs the title of a work\n\n{USAGE}").into());
+    }
+
+    if limit == 0 || limit > crate::mirror::MAX_PRINTED_WORKS {
+        return Err(format!("--limit is 1 to {}", crate::mirror::MAX_PRINTED_WORKS).into());
+    }
+
+    Ok(Command::Magazine { title: words.join(" "), limit, config })
+}
+
+fn parse_works(args: &[String]) -> Result<Command> {
+    let (mut words, mut config) = (Vec::new(), None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other => words.push(other.to_string()),
+        }
+    }
+
+    if words.is_empty() {
+        return Err(format!("works needs the name or id of an issue\n\n{USAGE}").into());
+    }
+
+    Ok(Command::Works { issue: words.join(" "), config })
 }
 
 fn parse_sync(args: &[String]) -> Result<Command> {
@@ -296,6 +396,10 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Search { query, live, limit, config } => {
             search(query, live, limit, config).await
         }
+        Command::Title { urls, live, config } => title(urls, live, config).await,
+        Command::Magazines { config } => magazines(config).await,
+        Command::Magazine { title, limit, config } => magazine(title, limit, config).await,
+        Command::Works { issue, config } => works(issue, config).await,
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
@@ -524,6 +628,97 @@ async fn search(
     Ok(())
 }
 
+/// The titles of the pages, one block per URL (the same lookup as `GET /okazuri/title`).
+async fn title(urls: Vec<String>, live: Live, config: Option<PathBuf>) -> Result<()> {
+    let mut config = load(config).await?;
+    config.search.enabled = true;
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
+
+    for url in urls {
+        println!("{url}");
+
+        match engine.title_of(&url, live).await {
+            Ok(info) => {
+                println!("  website        {}", info.website);
+                println!("  title          {}", info.title);
+                println!("  title_japanese {}", info.title_japanese.as_deref().unwrap_or("-"));
+                println!("  title_romaji   {}", info.title_romaji);
+                match &info.title_english {
+                    Some(english) => println!("  title_english  {} ({})", english.text, english.source),
+                    None => println!("  title_english  -"),
+                }
+                println!("  source         {}", info.source);
+            }
+            Err(None) => println!("  unsupported website"),
+            Err(Some(why)) => println!("  {why}"),
+        }
+    }
+
+    Ok(())
+}
+
+/// The copy of the catalogue, or the reason there is none.
+async fn mirror_file(config: Option<PathBuf>) -> Result<PathBuf> {
+    let config = load(config).await?;
+
+    if !config.magazine.mirror_path.exists() {
+        return Err(format!("there is no copy of the catalogue at {} (run `sync` first)", config.magazine.mirror_path.display()).into());
+    }
+
+    Ok(config.magazine.mirror_path)
+}
+
+fn issue_url(id: &str) -> String {
+    format!("https://www.dlsite.com/books/work/=/product_id/{id}.html")
+}
+
+async fn magazines(config: Option<PathBuf>) -> Result<()> {
+    let path = mirror_file(config).await?;
+    let found = crate::mirror::mirror_magazines(&path).await?.ok_or("the copy has no magazines yet")?;
+
+    for magazine in &found {
+        println!("{:<28} {:>4} issues", magazine.name, magazine.issues);
+
+        if let Some(latest) = &magazine.latest {
+            println!("    latest: {} ({})", latest.name, issue_url(&latest.id));
+        }
+    }
+
+    Ok(())
+}
+
+async fn magazine(title: String, limit: u64, config: Option<PathBuf>) -> Result<()> {
+    let path = mirror_file(config).await?;
+    let found = crate::mirror::mirror_find_works(&path, &title, limit).await?.ok_or("the copy has no works yet")?;
+
+    if found.is_empty() {
+        return Err("no such work".into());
+    }
+
+    for work in &found {
+        println!("{}  ({})", work.name, work.author);
+        println!("    {} #{}  {}", work.issue.name, work.position, issue_url(&work.issue.id));
+    }
+
+    Ok(())
+}
+
+async fn works(issue: String, config: Option<PathBuf>) -> Result<()> {
+    let path = mirror_file(config).await?;
+    let (issue, works) = crate::mirror::mirror_issue_works(&path, &issue)
+        .await?
+        .ok_or("the copy has no works yet")?
+        .ok_or("no such issue")?;
+
+    println!("{} ({})", issue.name, issue_url(&issue.id));
+
+    for work in &works {
+        println!("{:>3}. {}  ({})", work.position, work.name, work.author);
+    }
+
+    Ok(())
+}
+
 async fn sync(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
     let synced = Arc::new(d1_client(&config)?).sync(&config.magazine.mirror_path).await?;
@@ -733,6 +928,24 @@ mod tests {
     #[test]
     fn sync_and_prefetch() {
         assert_eq!(parse(&args(&["sync"])).unwrap(), Command::Sync { config: None });
+        assert_eq!(
+            parse(&args(&["title", "http://a", "--live", "off", "http://b"])).unwrap(),
+            Command::Title { urls: args(&["http://a", "http://b"]), live: Live::Off, config: None }
+        );
+        assert!(parse(&args(&["title"])).is_err());
+        assert_eq!(parse(&args(&["magazines", "--config", "a.toml"])).unwrap(), Command::Magazines { config: Some(PathBuf::from("a.toml")) });
+        assert!(parse(&args(&["magazines", "x"])).is_err());
+        assert_eq!(
+            parse(&args(&["magazine", "My", "Work", "--limit", "3"])).unwrap(),
+            Command::Magazine { title: "My Work".into(), limit: 3, config: None }
+        );
+        assert!(parse(&args(&["magazine", "x", "--limit", "0"])).is_err());
+        assert!(parse(&args(&["magazine"])).is_err());
+        assert_eq!(
+            parse(&args(&["works", "COMIC", "2026"])).unwrap(),
+            Command::Works { issue: "COMIC 2026".into(), config: None }
+        );
+        assert!(parse(&args(&["works"])).is_err());
         assert_eq!(
             parse(&args(&["prefetch", "--limit", "20"])).unwrap(),
             Command::Prefetch { limit: Some(20), config: None }
