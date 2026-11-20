@@ -72,9 +72,9 @@ google_bridge_url = ""
 # What the bridge wants in "Authorization: Bearer" (its BRIDGE_TOKEN). Empty for none.
 google_bridge_token = ""
 
-# A copy of the magazine tables (magazines and numbers) of the Worker's D1 database. The server asks D1 whether
+# A copy of the magazine tables (magazines, numbers, authors and works) of the Worker's D1 database. The server asks D1 whether
 # the data changed (the Time Travel bookmark: no rows are read), and when it did, downloads the SQL that D1
-# exports for those two tables and loads it into the second SQLite file. The whole database cannot be exported
+# exports for those tables and loads it into the second SQLite file. The whole database cannot be exported
 # because of its FTS5 table, so the tables are named. An export blocks the database for a moment.
 [d1]
 enabled = false
@@ -82,7 +82,7 @@ account_id = ""
 database_id = ""
 # A Cloudflare API token that can edit D1. ${NAME} is the environment variable NAME: keep the token out of this file.
 api_token = "${CLOUDFLARE_API_TOKEN}"
-tables = ["magazines", "numbers"]
+tables = ["magazines", "numbers", "authors", "works"]
 mirror_path = "d1-mirror.db"
 check_interval_minutes = 10
 
