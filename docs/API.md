@@ -2,7 +2,7 @@
 
 Every `200` answer says how long a cache may keep it: `Cache-Control: public, max-age=60, s-maxage=N` (300 s for a search,
 an hour for `/okazuri/sites`, a day for the translations and `/romaji`). A search with `live=on`, an error and `/health` are
-`no-store`. The demo server is also at `https://okazuri.nae.quest/api/v1/...` (the same paths behind `/api/v1`), where Cloudflare keeps the answers.
+`no-store`. Every path is also under `/api/v1` (`/api/v1/okazuri/search`). The demo server is also at `https://okazuri.nae.quest/api/v1/...` (the same paths behind `/api/v1`), where Cloudflare keeps the answers.
 
 A function that is off in `config.toml` has no route: its paths answer `404`. A bad request is a `422` with
 `{"detail": "..."}`.
