@@ -28,6 +28,8 @@ GET /okazuri/search?q=快楽天 2026 7
   "query": "kairakuten 2026 7",
   "terms": ["kairakuten", "2026", "7"],
   "total": 12,
+  "total_legal": 9,
+  "total_illegal": 3,
   "results": [
     {
       "website": "DLsite",
@@ -55,6 +57,7 @@ GET /okazuri/search?q=快楽天 2026 7
 - `translation` は、日本語を含むクエリの英語のタイトルで、`translation_ja` は、日本語を含まないクエリの日本語のタイトルです
   (`{"text", "source"}` または `null`)。そのタイトルを持つ作品も `results` に入ります([SEARCH.md](SEARCH.md))。
 - `total` は、ヒットした作品の実際の数です(すべての語を含む保存済みの作品に、英訳・日本語訳の題名で見つかった作品を足し、同じアドレスは 1 つに数えます)。`results` は `limit` で切られます。
+- `total_legal` と `total_illegal` は、`total` のうち合法なサイト(`is_legal` が `true`)の作品の数と、違法なサイトの作品の数です(足すと `total`)。`limit` や `offset` では変わりません。
 - `is_new` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
   再び見つかった作品は新しくなく、行もそのままです(タイトルが変わったときだけ書き直します)。
 - `sites` は、各サイトの結果を表します。`searched`(いま尋ねた)、`cached`(`live=diff` で、`ttl_hours` 以内に尋ねたので
