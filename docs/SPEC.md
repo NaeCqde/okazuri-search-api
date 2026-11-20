@@ -57,7 +57,7 @@ okazuri-search-api convert "文"...       ローマ字を表示。文がなけ�
 
 ## 設定(`config.toml`、カレントディレクトリ)
 
-`[server]`(`host` 既定 `127.0.0.1`、`port` 既定 8000)、`[search]`(`enabled`、`db_path`、`ttl_hours` 720、`max_query_chars` 300、`timeout_secs`、`min_delay_ms`、`max_results_per_site`、`max_results` 100、`disabled_sites`、`try_unsupported`)、`[magazine]`(Cloudflare の D1 の写し。`api_token` は環境変数 `CLOUDFLARE_API_TOKEN`)、`[prefetch]`、`[cron]`(`[[cron.jobs]]`、値の `${NAME}` は環境変数)、`[romaji]`(`max_query_chars`、`[romaji.exceptions]`)。
+`[server]`(`host` 既定 `127.0.0.1`、`port` 既定 8000)、`[search]`(`enabled`、`db_path`、`ttl_hours` 720、`max_query_chars` 300、`timeout_secs`、`min_delay_ms`、`max_results_per_site`、`max_results` 100、`disabled_sites`、`try_unsupported`)、`[magazine]`(Cloudflare の D1 の写し。`api_token` は環境変数 `CLOUDFLARE_API_TOKEN`。事前検索は `[magazine.prefetch]`)、`[cron]`(`[[cron.jobs]]`、値の `${NAME}` は環境変数)、`[romaji]`(`max_query_chars`、`[romaji.exceptions]`)。
 
 ## データ
 
