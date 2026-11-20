@@ -67,8 +67,8 @@ push のたびに、実行ファイルがアーカイブにされず、そのま
 | 実行ファイル                                            |                                                                                              |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `okazuri-search-api-Linux-x86_64-musl`                  | **静的リンク**で glibc に依存せず、どの Linux x86_64 サーバー(VPS、コンテナ)でも動きます |
-| `okazuri-search-api-Linux-x86_64`、`-Linux-aarch64`     | glibc 版                                                                                     |
-| `okazuri-search-api-Windows-x86_64`、`-Windows-aarch64` |                                                                                              |
+| `okazuri-search-api-Linux-aarch64-musl`                 | 同じく静的リンクの Linux aarch64 版(ARM のサーバー、Raspberry Pi など)                       |
+| `okazuri-search-api-Windows-x86_64`                     |                                                                                              |
 | `okazuri-search-api-macOS-aarch64`                      |                                                                                              |
 
 実行ファイルは約 190 MB あります(UniDic と SQLite を埋め込んでいるためです)。サーバーでの動かし方は

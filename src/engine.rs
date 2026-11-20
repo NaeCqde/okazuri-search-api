@@ -1835,7 +1835,7 @@ pub(crate) mod tests {
         // a fragment, a query string and a slash at the end do not matter
         for url in [page.clone(), format!("{page}/"), format!("{page}?utm_source=x&ref=y#top")] {
             let info = engine.title_of(&url, Live::Diff).await.unwrap();
-            assert_eq!((info.website, info.title.as_str(), info.source, info.title_romaji.as_str()), ("Good", "Saved title", "database", "saved title"), "{url}");
+            assert_eq!((info.website, info.title.as_str(), info.source, info.title_romaji.as_str()), ("Good", "Saved title", "database", "Saved title"), "{url}");
             assert_eq!((info.title_japanese, info.title_english.as_deref()), (None, Some("Saved title")), "a title in Latin letters is its own English title");
         }
         assert_eq!(requests(&hits), (0, 0, 0), "the database answered, no page was asked");

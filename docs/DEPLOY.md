@@ -1,6 +1,6 @@
 # サーバーで動かす
 
-Linux x86_64 の VPS やコンテナでは、**musl** のアーカイブ(`okazuri-search-api-Linux-x86_64-musl`)を使います。実行ファイルは静的なので、
+Linux の VPS やコンテナでは、**musl** の実行ファイル(x86_64 は `okazuri-search-api-Linux-x86_64-musl`、ARM は `okazuri-search-api-Linux-aarch64-musl`)を使います。実行ファイルは静的なので、
 glibc も、ほかのファイルも要りません。UniDic が中に入っているため約 190 MB ありますが、辞書はファイルからメモリに対応付けられ、
 使う部分だけが読み込まれます。Windows で測ったところ、起動は 0.3 秒で、300 回のリクエストの後でも使用メモリは約 8 MB でした
 (OS がファイル全体をキャッシュに残すことはあります)。

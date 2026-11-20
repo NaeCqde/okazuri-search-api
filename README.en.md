@@ -68,8 +68,8 @@ Every push builds a release. The executables are uploaded as they are (not archi
 | Executable                                               |                                                                            |
 | ------------------------------------------------------- | -------------------------------------------------------------------------- |
 | `okazuri-search-api-Linux-x86_64-musl`                  | **statically linked**, no glibc needed: runs on any Linux x86_64 server (VPS, container) |
-| `okazuri-search-api-Linux-x86_64`, `-Linux-aarch64`     | glibc                                                                      |
-| `okazuri-search-api-Windows-x86_64`, `-Windows-aarch64` |                                                                            |
+| `okazuri-search-api-Linux-aarch64-musl`                 | the same, static, for Linux aarch64 (ARM servers, Raspberry Pi)           |
+| `okazuri-search-api-Windows-x86_64`                     |                                                                            |
 | `okazuri-search-api-macOS-aarch64`                      |                                                                            |
 
 The executable is about 190 MB because UniDic and SQLite are built into it. For how to run it on a server, see
