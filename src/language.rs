@@ -2,6 +2,11 @@
 //! brackets that only name languages (`[EN]`, `[English]`, `[CN,EN,JP,KR]`). It is a guess from the title, so it is kept apart from
 //! the title (`works.language`) and made again by `import` and `reromanize`.
 //!
+//! A title that is written in the script of a language is that language too, whatever it says: Cyrillic is Russian, Hangul Korean, Thai
+//! Thai, Arabic Arabic, the letters that only Vietnamese has Vietnamese, and a character that only Chinese writes (a simplified form, or a
+//! traditional form that Japanese does not use) Chinese, since a work with such a title was translated for them. Japanese and English are not
+//! read from the script: the kana and the Latin letters are in the titles of every language.
+//!
 //! The answer is the two-letter codes of the languages the title names, joined with `,` in the order it names them (`zh`, `en,ko`; a pack
 //! `[CN,EN,JP,KR]` is `zh,en,ja,ko`), or None when the title says nothing (most titles are Japanese and do not say so). The flag of Japan that
 //! a site puts first does not make a title Japanese when the title names another language (`🇯🇵 【EN】Kosuzu-Chan` is `en`): Japanese
@@ -81,6 +86,49 @@ fn patterns() -> &'static Patterns {
     })
 }
 
+/// Characters of Chinese that Japanese does not write: the simplified forms, and the traditional forms that are not the kanji of Japanese.
+const CHINESE_ONLY: &str = "们这个说吗么还对见书车长门问间马东开关电时经为产业华从众传优伤价兴册军凉动务劳势协单卫历县变叹听启员响团园图坏场坚处备头夸夺奋妇决净发\
+    這們說嗎麼點沒對關經產從眾傳價淨勞歷縣變聽啟團圖壞處";
+
+/// The languages whose script the text is written in (see the top of the file), in the order of their first letter.
+fn by_script(text: &str) -> Vec<&'static str> {
+    let (mut cyrillic, mut hangul, mut thai, mut arabic) = (0, 0, 0, 0);
+    let mut found: Vec<(usize, &'static str)> = Vec::new();
+
+    for (at, c) in text.char_indices() {
+        let code = match c {
+            '\u{0400}'..='\u{04FF}' => {
+                cyrillic += 1;
+                (cyrillic == 2).then_some("ru")
+            }
+            '\u{AC00}'..='\u{D7AF}' => {
+                hangul += 1;
+                (hangul == 2).then_some("ko")
+            }
+            '\u{0E00}'..='\u{0E7F}' => {
+                thai += 1;
+                (thai == 2).then_some("th")
+            }
+            '\u{0600}'..='\u{06FF}' => {
+                arabic += 1;
+                (arabic == 2).then_some("ar")
+            }
+            _ if "ăơưđạảấầẩẫậắằẳẵặẹẻẽếềểễệịỉọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ".contains(c.to_ascii_lowercase()) || "ĂƠƯĐẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỊỈỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ".contains(c) => Some("vi"),
+            _ if CHINESE_ONLY.contains(c) => Some("zh"),
+            _ => None,
+        };
+
+        if let Some(code) = code {
+            if !found.iter().any(|(_, known)| *known == code) {
+                found.push((at, code));
+            }
+        }
+    }
+
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, code)| code).collect()
+}
+
 fn add(found: &mut Vec<&'static str>, code: &'static str) {
     if !found.contains(&code) {
         found.push(code);
@@ -144,6 +192,11 @@ pub fn detect_all(title: &str) -> Vec<&'static str> {
         }
     }
 
+    // a title in the script of a language is that language too
+    for code in by_script(text) {
+        add(&mut found, code);
+    }
+
     // the flag of Japan next to another language is the site's flag, not a tag of the title
     if found.len() > 1 && !japanese_tag {
         found.retain(|code| *code != "ja");
@@ -201,6 +254,27 @@ mod tests {
         is("🇯🇵 A", "ja");
         is("🇺🇸🇰🇷 A", "en,ko");
         is("🇹🇼 A", "zh");
+    }
+
+    #[test]
+    fn a_title_in_the_script_of_a_language_is_that_language() {
+        is("Рассвет над городом", "ru");
+        is("[Автор] Название [Digital]", "ru");
+        is("제목이 한국어", "ko");
+        is("ชื่อเรื่องภาษาไทย", "th");
+        is("عنوان عربي", "ar");
+        is("Tình yêu của chúng ta", "vi");
+        is("[A] 这个故事 [DL版]", "zh");
+        is("這們故事", "zh");
+        is("[Автор] 这个 [English]", "en,ru,zh");
+        // the flag of Japan stays out when the script names another language
+        is("🇯🇵 Название", "ru");
+        // Japanese and English are not read from the script
+        assert_eq!(detect("[A] 普通の日本語タイトル"), None);
+        assert_eq!(detect("COMIC 快楽天 2026年1月号"), None);
+        assert_eq!(detect("An English title"), None);
+        // one letter (a decoration such as Я) does not make a title Russian
+        assert_eq!(detect("ЯBIT"), None);
     }
 
     #[test]
