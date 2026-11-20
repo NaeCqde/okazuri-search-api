@@ -83,7 +83,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
   "input": "COMIC快楽天 2026 11",
   "query": "comic kairakuten 2026 11",
   "terms": ["comic快楽天", "2026", "11"],
-  "total": 28,
+  "total": 28, "total_legal": 20, "total_illegal": 8,
   "results": [
     { "website": "FANZA", "is_legal": true, "path": "/product/25199/b915awnmg04607/",
       "url": "https://book.dmm.co.jp/product/25199/b915awnmg04607/", "title": "COMIC快楽天 2026年11月号",
@@ -97,7 +97,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
 
 `status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
 までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
-失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数で、`results` はそれより短いことがあります。
+失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数(`total_legal` と `total_illegal` は、その合法なサイトと違法なサイトの内訳)で、`results` はそれより短いことがあります。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
 スラッシュ付きで保存したページを、サイトが後からスラッシュなしで挙げたときは、スラッシュなしの path に**名前が変わります**(同じ行なので `first_seen` は残り、
 そのページを指す一覧も追従します)。両方の形が同時に挙がったページは、スラッシュなしで保存します(そう書くサイトに、スラッシュは要りません)。

@@ -235,6 +235,9 @@ pub struct Outcome {
     pub terms: Vec<String>,
     /// How many works have all the words (`results` may be cut short of it).
     pub total: usize,
+    /// How many of `total` are on a legal site, and how many on an illegal one (`is_legal`).
+    pub total_legal: usize,
+    pub total_illegal: usize,
     pub results: Vec<Hit>,
     pub sites: Vec<SiteReport>,
     /// The English title of the query that was searched too (the works of both are in `results`). None when the query has no
@@ -678,6 +681,8 @@ impl Engine {
 
         // `total` is how many works there are, whatever the limit cuts
         outcome.total = outcome.results.len();
+        outcome.total_legal = outcome.results.iter().filter(|hit| hit.is_legal).count();
+        outcome.total_illegal = outcome.total - outcome.total_legal;
         outcome.results.truncate(request.limit.max(1));
         self.fill_english(&mut outcome.results).await?;
 
@@ -815,6 +820,8 @@ impl Engine {
             input: plan.input,
             terms: terms.keys().into_iter().map(str::to_string).collect(),
             total,
+            total_legal: 0,
+            total_illegal: 0,
             results: hits,
             query: plan.query,
             translation: None,
@@ -2142,6 +2149,7 @@ pub(crate) mod tests {
         let outcome = engine.search(&Request { limit: 1, ..Request::new("q") }).await.unwrap();
 
         assert_eq!((outcome.results.len(), outcome.total), (1, 2));
+        assert_eq!(outcome.total_legal + outcome.total_illegal, 2);
     }
 
     #[tokio::test]
