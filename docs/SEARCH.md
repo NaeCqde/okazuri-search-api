@@ -95,12 +95,6 @@ The answer:
 `status` is `searched` (asked now), `failed` (the `error` says why) or `not searched` (`live=0`); `queries` are the queries the site is asked
 (one or two, see above) and `count` the works they listed together. A site that fails does not stop the others. `total` is the number of works that have all the words; `results` may be shorter. A page is one work in the database and one result: a page that a site writes with and without the slash at the end (`/g/1/`, `/g/1`) is saved once. A page saved with the slash that the site lists without it later is **renamed** to the path without (the same row, so `first_seen` stays, and the lists that name it follow); one listed in both forms at once is saved without the slash (a site that writes it that way does not need it); one that is saved without the slash stays so; one that is only ever listed with the slash keeps it, and works with the same address (also with or without the `/` at the end, or the `#` part, in lower case) are one, the first stays, and it is `isNew` when any of them is.
 
-## The same search on Hitomi.La: `GET /hitomila/search`
-
-`GET /hitomila/search?q=…` is `/okazuri/search` with every other site left out (`exclude`): the same parameters (`live`, `limit`,
-`translator`) and the same answer (`input`, `query`, `terms`, `total`, `results`, `sites` with Hitomi.La alone, `translation`). It has no route (404)
-when Hitomi.La is left out of `[search]`.
-
 ## The sites
 
 ### `GET /hitomila/translate?q=<text>`: Japanese to English, English to Japanese
