@@ -414,6 +414,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         romanizer: romanizer.clone(),
         max_query_chars: config.romaji.max_query_chars,
         search: engine.clone(),
+        mirror_path: (config.magazine.enabled || config.magazine.mirror_path.exists()).then(|| config.magazine.mirror_path.clone()),
     });
 
     // an IPv6 address has to be in brackets
