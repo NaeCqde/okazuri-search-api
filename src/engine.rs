@@ -674,6 +674,18 @@ impl Engine {
     /// The answer to a request: the sites are asked (unless the request says not to), and then the saved works
     /// whose title has every word of the query are the result.
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
+        let mut outcome = self.search_all(request).await?;
+
+        // `total` is how many works there are, whatever the limit cuts
+        outcome.total = outcome.results.len();
+        outcome.results.truncate(request.limit.max(1));
+        self.fill_english(&mut outcome.results).await?;
+
+        Ok(outcome)
+    }
+
+    /// `search` with every work in `results`: the works of the English (or Japanese) title are in it, once.
+    async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let mut outcome = self.search_one(request).await?;
 
         if request.translator == Translator::None {
@@ -698,9 +710,7 @@ impl Engine {
                     let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
                     let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
 
-                    outcome.total += added.len();
                     outcome.results.extend(added);
-                    outcome.results.truncate(request.limit.max(1));
                     outcome.translation_ja = Some(Translated { text, source: found.source });
                 }
                 Err(e) => log::warn!("cannot search the Japanese title {text:?} of {:?}: {e}", request.query),
@@ -722,9 +732,7 @@ impl Engine {
                 let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
                 let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
 
-                outcome.total += added.len();
                 outcome.results.extend(added);
-                outcome.results.truncate(request.limit.max(1));
                 outcome.translation = Some(Translated { text, source: english.source });
             }
             Err(e) => log::warn!("cannot search the English title {text:?} of {:?}: {e}", request.query),
@@ -733,7 +741,7 @@ impl Engine {
         Ok(outcome)
     }
 
-    /// The search of one query (`search` does it for the English title too).
+    /// The search of one query (`search` does it for the English title too). Every work is in `results`, with no English titles yet.
     async fn search_one(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.query);
@@ -788,9 +796,6 @@ impl Engine {
 
         let hits = dedupe_by_url(hits);
         let total = hits.len();
-        let mut hits = hits;
-        hits.truncate(request.limit.max(1));
-        self.fill_english(&mut hits).await?;
 
         Ok(Outcome {
             sites: {
