@@ -1,23 +1,24 @@
 # HTTP API
 
-Every `200` answer says how long a cache may keep it: `Cache-Control: public, max-age=60, s-maxage=N` (300 s for a search,
-an hour for `/okazuri/sites`, a day for the translations and `/romaji`). A search with `live=on`, an error and `/health` are
-`no-store`. Every path is also under `/api/v1` (`/api/v1/okazuri/search`). The demo server is also at `https://okazuri.nae.quest/api/v1/...` (the same paths behind `/api/v1`), where Cloudflare keeps the answers.
+`200` の応答には、キャッシュを持てる期間が `Cache-Control: public, max-age=60, s-maxage=N` で示されます(検索は 300 秒、
+`/okazuri/sites` は 1 時間、翻訳と `/romaji` は 1 日)。`live=force` の検索、エラー、`/health` は `no-store` です。
+すべてのパスは `/api/v1` の下にも置かれています(`/api/v1/okazuri/search`)。デモサーバーは `https://okazuri.nae.quest/api/v1/...`
+でも使え(`/api/v1` の後ろは同じパスです)、そこでは Cloudflare が応答をキャッシュします。
 
-A function that is off in `config.toml` has no route: its paths answer `404`. A bad request is a `422` with
-`{"detail": "..."}`.
+`config.toml` でオフにした機能にはルートがなく、そのパスは `404` を返します。不正なリクエストは `422` と
+`{"detail": "..."}` を返します。
 
-## `GET /okazuri/search` (`[search]`)
+## `GET /okazuri/search`(`[search]`)
 
-The works that the sites list for a query. With `live` (the default) every site is asked now, the works that are new
-are saved, and the answer is every saved work, the new ones and what was saved before, whose title has all the words of
-the query. The whole story is in [SEARCH.md](SEARCH.md).
+クエリに対して、各サイトが一覧に載せている作品を返します。`live`(既定)では、いまサイトに尋ね、新しい作品を保存してから、
+クエリの語をすべてタイトルに含む保存済みの作品(新しい作品も以前に保存した作品も)を返します。詳しくは
+[SEARCH.md](SEARCH.md) を見てください。
 
-| Query | |
+| クエリ | |
 |---|---|
-| `q` | The words. Required, 1 to `[search] max_query_chars` characters (300 by default). White space separates them. It is turned into romaji first, always. |
-| `live` | `off`: ask no site, answer from the database alone, even when it is out of date. `diff` (default): ask only the combinations of query and site that are missing or older than `[search] ttl_hours` (a month); the others are `cached`. `on`: ask every site, cached or not (`searched`; an earlier failure is asked again). In every case the works that are new are saved, and the answer is from the database, which has them and what was saved before. `0`/`false`/`no` are `off`, `1`/`true`/`yes` are `on`. |
-| `limit` | The most works in the answer, 1 to `[search] max_results` (100 by default). |
+| `q` | 検索語。必須で、1 文字から `[search] max_query_chars` 文字まで(既定 300)。空白で語を区切ります。最初に必ずローマ字にされます。 |
+| `live` | `off`: どのサイトにも尋ねず、データベースだけで答えます(古くてもそのまま)。`diff`(既定): 答えがない、または `[search] ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかは `cached` になります。`force`: キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。どの場合も、新しい作品を保存し、保存済みの作品とあわせてデータベースから答えます。`0`/`false`/`no` は `off`、`1`/`true`/`yes`/`on` は `force` です。 |
+| `limit` | 応答に入れる作品の最大数。1 から `[search] max_results` まで(既定 100)。 |
 
 ```
 GET /okazuri/search?q=快楽天 2026 7
@@ -43,43 +44,48 @@ GET /okazuri/search?q=快楽天 2026 7
 }
 ```
 
-- `title` is the title of the work's item in the site's list, as the site writes it. `path` is the path of its page (and the
-  parameters of the query string that name the work); `url` is the domain of the site put before it.
-- `input` is `q` as it was sent (tidied up), and `query` is its **romaji**: what the sites were asked, and what the
-  titles were matched with. A `q` without Japanese in it is its own romaji. `titleRomaji` is the romaji of `title`.
-- `titleEnglish` is the English title of a result and `titleEnglishSource` where it is from (`{"official"|"google"}`, both `null` when there is none): the title itself when it is English, the English side of a title that has both (`English | 日本語`) or a saved translation: Hitomi.La's is the work's own title (`official`), Google's is a machine translation (`google`). Nothing is asked for it.
-- `translation` is the English title of a query with Japanese in it, and `translationJa` the Japanese title of a query without Japanese (`{"text", "source"}`, or `null`): the works with that title are in `results` too ([SEARCH.md](SEARCH.md)).
-- `total` is how many saved works have all the words; `results` is cut to `limit`.
-- `isNew` is true for a work that this request found on a site and saved: it was not in the database before. A work that is
-  found again is not new, and its row is left as it is (it is written again only if its title changed).
-- `sites` says what came of each site: `searched` (asked now), `cached` (`live=diff`, and asked less than `ttl_hours` ago: the database answers), `failed` (with the `error`), `not searched` (`live=off`) or `unavailable` (Hitomi.La while its whole list is not saved: it is then not searched at all), with the `queries`
-  the site is asked: `["快楽天", "kairakuten"]` for a site that finds Japanese titles when `q` has Japanese in it, `["kairakuten"]`
-  otherwise (a `q` without Japanese, or a site that does not find Japanese titles: EHentai, HentaiEra). `count` is the works the queries listed together.
-  The request is `200` even if some sites failed.
-- The works are in the order of the sites, and in a site the ones saved last come first.
-- A `422` for a missing or too long `q`, and for a `live` that is not `off`, `diff` or `on`.
+- `title` は、サイトの一覧に載っている作品のタイトルで、サイトが書いたままです。`path` は作品ページのパス(作品を指す
+  クエリ文字列のパラメータを含みます)で、`url` はそれにサイトのドメインを付けたものです。
+- `input` は送られた `q`(整えたもの)で、`query` はその**ローマ字**です。サイトに尋ねた文字列で、タイトルとの照合にも使います。
+  日本語を含まない `q` は、それ自体がローマ字です。`titleRomaji` は `title` のローマ字です。
+- `titleEnglish` は結果の英語のタイトルで、`titleEnglishSource` はその出どころです(`"official"` か `"google"`。英語のタイトルがなければ
+  どちらも `null`)。タイトルが英語ならそのタイトル、両方を併記したタイトル(`English | 日本語`)ならその英語側、そうでなければ保存済みの翻訳です。
+  Hitomi.La の翻訳は作品自身のタイトルなので `official`、Google の翻訳は機械翻訳なので `google` です。このために新しくサイトへ尋ねることはありません。
+- `translation` は、日本語を含むクエリの英語のタイトルで、`translationJa` は、日本語を含まないクエリの日本語のタイトルです
+  (`{"text", "source"}` または `null`)。そのタイトルを持つ作品も `results` に入ります([SEARCH.md](SEARCH.md))。
+- `total` は、すべての語を含む保存済みの作品の数で、`results` は `limit` で切られます。
+- `isNew` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
+  再び見つかった作品は新しくなく、行もそのままです(タイトルが変わったときだけ書き直します)。
+- `sites` は、各サイトの結果を表します。`searched`(いま尋ねた)、`cached`(`live=diff` で、`ttl_hours` 以内に尋ねたので
+  データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
+  までの間。その間は検索しません)のいずれかです。サイトに尋ねた `queries` も付きます。`q` に日本語があり、
+  日本語のタイトルで作品が見つかるサイトでは `["快楽天", "kairakuten"]`、それ以外(日本語を含まない `q`、または日本語のタイトルで
+  見つからないサイトの EHentai と HentaiEra)では `["kairakuten"]` です。`count` は、クエリを合わせて一覧に出た作品の数です。
+  一部のサイトが失敗しても、リクエストは `200` です。
+- 作品はサイトの順に並び、サイトの中では、最後に保存したものが先に来ます。
+- `q` がない、または長すぎるとき、および `live` が `off`、`diff`、`force`(または上の別名)でないときは `422` です。
 
-## `GET /okazuri/sites` (`[search]`)
+## `GET /okazuri/sites`(`[search]`)
 
-The sites of `okazuri_bot/src/websites.ts`, and whether each is searched.
+`okazuri_bot/src/websites.ts` のサイトと、それぞれを検索するかどうかを返します。
 
 ```
 [ { "name": "DLsite", "isLegal": true, "support": "ready", "hasSearch": true, "japanese": true, "active": true, "note": "" },
   { "name": "IMHentai", "isLegal": false, "support": "cloudflare", "hasSearch": true, "japanese": true, "active": false, "note": "" }, ... ]
 ```
 
-`support` is `ready`, `cloudflare` (a challenge that needs a browser), `javascript` or `closed`. `japanese` is whether the site finds
-works by their Japanese title: it is then asked a query that has Japanese in it as written as well as in romaji. `active` is whether this
-server searches the site with the current `[search]` settings (`disabled_sites`, `try_unsupported`).
+`support` は `ready`、`cloudflare`(ブラウザが要るチャレンジ)、`javascript`、`closed` のどれかです。`japanese` は、そのサイトが
+日本語のタイトルで作品を見つけられるかどうかで、`true` なら、日本語を含むクエリを、書かれたとおりの形とローマ字の両方で尋ねます。
+`active` は、現在の `[search]` の設定(`disabled_sites`、`try_unsupported`)で、このサーバーがそのサイトを検索するかどうかです。
 
 ## `GET /romaji`
 
-The romaji of a Japanese text, as `text/plain; charset=utf-8`.
+日本語の文のローマ字を、`text/plain; charset=utf-8` で返します。
 
-| Query | |
+| クエリ | |
 |---|---|
-| `q` | The text. Required, 1 to `[convert] max_query_chars` characters (300 by default). |
-| `loanwords` | `romaji` (default) or `english`: how to write a loanword that is spelled in hiragana. |
+| `q` | 文。必須で、1 文字から `[convert] max_query_chars` 文字まで(既定 300)。 |
+| `loanwords` | `romaji`(既定)か `english`。ひらがなで書かれた外来語の書き方です。 |
 
 ```
 GET /romaji?q=チートアイテム管理局のお仕事
@@ -92,27 +98,25 @@ GET /romaji?q=ナカよしふらすとれーしょん！&loanwords=english
 naka yoshi frustration!
 ```
 
-A bad request (`q` missing, empty or too long, an unknown `loanwords`) is a `422`. A text that cannot be converted is a
-`500`.
+不正なリクエスト(`q` がない、空、長すぎる、`loanwords` が未知の値)は `422` です。変換できない文は `500` です。
 
-The query string has to be percent-encoded as UTF-8 (`encodeURIComponent` in JavaScript). Sending it
-through a shell on Windows often mangles Japanese: use a program that encodes it.
+クエリ文字列は UTF-8 でパーセントエンコードする必要があります(JavaScript の `encodeURIComponent`)。Windows のシェルを
+通すと日本語が文字化けすることが多いので、エンコードしてくれるプログラムを使ってください。
 
 ## `GET /health`
 
-`ok`, once the server is listening. That is after the dictionary is loaded, so a connection that is
-refused during start-up means it is not ready yet.
+サーバーが待ち受けを始めると `ok` を返します。辞書の読み込みが終わってから待ち受けるので、起動中に接続を
+拒否されたときは、まだ準備ができていません。
 
-## Who calls it
+## 呼び出す側
 
-`okazuri_bot` called `/romaji` (`src/romaji.ts`) to rewrite a search query into romaji. `/okazuri/search` is the
-search that replaces the Bing search of the bot: the bot sends the title (or the name of the issue) and gets the pages
-of the sites that have it.
+`okazuri_bot` は `/romaji`(`src/romaji.ts`)を呼んで、検索クエリをローマ字に書き換えていました。`/okazuri/search` は
+BOT の Bing 検索の代わりになる検索で、BOT がタイトル(または号の名前)を送ると、それを載せているサイトのページが返ります。
 
-## Replacing the Python server
+## Python サーバーからの置き換え
 
-`/romaji` answers like the FastAPI server in `okazuri_bot/api` (cutlet + pykakasi), with these differences:
+`/romaji` は、`okazuri_bot/api` の FastAPI サーバー(cutlet + pykakasi)と同じように答えます。違いは次のとおりです。
 
-- no `engine` parameter: the pykakasi engine is gone (it was only a fallback);
-- the dictionary is UniDic 2.1.2 (lindera) instead of UniDic 2.3.0 (unidic-lite), so a few words are
-  split or read differently. `docs/ALGORITHM.md` has how close the two are.
+- `engine` パラメータはありません。pykakasi のエンジンは、フォールバックにすぎなかったのでなくなりました。
+- 辞書は UniDic 2.3.0(unidic-lite)ではなく UniDic 2.1.2(lindera)なので、いくつかの語で区切りや読みが違います。
+  どこまで近いかは `docs/ALGORITHM.md` にあります。

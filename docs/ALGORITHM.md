@@ -1,130 +1,128 @@
-# How the romaji is made
+# ローマ字の作り方
 
-The goal is a search query: the title of a work, written the way a site that lists it in the Latin
-alphabet would write it. `チートアイテム管理局のお仕事` should become `cheat item kanri kyoku no oshigoto`.
+目的は検索クエリを作ることです。作品のタイトルを、ラテン文字で作品を載せているサイトが書くのと同じ形にします。
+`チートアイテム管理局のお仕事` は `cheat item kanri kyoku no oshigoto` になるのが目標です。
 
-## The base: cutlet
+## 土台: cutlet
 
-[cutlet](https://github.com/polm/cutlet) splits the text into words with MeCab + UniDic, reads each
-word from the dictionary and writes it in Hepburn romaji. Two things it does matter here:
+[cutlet](https://github.com/polm/cutlet) は、MeCab + UniDic で文を単語に分け、辞書から各単語の読みを引き、ヘボン式ローマ字で書きます。
+ここで大事なのは次の 2 点です。
 
-- **A katakana loanword is written with its foreign spelling.** UniDic keeps it in the lemma
-  (`チート-cheat`, `アイテム-item`), so `チート` is `cheat`, not `chiito`.
-- **Words get spaces by rules** (a particle is a word, a suffix sticks to the word before it, a prefix
-  sticks to the word after it, ...). `romanizer.rs::cutlet_tokens` is that code, line by line.
+- **カタカナの外来語は、元の綴りで書きます。** UniDic は見出し語(lemma)に元の綴りを持っています
+  (`チート-cheat`、`アイテム-item`)。そのため `チート` は `chiito` ではなく `cheat` になります。
+- **単語の間のスペースは規則で決まります**(助詞は 1 語、接尾辞は直前の語にくっつく、接頭辞は直後の語にくっつく、など)。
+  `romanizer.rs::cutlet_tokens` がそのコードで、cutlet を 1 行ずつ写したものです。
 
-`romaji.rs` is cutlet's Hepburn table and its kana rules (digraphs, っ, ん before a vowel, ー).
+`romaji.rs` は cutlet のヘボン式の表と、かなの規則(拗音、っ、母音の前の ん、ー)です。
 
-lindera + UniDic replaces MeCab + UniDic. Both are the same dictionary family, but cutlet in Python used
-UniDic 2.3.0 (unidic-lite) and lindera embeds UniDic 2.1.2.
+MeCab + UniDic の代わりに lindera + UniDic を使います。辞書は同じ系統ですが、Python の cutlet は UniDic 2.3.0
+(unidic-lite)を使い、lindera は UniDic 2.1.2 を内蔵しています。
 
-### The reading of a word
+### 単語の読み
 
-UniDic 2.3.0 has a `kana` column: the reading as it is spelled (号 is ゴウ, しよう is シヨウ). UniDic 2.1.2 has only
-the pronunciation (`pron`, where a long vowel is `ー`: ゴー, ショー) and the reading of the dictionary form
-(`lForm`: 見込んで is ミコム, not ミコン). `Word::reading` works the spelled reading out:
+UniDic 2.3.0 には `kana` 列があり、綴りどおりの読みが入っています(号 は ゴウ、しよう は シヨウ)。UniDic 2.1.2 にあるのは
+発音(`pron`。長音は `ー` で、ゴー、ショー)と、辞書形の読み(`lForm`。見込んで は ミコン ではなく ミコム)だけです。
+`Word::reading` が、綴りどおりの読みを次の順で求めます。
 
-1. A word written in kana is read as it is written (しよう is `shiyou`, を is `o`, おねえちゃん is
-   `oneechan`). An interjection keeps its pronunciation (こんにちは is `konnichiwa`).
-2. A word that is not inflected, or is in its dictionary form, is read from `lForm`, which spells the long
-   vowels out (号 is ゴウ, 言う is イウ). Not a numeral: ふ is フ, not フタ.
-3. An inflected word is read from `pron`. Each `ー` becomes the vowel `lForm` has there (大きく is オオキク), or
-   the vowel the kana before it ends with (聞い is キー, so キイ; 行こう is イコー, so イコウ).
+1. かなで書かれた語は、書かれたとおりに読みます(しよう は `shiyou`、を は `o`、おねえちゃん は `oneechan`)。
+   感動詞は発音のままです(こんにちは は `konnichiwa`)。
+2. 活用していない語、または辞書形の語は、長音を綴りで書き出す `lForm` から読みます(号 は ゴウ、言う は イウ)。
+   数詞は除きます(ふ は フタ ではなく フ)。
+3. 活用した語は `pron` から読みます。それぞれの `ー` は、`lForm` のその位置にある母音に置き換えます(大きく は オオキク)。
+   なければ、直前のかなの終わりの母音にします(聞い は キー なので キイ、行こう は イコー なので イコウ)。
 
-## What is added on top
+## 上に足しているもの
 
-### 1. A loanword in hiragana is one word
+### 1. ひらがなの外来語は 1 語
 
-UniDic cuts `ふらすとれーしょん` into `ふらす / とれ / ー / しょ / ん` (a verb, an auxiliary, a symbol, ...), and
-cutlet would write `furasutore- sho n`. A hiragana word with a `ー` is almost always a loanword
-(`ー` is not used in native Japanese words), so those pieces are joined:
+UniDic は `ふらすとれーしょん` を `ふらす / とれ / ー / しょ / ん`(動詞、助動詞、記号、…)に切るため、cutlet は
+`furasutore- sho n` と書いてしまいます。`ー` を含むひらがなの語は、ほぼ必ず外来語です(和語には `ー` を使いません)。
+そこで、次のようにその断片をつなぎます。
 
-- going back from the `ー`, over the hiragana pieces, up to a dictionary word (`よし` in
-  `ナカよしふらすとれーしょん`: a noun that is not a piece);
-- going forward over the end pieces, but not over a particle (`の` in `ふらすとれーしょんの話`; the `ん`
-  is the exception, UniDic calls it a particle there);
-- a small kana that was cut off the kana before it (`ふ / ぁ / みこん` is `ふぁみこん`) joins both.
+- `ー` から後ろへ戻り、ひらがなの断片を、辞書の語に当たるところまでたどります
+  (`ナカよしふらすとれーしょん` の `よし` は、断片ではなく名詞です)。
+- 後ろへは、終わりの断片をたどりますが、助詞は越えません(`ふらすとれーしょんの話` の `の`。ただし `ん` は例外で、
+  UniDic はここで助詞と呼びます)。
+- 前のかなから切り離された小さいかな(`ふ / ぁ / みこん` は `ふぁみこん`)は、両方をつなぎます。
 
-The joined word is read from its kana directly, so it is `famikon` and not `fu a mikon`.
+つないだ語は、かなから直接読みます。そのため `fu a mikon` ではなく `famikon` になります。
 
-### 2. `ー` is a hyphen
+### 2. `ー` はハイフン
 
-cutlet repeats the vowel for `ー` (`rikabarii`). Here it stays what it was written as: `rikabari-`,
-`furasutore-shon`, `arigato-`. A long vowel written with kana (`ryokou`) is not touched, and neither is a
-loanword that becomes an English word.
+cutlet は `ー` で母音を繰り返します(`rikabarii`)。ここでは、書かれたとおりに残します。`rikabari-`、
+`furasutore-shon`、`arigato-` です。かなで書かれた長音(`ryokou`)には手を付けません。英単語になる外来語にも付けません。
 
 ### 3. `loanwords=english`
 
-The joined hiragana word is turned into katakana and looked up again: if UniDic has every word of it as
-a foreign word, the English spelling is used (`ふらすとれーしょん` → `フラストレーション` →
-`frustration`; `ふぁんたじー` → `fantasy`). Otherwise the romaji stays.
+つないだひらがなの語をカタカナにして、もう一度引きます。UniDic が、その語のすべてを外来語として持っていれば、
+英語の綴りを使います(`ふらすとれーしょん` → `フラストレーション` → `frustration`、`ふぁんたじー` → `fantasy`)。
+そうでなければ、ローマ字のままです。
 
-Turning *all* the hiragana of a text into katakana would make most loanwords English, but it breaks the
-ordinary Japanese: MeCab cuts a sentence by its hiragana particles and endings, so `寂しいうさちゃんは…`
-becomes one long word and `救われたい` leaves a kanji in the output. Only the part that is already
-known to be a loanword is converted.
+テキストの*すべての*ひらがなをカタカナにすれば、多くの外来語が英語になります。しかし普通の日本語が壊れます。
+MeCab は文を、ひらがなの助詞や語尾で切るため、`寂しいうさちゃんは…` は 1 つの長い語になり、`救われたい` は出力に漢字が残ります。
+そのため、すでに外来語とわかっている部分だけを変換します。
 
-### 4. Exceptions
+### 4. 例外
 
-UniDic's foreign spelling can be a different foreign word with the same sound: `ラーメン` is `Rahmen`
-(German, "frame"), `メイド` is `made`. `BUILT_IN_EXCEPTIONS` (and `[exceptions]` in `config.toml`)
-replaces such words. They are matched against a whole word as UniDic splits it.
+UniDic の外来語の綴りは、同じ音の別の外国語になることがあります。`ラーメン` は `Rahmen`(ドイツ語で「枠」)、
+`メイド` は `made` です。`BUILT_IN_EXCEPTIONS`(と `config.toml` の `[exceptions]`)が、こうした語を置き換えます。
+UniDic が切ったとおりの 1 語全体と照らし合わせます。
 
-The built-in exceptions also hold what the sites in the Latin alphabet write in a fixed way, found by comparing the
-romaji of the Japanese titles with the English titles of the same works: the magazines (`失楽天` is `shitsurakuten`,
-`ビースト` is `beast`, `山賊版` is `sanzokuban`, `オルガ` is `orga`), the tags (`DL版` is `digital`, `中国翻訳` is `chinese`),
-and common words (`エロ` is `ero`, `コスプレ` is `cosplay`, `えっち` is `ecchi`, `お姉さん` is `oneesan`, `お母さん` is `okaasan`).
+組み込みの例外には、ラテン文字のサイトが決まった形で書くものも入っています。日本語タイトルのローマ字と、同じ作品の
+英語タイトルを比べて見つけました。雑誌(`失楽天` は `shitsurakuten`、`ビースト` は `beast`、`山賊版` は `sanzokuban`、
+`オルガ` は `orga`)、タグ(`DL版` は `digital`、`中国翻訳` は `chinese`)、よくある語(`エロ` は `ero`、`コスプレ` は `cosplay`、
+`えっち` は `ecchi`、`お姉さん` は `oneesan`、`お母さん` は `okaasan`)です。
 
-A small tsu that UniDic takes for a symbol, before kana (`た～っぷり`), sticks to the next word and doubles its first letter
-(`ta~ppuri`).
+UniDic が記号と見なす小さい つ(かなの前の `た～っぷり`)は、次の語にくっつき、その語の最初の文字を重ねます
+(`ta~ppuri`)。
 
-An English word followed by a suffix gets a space (`maid san`); cutlet would write `maidsan`.
+英単語の後ろに接尾辞が付くときは、スペースを入れます(`maid san`)。cutlet は `maidsan` と書きます。
 
-### 5. The issue of a magazine
+### 5. 雑誌の号
 
-`2024年8月号` is written `2024-08` (year, a dash, the month in two digits), the way the sites that use the Latin
-alphabet write it (`COMIC Kairakuten 2024-08`). Only `<4 digits>年<month>月号` is changed; `8月号` and `2024年8月` are read
-as words. A search still finds it by the numbers: `2024 8` is a search for the runs of digits 2024 and 8.
+`2024年8月号` は `2024-08`(年、ダッシュ、2 桁の月)と書きます。ラテン文字を使うサイトの書き方
+(`COMIC Kairakuten 2024-08`)に合わせたものです。変えるのは `<4 桁>年<月>月号` だけで、`8月号` と `2024年8月` は
+単語として読みます。検索は数字でも見つけられます。`2024 8` は、数字の並び 2024 と 8 の検索です。
 
-### 6. A name in brackets written in kana is one word
+### 6. 括弧の中の、かなで書かれた名前は 1 語
 
-A circle or an artist in `[ ]`, `( )` or `【 】`, written in kana, is one word to the sites that use the Latin alphabet
-(`[Hitsujida (Kumadela)]`), but UniDic cuts it into the words it knows (`ひつじ / だ`, `くま / でら`). Inside such
-brackets, the pieces that are next to each other and are all hiragana (or all katakana) are joined, if together they
-are at most 8 kana: `[ひつじだ (くまでら)]` is `[hitsujida (kumadera)]`, `[むーにゃん]` is `[mu-nyan]`.
+`[ ]`、`( )`、`【 】` の中の、かなで書かれたサークルや作家は、ラテン文字のサイトでは 1 語です
+(`[Hitsujida (Kumadela)]`)。しかし UniDic は、知っている語に切ってしまいます(`ひつじ / だ`、`くま / でら`)。
+このような括弧の中では、隣り合っていて、すべてがひらがな(またはすべてがカタカナ)の断片を、合わせて 8 かな以下ならつなぎます。
+`[ひつじだ (くまでら)]` は `[hitsujida (kumadera)]`、`[むーにゃん]` は `[mu-nyan]` です。
 
-It is left alone when: the piece is a foreign word (`(ブルーアーカイブ)` is `blue archive`), the pieces are of two scripts
-(`ちぃず` `オレ`), the text is not in brackets (`ひつじだとくまでら`) or is in a quotation (`「 」`, which is a sentence), or it is longer
-than a name. The names of the magazines of the catalogue are in the exceptions instead (`失楽天` is `shitsurakuten`,
-`ビースト` is `beast`, `山賊版` is `sanzokuban`).
+次の場合は、そのままにします。断片が外来語のとき(`(ブルーアーカイブ)` は `blue archive`)、断片が 2 種類の文字のとき
+(`ちぃず` `オレ`)、括弧の中でないとき(`ひつじだとくまでら`)、引用(`「 」`。これは文です)の中のとき、
+名前にしては長いときです。カタログの雑誌の名前は、代わりに例外に入っています(`失楽天` は `shitsurakuten`、
+`ビースト` は `beast`、`山賊版` は `sanzokuban`)。
 
-Matching does not need the spaces (the title key has none), so this is about the output looking like the titles of
-the other sites; it measured 0.77 to 0.81 whole words of the romaji found as words of the English title.
+照合にスペースは要らない(タイトルのキーにスペースはない)ので、これは出力を他のサイトのタイトルに似せるためのものです。
+ローマ字の語のうち、英語タイトルの語として見つかった割合は、全体で 0.77 から 0.81 でした。
 
-### 7. The output
+### 7. 出力
 
-NFKC-normalized input, lowercase output, single spaces. A search does not care about the case, and cutlet
-capitalizes proper nouns.
+入力は NFKC に正規化し、出力は小文字にして、スペースは 1 つにします。検索は大文字と小文字を区別せず、cutlet は固有名詞を
+大文字にするためです。
 
-## How close it is to the Python version
+## Python 版とどれだけ近いか
 
-The 9,788 work and issue titles of the okazuri_bot catalogue were converted by both servers
-(`loanwords=romaji`): **91% are exactly the same**. Most of the rest are the dictionary:
+okazuri_bot のカタログにある作品と号のタイトル 9,788 件を、両方のサーバーで変換しました(`loanwords=romaji`)。
+**91% がまったく同じ**でした。残りの大部分は辞書の違いです。
 
-- UniDic 2.1.2 reads `話` after a number as `wa` (第1話 is `dai1wa`; the Python server says `dai1 hanashi`),
-  `日` as `nichi`, `新妻` as `niizuma`, `転生` as `tensei`: here it is the better reading.
-- It cuts a katakana name that is not in the dictionary into words that are (クリベロン into クリ + ベロン),
-  where UniDic 2.3.0 keeps it whole. Such a name goes in the exceptions (クリベロン is there).
-- A rare kanji or a name is read differently.
+- UniDic 2.1.2 は、数字の後ろの `話` を `wa` と読みます(第1話 は `dai1wa`。Python サーバーは `dai1 hanashi`)。
+  `日` は `nichi`、`新妻` は `niizuma`、`転生` は `tensei` と読みます。こちらのほうがよい読みです。
+- 辞書にないカタカナの名前を、辞書にある語に切ります(クリベロン を クリ + ベロン)。UniDic 2.3.0 は 1 語のままにします。
+  このような名前は例外に入れます(クリベロン は入っています)。
+- まれな漢字や名前は、読みが違います。
 
-`tests/fixtures/golden.tsv` has the cases the two agree on, and the examples this is made for.
+`tests/fixtures/golden.tsv` には、両者が一致するケースと、この変換が目的とする例が入っています。
 
-## Known limits
+## わかっている限界
 
-- A rare kanji in a name is read wrong (UniDic does not have the reading). `莉愛` is `lee ai`.
-- A word UniDic does not have, written in hiragana without a `ー` or a small kana, is cut at wrong places.
-- Only the words that UniDic lists as foreign get an English spelling, and it can be wrong (ラーメン, メイド,
-  ナン): see the exceptions.
-- A katakana name that UniDic 2.1.2 splits into dictionary words is read as those words.
-- UniDic 2.1.2 splits digits and Latin letters one by one (`73` is `7` `3`). The rules for ASCII words and
-  digits put them back together, using where the white space was in the text.
+- 名前の中のまれな漢字は、読みを間違えます(UniDic に読みがありません)。`莉愛` は `lee ai` です。
+- UniDic にない語が、`ー` や小さいかなを含まないひらがなで書かれていると、違う位置で切られます。
+- UniDic が外来語として載せている語だけが英語の綴りになりますが、間違うことがあります(ラーメン、メイド、ナン)。
+  例外を参照してください。
+- UniDic 2.1.2 が辞書の語に切ってしまうカタカナの名前は、その語として読まれます。
+- UniDic 2.1.2 は、数字とラテン文字を 1 つずつ切ります(`73` は `7` `3`)。ASCII の語と数字の規則が、テキストの中で
+  空白があった位置を使って、元に戻します。
