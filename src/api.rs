@@ -39,7 +39,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         router = router.route("/okazuri/search", get(search)).route("/hitomila/search", get(hitomila_search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
     }
 
-    router.with_state(state)
+    router.layer(axum::middleware::from_fn(cache_control)).with_state(state)
+}
+
+/// Says how long a cache (Cloudflare in front of this server, a browser) may keep an answer. Only a `200` is kept;
+/// a search that asks every site again (`live=on`) and the health check are never kept.
+async fn cache_control(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = request.uri().path().to_string();
+    // Read the query the way the handlers do (percent-decoded, case-insensitive), so `live=ON` or `live=%6Fn` is not kept either.
+    let forced = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(request.uri()).map_or(true, |query| query.0.iter().any(|(key, value)| key == "live" && Live::parse(value) == Some(Live::Force)));
+    let mut response = next.run(request).await;
+    let seconds = match path.as_str() {
+        "/okazuri/search" | "/hitomila/search" if !forced => 300,
+        "/hitomila/translate" | "/google/translate" | "/auto/translate" | "/romaji" => 86_400,
+        "/okazuri/sites" => 3_600,
+        _ => 0,
+    };
+    let value = if seconds > 0 && response.status() == StatusCode::OK { format!("public, max-age=60, s-maxage={seconds}") } else { "no-store".to_string() };
+    response.headers_mut().insert(header::CACHE_CONTROL, value.parse().expect("a valid header value"));
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +395,17 @@ mod tests {
         // the limit counts characters, not bytes
         let ok = "あ".repeat(300);
         assert_eq!(get_path(&format!("/romaji?q={}", encode(&ok))).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn only_an_answer_that_may_be_kept_has_a_max_age() {
+        let cache = |path: &'static str| async move {
+            let response = router(romanizer_state()).oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+            response.headers().get(header::CACHE_CONTROL).unwrap().to_str().unwrap().to_string()
+        };
+        assert_eq!(cache("/romaji?q=a").await, "public, max-age=60, s-maxage=86400");
+        assert_eq!(cache("/romaji?q=").await, "no-store", "an error is not kept");
+        assert_eq!(cache("/health").await, "no-store");
     }
 
     #[tokio::test]
