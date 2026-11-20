@@ -59,19 +59,21 @@ min_delay_ms = 1000
 # The most works kept from one site's list page, and the most in one answer (a request may use limit=).
 max_results_per_site = 50
 max_results = 100
-# Sites to leave out (the names of GET /okazuri/sites).
-disabled_sites = []
+# Sites to leave out (the names of GET /okazuri/sites). The demo server leaves out these three.
+disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 # A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The
-# other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`).
-skip_crawled = false
+# other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`); a site
+# that is not crawled yet is asked as before, so it does no harm to leave it on.
+skip_crawled = true
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
 try_unsupported = false
 # A copy of the magazine tables (magazines, numbers, authors and works) of the Worker's D1 database. The server asks D1 whether
 # the data changed (the Time Travel bookmark: no rows are read), and when it did, downloads the SQL that D1
 # exports for those tables and loads it into the second SQLite file. The whole database cannot be exported
 # because of its FTS5 table, so the tables are named. An export blocks the database for a moment.
+# This is on, as on the demo server: fill in account_id, database_id and the token, or turn it off (the server does not start without them).
 [magazine]
-enabled = false
+enabled = true
 account_id = ""
 database_id = ""
 # A Cloudflare API token that can edit D1. ${NAME} is the environment variable NAME: keep the token out of this file.
@@ -93,7 +95,7 @@ google_bridge_token = ""
 # ("COMIC快楽天 2026年07月号" is "COMIC快楽天 2026 07", searched in romaji), and is searched like a request, newest issue first. A
 # query that is searched already is skipped. Needs [search]; the copy comes from [magazine].
 [prefetch]
-enabled = false
+enabled = true
 # The wait between two queries.
 query_delay_ms = 2000
 # The most queries in one round (0: all). The next round goes on from there.
