@@ -16,8 +16,9 @@
 host = "127.0.0.1"
 port = 8000
 
-[convert]
-# The longest query, in characters (not bytes). A longer one is answered with 422.
+# The romaji conversion (GET /romaji, and the romaji of every search query and title). It has no switch: it is always on.
+[romaji]
+# The longest query of GET /romaji, in characters (not bytes). A longer one is answered with 422.
 max_query_chars = 300
 
 # Words that are written out instead of being read from the dictionary. The key is a word as
@@ -26,7 +27,7 @@ max_query_chars = 300
 #
 # Use it when the foreign spelling UniDic has for a katakana word is a different foreign word with
 # the same sound (ラーメン is "Rahmen", German for "frame").
-[exceptions]
+[romaji.exceptions]
 # "ナース" = "nurse"
 
 # The search engine: GET /okazuri/search?q=<words>. The query is asked to the search of every site of

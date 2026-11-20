@@ -117,7 +117,7 @@ GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fprodu
 
 | クエリ | |
 |---|---|
-| `q` | 文。必須で、1 文字から `[convert] max_query_chars` 文字まで(既定 300)。 |
+| `q` | 文。必須で、1 文字から `[romaji] max_query_chars` 文字まで(既定 300)。 |
 | `loanwords` | `romaji`(既定)か `english`。ひらがなで書かれた外来語の書き方です。 |
 
 ```

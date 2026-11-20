@@ -66,7 +66,7 @@ import <file>...                        Read the files that `export` wrote into 
 convert [text]...                      Print the romaji of the text. Without text, every line of the\n\
                                        standard input is converted and printed as a line\n\
     --loanwords <romaji|english>       How to write loanwords spelled in hiragana (default: romaji)\n\
-    --config <path>      Config file, for [exceptions]\n\
+    --config <path>      Config file, for [romaji]\n\
 --help, -h                             Show this help\n\n\
 GET /romaji?q=<text>[&loanwords=romaji|english]   the romaji as text/plain\n\
 GET /okazuri/search?q=<words>[&live=off|diff|force][&limit=n]\n\
@@ -314,7 +314,7 @@ async fn load(config: Option<PathBuf>) -> Result<Config> {
 fn load_romanizer(config: &Config) -> Result<Arc<Romanizer>> {
     log::info!("loading the dictionary");
 
-    Ok(Arc::new(Romanizer::new(&config.exceptions)?))
+    Ok(Arc::new(Romanizer::new(&config.romaji.exceptions)?))
 }
 
 /// The engine. It turns every query into romaji, so it needs the romaji conversion.
@@ -407,7 +407,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
 
     let state = Arc::new(AppState {
         romanizer: romanizer.clone(),
-        max_query_chars: config.convert.max_query_chars,
+        max_query_chars: config.romaji.max_query_chars,
         search: engine.clone(),
     });
 
@@ -470,7 +470,7 @@ fn on_off(on: bool) -> &'static str {
 
 async fn convert(texts: Vec<String>, loanwords: Loanwords, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let romanizer = Romanizer::new(&config.exceptions)?;
+    let romanizer = Romanizer::new(&config.romaji.exceptions)?;
 
     if texts.is_empty() {
         for line in std::io::stdin().lock().lines() {
@@ -495,7 +495,7 @@ async fn search(
     let mut config = load(config).await?;
     // the command is the wish to search (and the engine needs the romaji conversion)
     config.search.enabled = true;
-    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
 
     let limit = limit.unwrap_or(config.search.max_results);
     let outcome = engine.search(&Request { query: &text, live, limit, translator: crate::engine::Translator::None, exclude: &[] }).await?;
@@ -542,7 +542,7 @@ async fn reromanize(config: Option<PathBuf>) -> Result<()> {
     let mut config = load(config).await?;
     config.search.enabled = true;
 
-    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
     let done = engine.reromanize_works().await?;
 
     println!(
@@ -617,7 +617,7 @@ async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
         config.prefetch.max_queries_per_round = limit;
     }
 
-    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.exceptions)?)).await?;
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
     let prefetcher = Prefetcher::new(engine, config.d1.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled);
     let round = prefetcher.round().await?;
 

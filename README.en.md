@@ -50,12 +50,11 @@ The query is percent-encoded UTF-8. The endpoints are in [docs/API.md](docs/API.
 | Section | What | Default |
 |---|---|---|
 | `[server]` | `host` / `port`. `127.0.0.1` is reachable from this machine only; put a reverse proxy in front of it to expose it. | |
-| (none) | Romaji conversion: `/romaji`, and the romaji form of every search query and title. It cannot be switched off. | **always on** |
 | `[search]` | `/okazuri/search`, and the first SQLite file (`db_path`). | off |
 | `[d1]` | A copy of the magazine tables of the Worker's D1 database, stored in the second SQLite file (`mirror_path`). | off |
 | `[prefetch]` | Searches in advance for every issue in that copy. | off |
 | `[cron]` | HTTP requests the server sends on a schedule (`[[cron.jobs]]`). `${NAME}` in a value is an environment variable. | off |
-| `[convert]`, `[exceptions]` | The maximum `/romaji` query length; words to spell as specified instead of looking them up in the dictionary. | |
+| `[romaji]`, `[romaji.exceptions]` | The maximum `/romaji` query length; words to spell as specified instead of looking them up in the dictionary. The conversion itself cannot be switched off. | **always on** |
 
 There are two database files: `search.db` (the works listed by the sites) and `d1-mirror.db` (the copy of D1).
 Both are created if they do not exist, and both are accessed through [SeaORM](https://www.sea-ql.org/SeaORM/); the tables are

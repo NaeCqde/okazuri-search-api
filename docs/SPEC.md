@@ -31,7 +31,7 @@
 | パス | 機能 | 内容 |
 |---|---|---|
 | `GET /health` | 常にオン | 本文 `ok`(`text/plain; charset=utf-8`) |
-| `GET /romaji?q=&loanwords=` | 常にオン | 日本語をローマ字にして返す。`q` は 1〜`[convert] max_query_chars`(300)文字。`loanwords` は `romaji`(既定)か `english` |
+| `GET /romaji?q=&loanwords=` | 常にオン | 日本語をローマ字にして返す。`q` は 1〜`[romaji] max_query_chars`(300)文字。`loanwords` は `romaji`(既定)か `english` |
 | `GET /okazuri/search?q=&live=&limit=` | `[search]`(既定オフ) | 各サイトの検索で作品(タイトルと作品ページの path)を集めて保存し、ローマ字にしたクエリの語をすべて含むタイトルの作品を返す |
 | `GET /okazuri/sites` | `[search]` | 対象サイトの一覧と、それぞれが今検索されるか |
 
@@ -53,7 +53,7 @@ okazuri-search-api convert "文"...       ローマ字を表示。文がなけ�
 
 ## 設定(`config.toml`、カレントディレクトリ)
 
-`[server]`(`host` 既定 `127.0.0.1`、`port` 既定 8000)、`[search]`(`enabled`、`db_path`、`ttl_hours` 720、`max_query_chars` 300、`timeout_secs`、`min_delay_ms`、`max_results_per_site`、`max_results` 100、`disabled_sites`、`try_unsupported`)、`[d1]`(Cloudflare の D1 の写し。`api_token` は環境変数 `CLOUDFLARE_API_TOKEN`)、`[prefetch]`、`[cron]`(`[[cron.jobs]]`、値の `${NAME}` は環境変数)、`[convert]`、`[exceptions]`。
+`[server]`(`host` 既定 `127.0.0.1`、`port` 既定 8000)、`[search]`(`enabled`、`db_path`、`ttl_hours` 720、`max_query_chars` 300、`timeout_secs`、`min_delay_ms`、`max_results_per_site`、`max_results` 100、`disabled_sites`、`try_unsupported`)、`[d1]`(Cloudflare の D1 の写し。`api_token` は環境変数 `CLOUDFLARE_API_TOKEN`)、`[prefetch]`、`[cron]`(`[[cron.jobs]]`、値の `${NAME}` は環境変数)、`[romaji]`(`max_query_chars`、`[romaji.exceptions]`)。
 
 ## データ
 

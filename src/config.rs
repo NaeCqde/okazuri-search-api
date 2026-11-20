@@ -12,15 +12,13 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
-    pub convert: ConvertConfig,
+    pub romaji: RomajiConfig,
     pub search: SearchConfig,
     pub d1: D1Config,
     pub prefetch: PrefetchConfig,
     pub crawl: CrawlConfig,
     pub verify: VerifyConfig,
     pub cron: CronConfig,
-    /// Word (as UniDic splits it) to the romaji it is replaced by.
-    pub exceptions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,14 +37,16 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct ConvertConfig {
-    /// The longest query, in characters.
+pub struct RomajiConfig {
+    /// The longest query of `/romaji`, in characters.
     pub max_query_chars: usize,
+    /// Word (as UniDic splits it) to the romaji it is replaced by.
+    pub exceptions: BTreeMap<String, String>,
 }
 
-impl Default for ConvertConfig {
+impl Default for RomajiConfig {
     fn default() -> Self {
-        Self { max_query_chars: 300 }
+        Self { max_query_chars: 300, exceptions: BTreeMap::new() }
     }
 }
 
@@ -311,8 +311,8 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8000);
-        assert_eq!(config.convert.max_query_chars, 300);
-        assert!(config.exceptions.is_empty());
+        assert_eq!(config.romaji.max_query_chars, 300);
+        assert!(config.romaji.exceptions.is_empty());
         // the cron is off until it is asked for
         assert!(!config.cron.enabled);
         assert!(config.cron.jobs.is_empty());
@@ -320,14 +320,6 @@ mod tests {
         assert!(!config.search.enabled && !config.d1.enabled && !config.prefetch.enabled);
         assert_eq!(config.d1.tables, ["magazines", "numbers"]);
         assert_ne!(config.search.db_path, config.d1.mirror_path, "two database files");
-    }
-
-    #[test]
-    fn the_romaji_conversion_has_no_switch_and_an_old_section_is_ignored() {
-        // [romaji] (and the older [pronounce]) can no longer turn it off: they are not keys of the config
-        let config: Config = toml::from_str("[romaji]\nenabled = false\n[pronounce]\nenabled = false\n[server]\nport = 9000\n").unwrap();
-
-        assert_eq!(config.server.port, 9000);
     }
 
     #[test]
@@ -373,12 +365,12 @@ url = \"http://x\"
     #[test]
     fn reads_what_is_given_and_defaults_the_rest() {
         let config: Config = toml::from_str(
-            "[server]\nport = 9000\n\n[exceptions]\n\"ナース\" = \"nurse\"\n",
+            "[server]\nport = 9000\n\n[romaji.exceptions]\n\"ナース\" = \"nurse\"\n",
         )
         .unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9000);
-        assert_eq!(config.exceptions.get("ナース").map(String::as_str), Some("nurse"));
+        assert_eq!(config.romaji.exceptions.get("ナース").map(String::as_str), Some("nurse"));
     }
 
     #[tokio::test]
