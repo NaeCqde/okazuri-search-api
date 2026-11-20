@@ -1,7 +1,7 @@
 # okazuri-search-api config template.
 #
 # What the server does is switched here. The Japanese to romaji conversion (GET /romaji, and the romaji of every
-# search query and title) has no switch: it is always on. [search], [magazine], [prefetch] and [cron] are off until they
+# search query and title) has no switch: it is always on. [search], [magazine], [magazine.prefetch] and [cron] are off until they
 # are asked for with enabled = true.
 #
 # Copy this to config.toml (gitignored) and change what you need. Every key is optional: the
@@ -93,7 +93,7 @@ google_bridge_token = ""
 # Searching ahead of time: the name of every issue in the copy becomes a query the way the bot makes it
 # ("COMIC快楽天 2026年07月号" is "COMIC快楽天 2026 07", searched in romaji), and is searched like a request, newest issue first. A
 # query that is searched already is skipped. Needs [search]; the copy comes from [magazine].
-[prefetch]
+[magazine.prefetch]
 enabled = false
 # The wait between two queries.
 query_delay_ms = 2000
