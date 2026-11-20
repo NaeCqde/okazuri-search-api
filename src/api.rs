@@ -46,7 +46,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// a search that asks every site again (`live=on`) and the health check are never kept.
 async fn cache_control(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let path = request.uri().path().to_string();
-    let forced = request.uri().query().is_some_and(|query| query.split('&').any(|pair| matches!(pair.strip_prefix("live="), Some("on" | "1" | "true" | "yes" | "force"))));
+    // Read the query the way the handlers do (percent-decoded, case-insensitive), so `live=ON` or `live=%6Fn` is not kept either.
+    let forced = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(request.uri()).map_or(true, |query| query.0.iter().any(|(key, value)| key == "live" && Live::parse(value) == Some(Live::Force)));
     let mut response = next.run(request).await;
     let seconds = match path.as_str() {
         "/okazuri/search" | "/hitomila/search" if !forced => 300,
