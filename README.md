@@ -50,12 +50,12 @@ curl "http://127.0.0.1:8000/romaji?q=%E3%83%81%E3%83%BC%E3%83%88"        # cheat
 | セクション | 内容 | 既定 |
 |---|---|---|
 | `[server]` | `host` / `port`。既定の `127.0.0.1` はこのマシンからしか届きません。外部に公開するときは、前にリバースプロキシを置いてください。 | |
-| (なし) | ローマ字変換: `/romaji` と、検索のクエリ・タイトルのローマ字化。切り替えはできません。 | **常にオン** |
 | `[search]` | `/okazuri/search` と、1 つ目の SQLite ファイル(`db_path`)。 | オフ |
-| `[d1]` | Worker の D1 データベースにある雑誌のテーブルの写し。2 つ目の SQLite ファイル(`mirror_path`)に保存します。 | オフ |
+| `[translation]` | 翻訳の出どころの設定(Google 翻訳のブリッジ `google_bridge_url`、`google_bridge_token`)。 | |
+| `[magazine]` | Worker の D1 データベースにある雑誌のテーブルの写し。2 つ目の SQLite ファイル(`mirror_path`)に保存します。 | オフ |
 | `[prefetch]` | 写しにあるすべての号を、あらかじめ検索します。 | オフ |
 | `[cron]` | 決めた時刻にサーバーが送る HTTP リクエスト(`[[cron.jobs]]`)。値の中の `${NAME}` は環境変数です。 | オフ |
-| `[convert]`、`[exceptions]` | `/romaji` のクエリの最大長。辞書を引かず、指定した綴りで書く語。 | |
+| `[romaji]`、`[romaji.exceptions]` | `/romaji` のクエリの最大長。辞書を引かず、指定した綴りで書く語。変換そのものは切り替えられません。 | **常にオン** |
 
 データベースのファイルは 2 つあります。`search.db`(サイトの一覧に載っていた作品)と `d1-mirror.db`(D1 の写し)です。
 どちらも [SeaORM](https://www.sea-ql.org/SeaORM/) で読み書きし(テーブルは `src/entity/` のエンティティです)、ファイルがなければ自動で作られます。
@@ -67,8 +67,8 @@ push のたびに、実行ファイルがアーカイブにされず、そのま
 | 実行ファイル                                            |                                                                                              |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `okazuri-search-api-Linux-x86_64-musl`                  | **静的リンク**で glibc に依存せず、どの Linux x86_64 サーバー(VPS、コンテナ)でも動きます |
-| `okazuri-search-api-Linux-x86_64`、`-Linux-aarch64`     | glibc 版                                                                                     |
-| `okazuri-search-api-Windows-x86_64`、`-Windows-aarch64` |                                                                                              |
+| `okazuri-search-api-Linux-aarch64-musl`                 | 同じく静的リンクの Linux aarch64 版(ARM のサーバー、Raspberry Pi など)                       |
+| `okazuri-search-api-Windows-x86_64`                     |                                                                                              |
 | `okazuri-search-api-macOS-aarch64`                      |                                                                                              |
 
 実行ファイルは約 190 MB あります(UniDic と SQLite を埋め込んでいるためです)。サーバーでの動かし方は

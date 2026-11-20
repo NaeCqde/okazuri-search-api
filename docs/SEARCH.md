@@ -60,7 +60,7 @@
 | `q` | 検索語。必須で、最大 `[search] max_query_chars` 文字。 |
 | `live=off` | どのサイトにも尋ねません。データベースが持っているものが古くても、それだけで答えます。 |
 | `live=diff`(既定) | 答えがない、または `ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかはデータベースが答えます(`cached`)。 |
-| `live=force` | キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。`on`(以前の名前)、`1`、`true`、`yes` も同じ意味です。 |
+| `live=force` | キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます) |
 | `limit=n` | 応答に入れる作品の最大数(最大 `[search] max_results`)。 |
 | `exclude=A,B` | 除外するサイト(`GET /okazuri/sites` に出る名前。大文字小文字は区別せず、カンマで区切ります)。そのサイトには尋ねず、保存済みの作品も応答に入れず、`sites` にも出ません。サイトにない名前は 422 です。翻訳には影響しません(出どころは `translator` が決めます)。 |
 | `translator=auto`(既定) | 日本語を含むクエリは、英語でも検索します。英語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、Hitomi.La が失敗するか何も返さないときは Google 翻訳(`/google/translate`)から取ります。両方の検索の作品が `results` に入り、`translation` がそのタイトルを示します(`{"text", "source"}`)。 |
@@ -69,7 +69,7 @@
 | `translator=none` | 英語の検索をしません。 |
 
 **日本語を含まない**クエリ(英語やローマ字)も、逆向きに、同じ方法で日本語でも検索します。日本語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、
-Hitomi.La が失敗するか何も返さないときは Google 翻訳から取ります。両方の検索の作品が `results` に入り、`translationJa` がそのタイトルを示します
+Hitomi.La が失敗するか何も返さないときは Google 翻訳から取ります。両方の検索の作品が `results` に入り、`translation_ja` がそのタイトルを示します
 (`{"text", "source"}`。ないとき、およびクエリに日本語がある、または文字がないときは `null`)。出どころは `translator` と `live` が
 同じように決めます。
 
@@ -84,24 +84,24 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
   "terms": ["comic快楽天", "2026", "11"],
   "total": 28,
   "results": [
-    { "website": "FANZA", "isLegal": true, "path": "/product/25199/b915awnmg04607/",
+    { "website": "FANZA", "is_legal": true, "path": "/product/25199/b915awnmg04607/",
       "url": "https://book.dmm.co.jp/product/25199/b915awnmg04607/", "title": "COMIC快楽天 2026年11月号",
-      "titleRomaji": "comic kairakuten 2026 nen 11 gatsu gou" }
+      "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou" }
   ],
   "sites": [
-    { "website": "FANZA", "status": "searched", "count": 23, "error": null, "searchedAt": 1793181281 }
+    { "website": "FANZA", "status": "searched", "count": 23, "error": null, "searched_at": 1793181281 }
   ]
 }
 ```
 
-`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=0`)、`unavailable`(Hitomi.La の一覧が全件保存される
+`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
 までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
 失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数で、`results` はそれより短いことがあります。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
 スラッシュ付きで保存したページを、サイトが後からスラッシュなしで挙げたときは、スラッシュなしの path に**名前が変わります**(同じ行なので `first_seen` は残り、
 そのページを指す一覧も追従します)。両方の形が同時に挙がったページは、スラッシュなしで保存します(そう書くサイトに、スラッシュは要りません)。
 スラッシュなしで保存したページはそのままです。スラッシュ付きでしか挙がらないページは、スラッシュ付きのままです。同じアドレスの作品(末尾の `/` や `#` 以降の
-有無、大文字小文字だけが違うもの)は 1 つの作品で、最初に保存したものが残り、どれかが新しければ `isNew` になります。
+有無、大文字小文字だけが違うもの)は 1 つの作品で、最初に保存したものが残り、どれかが新しければ `is_new` になります。
 
 ## サイト
 
@@ -177,7 +177,7 @@ Google 翻訳には、その Web ページと同じ方法で尋ねます(`transl
 それがあれば答えは `The Phaethon Assault`(`[[3],[[6,3]]]`)で、なければ `Assault on Phaeton`(`[[0],[[6,1]]]`)です。トークンは 1 つの文のために作られ(同じ文なら、
 別の `_reqid` でも受け付けられます)、Cookie ではなく、ページの `User-Agent` と `Referer` で検査されます。Google のスクリプトを動かさないと作れないので、
 `tools/google-translate-bridge`(ウィンドウのない Chrome。`node server.mjs`。その README を見てください)が作ります。`GET /token` が文を付けてページを開き、
-ページ自身のリクエストを止めて渡し、このプログラムがそれを送ります(`reqwest`、gzip)。`[search] google_bridge_url`(と `google_bridge_token`)がそのアドレスで、
+ページ自身のリクエストを止めて渡し、このプログラムがそれを送ります(`reqwest`、gzip)。`[translation] google_bridge_url`(と `google_bridge_token`)がそのアドレスで、
 設定されているのに止まっているときは、Google 翻訳は失敗します(クラシックな答えへのフォールバックはありません。それは永久に保存されてしまうからです)。
 ブリッジを使ってテストを動かすには、`OKAZURI_GOOGLE_BRIDGE=http://127.0.0.1:8130 cargo test -- --ignored` です。
 
@@ -236,9 +236,9 @@ Hitomi.La の保存済みの行と Google の保存済みの行は別です(`tra
 | ファイル | 設定 | 内容 |
 |---|---|---|
 | `search.db` | `[search] db_path` | `works`(サイト、path、サイトが書いた**タイトル**、そのローマ字の **title_romaji**、検索を絞る title_key(ローマ字を整えたもの)、最初に保存した日時と最後に変わった日時)、`works_fts`(title_key に対する、trigram トークナイザーの FTS5 インデックス。キーに 3 文字以上の断片を含む作品を、すべての行を読まずに見つけます。`works` テーブルがその内容で、トリガーが最新に保ちます。起動時に、テーブルより作品が少なければ作り直します)、`searches`(どのクエリをどのサイトにいつ尋ねたか、成功したか) |
-| `d1-mirror.db` | `[d1] mirror_path` | Worker の D1 データベースの `magazines` と `numbers` のテーブルと、それを写したデータのブックマーク |
+| `d1-mirror.db` | `[magazine] mirror_path` | Worker の D1 データベースの `magazines` と `numbers` のテーブルと、それを写したデータのブックマーク |
 
-## D1 の写し(`[d1]`)
+## D1 の写し(`[magazine]`)
 
 D1 は、Cloudflare API で、データベースを SQL ファイルとしてエクスポートできます。`output_format: "polling"` で `POST .../d1/database/{id}/export` を呼び、
 `complete` になるまでポーリングして、返ってきた署名付き URL から SQL をダウンロードします。Worker のデータベースには、D1 がエクスポートを拒否する仮想テーブル
@@ -276,7 +276,7 @@ Hitomi.La に尋ね(`/hitomila/translate` と同じ。永久に保存。Google �
 
 `language.rs` が、タイトルから言語を読みます。サイトがタイトルの先頭に付ける国旗、翻訳の印(`[中国翻訳]`、`[汉化]`)、言語だけを表す括弧(`[EN]`、`[English]`、`[CN,EN,JP,KR]`)です。
 答えは、タイトルが示した順に `,` でつないだ 2 文字のコードです(`zh`、`en,ja`、`zh,en,ja,ko`)。タイトルに言語がなければ NULL です(ほとんどのタイトルは日本語で、そうは書きません)。
-検索は、これをコードのリストを同じ順にした `language` として返します(`["zh", "en"]`。ないときは `[]`)。この機能より前のデータベースは、開くときに列が追加され、タイトルが読まれます。
+検索は、これをコードのリストを同じ順にした `language` として返します(`["zh", "en"]`。ないときは `[]`)。
 `export` のファイルにはこの列がありません。`import` が作ります(ローマ字とキーを作るのと同じです)。規則が変わったときは、`okazuri-search-api relanguage` がすべてのタイトルを
 読み直し、結果が変わった作品を書き込みます(`reromanize` も、ローマ字が変わった作品には書き込みます)。タイトルのどこかにある国旗(🇯🇵、🇨🇳 など)はその言語を示し、
 **タイトルから取り除かれます**(ローマ字とキーからも)。新しい作品は、国旗なしで保存され、それ以前に保存した作品には `relanguage` が同じことをします。国旗がなくなった後は、
@@ -311,4 +311,4 @@ E-Hentai(ステータス 200 で短い文を返し、数秒に 1 ページより
 ## やっていないこと
 
 - Cloudflare のチャレンジの向こうのサイトと Anime-Sharing は、検索しません。これは普通の HTTP リクエストで、ブラウザではないからです。
-- `[d1]` の呼び出しは、wrangler が使う API を見て書き、そのモックに対してテストしました。トークンを付けて `okazuri-search-api sync` を 1 回実行して、実際の動作を確かめてください。
+- `[magazine]` の呼び出しは、wrangler が使う API を見て書き、そのモックに対してテストしました。トークンを付けて `okazuri-search-api sync` を 1 回実行して、実際の動作を確かめてください。

@@ -35,8 +35,8 @@ struct Line {
     title: String,
     first_seen: i64,
     updated_at: i64,
-    /// The language (the flags are taken out of the titles, so it is sent along; a file of an older version has none).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The language (the flags are taken out of the titles, so it is sent along).
+    #[serde(skip_serializing_if = "Option::is_none")]
     language: Option<String>,
 }
 

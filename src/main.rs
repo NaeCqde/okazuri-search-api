@@ -18,6 +18,7 @@ mod sites;
 mod store;
 #[cfg(test)]
 mod testing;
+mod titles;
 mod tokenizer;
 mod transfer;
 mod utils;

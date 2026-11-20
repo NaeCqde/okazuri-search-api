@@ -17,7 +17,7 @@
 | クエリ | |
 |---|---|
 | `q` | 検索語。必須で、1 文字から `[search] max_query_chars` 文字まで(既定 300)。空白で語を区切ります。最初に必ずローマ字にされます。 |
-| `live` | `off`: どのサイトにも尋ねず、データベースだけで答えます(古くてもそのまま)。`diff`(既定): 答えがない、または `[search] ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかは `cached` になります。`force`: キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。どの場合も、新しい作品を保存し、保存済みの作品とあわせてデータベースから答えます。`0`/`false`/`no` は `off`、`1`/`true`/`yes`/`on` は `force` です。 |
+| `live` | `off`: どのサイトにも尋ねず、データベースだけで答えます(古くてもそのまま)。`diff`(既定): 答えがない、または `[search] ttl_hours`(1 か月)より古い、クエリとサイトの組み合わせだけに尋ねます。ほかは `cached` になります。`force`: キャッシュの有無に関係なくすべてのサイトに尋ねます(`searched`。以前の失敗も改めて尋ねます)。どの場合も、新しい作品を保存し、保存済みの作品とあわせてデータベースから答えます |
 | `limit` | 応答に入れる作品の最大数。1 から `[search] max_results` まで(既定 100)。 |
 
 ```
@@ -30,16 +30,16 @@ GET /okazuri/search?q=快楽天 2026 7
   "results": [
     {
       "website": "DLsite",
-      "isLegal": true,
+      "is_legal": true,
       "path": "/books/work/=/product_id/BJ03044883.html",
       "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html",
       "title": "COMIC快楽天 2026年11月号",
-      "titleRomaji": "comic kairakuten 2026 nen 11 gatsu gou",
-      "isNew": true
+      "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou",
+      "is_new": true
     }
   ],
   "sites": [
-    { "website": "DLsite", "status": "searched", "count": 30, "error": null, "searchedAt": 1793181281 }
+    { "website": "DLsite", "status": "searched", "count": 30, "error": null, "searched_at": 1793181281 }
   ]
 }
 ```
@@ -47,14 +47,14 @@ GET /okazuri/search?q=快楽天 2026 7
 - `title` は、サイトの一覧に載っている作品のタイトルで、サイトが書いたままです。`path` は作品ページのパス(作品を指す
   クエリ文字列のパラメータを含みます)で、`url` はそれにサイトのドメインを付けたものです。
 - `input` は送られた `q`(整えたもの)で、`query` はその**ローマ字**です。サイトに尋ねた文字列で、タイトルとの照合にも使います。
-  日本語を含まない `q` は、それ自体がローマ字です。`titleRomaji` は `title` のローマ字です。
-- `titleEnglish` は結果の英語のタイトルで、`titleEnglishSource` はその出どころです(`"official"` か `"google"`。英語のタイトルがなければ
-  どちらも `null`)。タイトルが英語ならそのタイトル、両方を併記したタイトル(`English | 日本語`)ならその英語側、そうでなければ保存済みの翻訳です。
+  日本語を含まない `q` は、それ自体がローマ字です。`title_romaji` は `title` のローマ字です。
+- `title_english` は結果の英語のタイトルで、`{"text": "…", "source": "official" か "google"}` の形です(英語のタイトルがなければ
+  `null`)。タイトルが英語ならそのタイトル、両方を併記したタイトル(`English | 日本語`)ならその英語側、そうでなければ保存済みの翻訳です。
   Hitomi.La の翻訳は作品自身のタイトルなので `official`、Google の翻訳は機械翻訳なので `google` です。このために新しくサイトへ尋ねることはありません。
-- `translation` は、日本語を含むクエリの英語のタイトルで、`translationJa` は、日本語を含まないクエリの日本語のタイトルです
+- `translation` は、日本語を含むクエリの英語のタイトルで、`translation_ja` は、日本語を含まないクエリの日本語のタイトルです
   (`{"text", "source"}` または `null`)。そのタイトルを持つ作品も `results` に入ります([SEARCH.md](SEARCH.md))。
 - `total` は、すべての語を含む保存済みの作品の数で、`results` は `limit` で切られます。
-- `isNew` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
+- `is_new` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
   再び見つかった作品は新しくなく、行もそのままです(タイトルが変わったときだけ書き直します)。
 - `sites` は、各サイトの結果を表します。`searched`(いま尋ねた)、`cached`(`live=diff` で、`ttl_hours` 以内に尋ねたので
   データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
@@ -65,24 +65,57 @@ GET /okazuri/search?q=快楽天 2026 7
 - 作品はサイトの順に並び、サイトの中では、最後に保存したものが先に来ます。
 - `q` がない、または長すぎるとき、および `live` が `off`、`diff`、`force`(または上の別名)でないときは `422` です。
 
+## `GET /okazuri/title`(`[search]`)
+
+作品ページのアドレスから、タイトルを取り出します。BOT の「これらを検索」が使っているのと同じ用途です。まず**保存済みの作品**(`search.db`)から答え、
+保存されていない作品だけ、ページを取得してタイトルを読みます。アドレスを `okazuri_bot/src/websites.ts` のパターンに照らして対応するサイトを決め、
+次のように作品を探します。
+
+- アドレスを整えます。`#` 以降、`locale` のパラメータ、作品を指さないクエリ文字列(`utm_source` など)を捨て、`/view/1/2` のような閲覧用のアドレスは作品のページに直します。
+- 残った path を、末尾の `/` の有無の両方で、保存済みの作品から探します。余計なものが付いたアドレスでも、同じ作品に当たります。
+- 見つからなければ、そのページ(Hitomi.La は作品の情報ファイル)を取得し、サイトごとの規則でタイトルを読みます(`<h1>`、`og:title` など。サイトによっては作者名をタイトルの後ろに付けます)。
+  Hitomi.La は、保存済みの `English | 日本語` のうち日本語側を返します。
+
+| クエリ | |
+|---|---|
+| `url` | 作品ページのアドレス。必須で、1 回から 10 回まで繰り返せます(パーセントエンコードしてください)。 |
+| `live` | `off`: 保存済みの作品だけで答えます(ページは取得しません)。`diff`(既定): 保存済みの作品、なければページ。`force`: 保存済みの作品を見ず、いつもページを取得します。 |
+
+```
+GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fproduct_id%2FBJ03044883.html%3Futm_source%3Dx&url=https%3A%2F%2Fexample.com%2Fx
+{ "total": 2, "results": [
+    { "url": "https://www.dlsite.com/books/work/=/product_id/BJ03044883.html?utm_source=x", "website": "DLsite", "title": "COMIC快楽天 2026年11月号",
+      "title_japanese": "COMIC快楽天 2026年11月号", "title_romaji": "comic kairakuten 2026 nen 11 gatsu gou", "title_english": null,
+      "source": "database", "error": null },
+    { "url": "https://example.com/x", "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "source": null, "error": "unsupported website" } ] }
+```
+
+結果は、渡した `url` と同じ順です。`title_japanese` は日本語のタイトル(タイトルが日本語ならそれ自身、`English | 日本語` なら日本語側。なければ `null`)、
+`title_romaji` はタイトルのローマ字、`title_english` は、検索結果と同じ規則の英語のタイトルとその出どころ(`{text, source}`)です(保存済みのものだけで、このために
+どこにも尋ねません)。`source` は `database`(保存済みの作品)か `page`(ページを取得)です。タイトルが取れなかったアドレスは `title` が `null` で、`error` に理由が入ります
+(`unsupported website`、`the work is not saved`(`live=off`)、`blocked by a Cloudflare challenge`、`HTTP 404`、`the page has no title` など)。
+一部が失敗しても、リクエストは `200` です。`url` がない、11 個以上、`live` が不正なときは `422` です。ページの取得は、検索と同じ `min_delay_ms` を守ります。
+
+保存済みのタイトルは、サイトの一覧に載っていたとおりの文字列なので、ページの `<h1>` と少し違うことがあります。
+
 ## `GET /okazuri/sites`(`[search]`)
 
 `okazuri_bot/src/websites.ts` のサイトと、それぞれを検索するかどうかを返します。
 
 ```
-[ { "name": "DLsite", "isLegal": true, "support": "ready", "hasSearch": true, "japanese": true, "active": true, "note": "" },
-  { "name": "IMHentai", "isLegal": false, "support": "cloudflare", "hasSearch": true, "japanese": true, "active": false, "note": "" }, ... ]
+[ { "name": "DLsite", "is_legal": true, "support": "ready", "has_search": true, "japanese": true, "active": true, "note": "" },
+  { "name": "IMHentai", "is_legal": false, "support": "cloudflare", "has_search": true, "japanese": true, "active": false, "note": "" }, ... ]
 ```
 
 `support` は `ready`、`cloudflare`(ブラウザが要るチャレンジ)、`javascript`、`closed` のどれかです。`japanese` は、そのサイトが
 日本語のタイトルで作品を見つけられるかどうかで、`true` なら、日本語を含むクエリを、書かれたとおりの形とローマ字の両方で尋ねます。
 `active` は、現在の `[search]` の設定(`disabled_sites`、`try_unsupported`)で、このサーバーがそのサイトを検索するかどうかです。
 
-## カタログの検索(`[d1]`)
+## カタログの検索(`[magazine]`)
 
-D1 データベースの写し(`[d1] mirror_path`)から答えます。サイトには尋ねません。写しがない(`[d1]` がオフで、ファイルもない)ときは、
+D1 データベースの写し(`[magazine] mirror_path`)から答えます。サイトには尋ねません。写しがない(`[magazine]` がオフで、ファイルもない)ときは、
 これらのパスは `404` です。写しはあるが `works` と `authors` がまだ入っていないときは `503` で、`okazuri-search-api sync` を実行するか、
-次の自動同期を待ってください(`[d1] tables` に `authors` と `works` を含めておく必要があります)。作品と号の URL は DLsite のページです。
+次の自動同期を待ってください(`[magazine] tables` に `authors` と `works` を含めておく必要があります)。作品と号の URL は DLsite のページです。
 
 ### `GET /okazuri/magazine`: 作品名から雑誌を探す
 
@@ -90,7 +123,7 @@ D1 データベースの写し(`[d1] mirror_path`)から答えます。サイト
 
 | クエリ | |
 |---|---|
-| `q` | 作品名。必須で、1 文字から `[convert] max_query_chars` 文字まで。 |
+| `q` | 作品名。必須で、1 文字から `[romaji] max_query_chars` 文字まで。 |
 | `limit` | 最大件数。1 から 50 まで(既定 10)。 |
 
 ```
@@ -135,7 +168,7 @@ GET /okazuri/magazines
 
 | クエリ | |
 |---|---|
-| `q` | 文。必須で、1 文字から `[convert] max_query_chars` 文字まで(既定 300)。 |
+| `q` | 文。必須で、1 文字から `[romaji] max_query_chars` 文字まで(既定 300)。 |
 | `loanwords` | `romaji`(既定)か `english`。ひらがなで書かれた外来語の書き方です。 |
 
 ```

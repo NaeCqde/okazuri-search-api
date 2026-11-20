@@ -476,6 +476,11 @@ impl Site {
         format!("{}{}", self.def.origin, path)
     }
 
+    /// Whether the address is the page of a work of this site (the pattern of `websites.ts`).
+    pub fn matches(&self, url: &str) -> bool {
+        self.pattern.is_match(url)
+    }
+
     pub fn clean(&self, url: &str) -> String {
         let without_fragment = url.split('#').next().unwrap_or(url);
 

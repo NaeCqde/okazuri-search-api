@@ -39,7 +39,6 @@ const USER_AGENT: &str =
 
 /// A work found: the site, the title as the site writes it, and its page.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct Hit {
     pub website: String,
     pub is_legal: bool,
@@ -53,15 +52,28 @@ pub struct Hit {
     pub title_romaji: String,
     /// The English title: the title itself when it is English, the English side of a title that has both (`English | 日本語`), or a
     /// saved translation (Hitomi.La's, else Google's); None when there is none. It is never asked for: only what is saved.
-    pub title_english: Option<String>,
-    /// Where `title_english` comes from: `official` (the title, or Hitomi.La's, which is the work's own title) or `google` (a machine
-    /// translation); None with it.
-    pub title_english_source: Option<String>,
+    /// `source` is `official` (the title, or Hitomi.La's, which is the work's own title) or `google` (a machine translation).
+    pub title_english: Option<Translated>,
     /// The languages the title names (`language.rs`), as two-letter codes in the order it names them (`["zh", "en"]`); `[]` when it
     /// names none.
     pub language: Vec<String>,
     /// This request found the work on a site and saved it: it was not in the database before.
     pub is_new: bool,
+}
+
+/// The title of a work from the address of its page (`Engine::title_of`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleInfo {
+    pub website: &'static str,
+    /// The title the way the bot reads it (a saved work: as the site lists it).
+    pub title: String,
+    /// `database` (a saved work) or `page` (the page was asked for).
+    pub source: &'static str,
+    /// The Japanese title: the title itself, or the Japanese side of a title that has both (`English | 日本語`); None when it has none.
+    pub title_japanese: Option<String>,
+    pub title_romaji: String,
+    /// As in a search result: `{text, source}`.
+    pub title_english: Option<Translated>,
 }
 
 /// A query as the sites are asked it: with `×` written as `x`, and for the sites that need it (`keep_times`) with the `×`
@@ -132,7 +144,6 @@ impl Lang {
 
 /// A translation of a text: the title of a work of Hitomi.La in English and in Japanese (`translate`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct Translation {
     pub id: u32,
     pub url: String,
@@ -199,7 +210,6 @@ pub struct Fetched {
 
 /// What came of the search on one site.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct SiteReport {
     pub website: String,
     /// `searched` (asked now), `cached` (asked less than `ttl_hours` ago, so the database answers), `failed` (a query
@@ -215,7 +225,6 @@ pub struct SiteReport {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct Outcome {
     /// The query as it was sent (tidied up).
     pub input: String,
@@ -262,11 +271,11 @@ impl Translator {
     }
 }
 
-/// The English title that was searched too (`Outcome::translation`).
+/// An English (or Japanese) title with where it is from: the title that was searched too (`Outcome::translation`: `hitomi` or
+/// `google`), or the English title of a result (`Hit::title_english`: `official` or `google`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Translated {
     pub text: String,
-    /// `hitomi` or `google`.
     pub source: String,
 }
 
@@ -283,12 +292,12 @@ pub enum Live {
 }
 
 impl Live {
-    /// `off`, `diff` and `force`; `0`, `false`, `no` are off, `on`, `1`, `true`, `yes` are force (`on` is the old name). `None` for anything else.
+    /// `off`, `diff` (or nothing) and `force`. `None` for anything else.
     pub fn parse(text: &str) -> Option<Live> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "off" | "0" | "false" | "no" => Some(Live::Off),
+            "off" => Some(Live::Off),
             "diff" | "" => Some(Live::Diff),
-            "force" | "on" | "1" | "true" | "yes" => Some(Live::Force),
+            "force" => Some(Live::Force),
             _ => None,
         }
     }
@@ -320,7 +329,6 @@ impl<'a> Request<'a> {
 
 /// A site as `GET /okazuri/sites` lists it.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SiteInfo {
     pub name: &'static str,
     pub is_legal: bool,
@@ -769,7 +777,6 @@ impl Engine {
                     title: work.title,
                     title_romaji: work.title_romaji,
                     title_english: None,
-                    title_english_source: None,
                     language: work.language.map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
                     is_new,
                 });
@@ -836,13 +843,11 @@ impl Engine {
         for hit in hits.iter_mut() {
             if let Some((english, _)) = crate::hitomi::title_pair(&hit.title) {
                 // both titles are the work's own
-                hit.title_english = Some(english);
-                hit.title_english_source = Some("official".to_string());
+                hit.title_english = Some(Translated { text: english, source: "official".to_string() });
             } else if !crate::query::has_japanese(&hit.title) {
                 // a title in Latin letters, or in the language it names: only an English one is the English title
                 if hit.language.is_empty() || hit.language.iter().any(|code| code == "en") {
-                    hit.title_english = Some(hit.title.clone());
-                    hit.title_english_source = Some("official".to_string());
+                    hit.title_english = Some(Translated { text: hit.title.clone(), source: "official".to_string() });
                 }
             } else {
                 wanted.push(key_of(&hit.title));
@@ -856,9 +861,8 @@ impl Engine {
 
         for hit in hits.iter_mut().filter(|hit| hit.title_english.is_none() && crate::query::has_japanese(&hit.title)) {
             if let Some((english, source)) = found.get(&key_of(&hit.title)) {
-                hit.title_english = Some(english.clone());
                 // Hitomi.La's English title is the work's own; Google's is a translation
-                hit.title_english_source = Some(if source == "google" { "google" } else { "official" }.to_string());
+                hit.title_english = Some(Translated { text: english.clone(), source: if source == "google" { "google" } else { "official" }.to_string() });
             }
         }
 
@@ -1030,6 +1034,97 @@ impl Engine {
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
     async fn request_hitomi(&self, index: usize, query: &str) -> std::result::Result<Vec<Link>, String> {
         crate::hitomi::search(&mut HitomiFetch { engine: self, index }, query, self.config.max_results_per_site).await
+    }
+
+    /// The title of the work whose page is at `url` (`read_title`), with its Japanese title, its romaji and its English title
+    /// (what is saved: nothing is asked for them, as in a search).
+    pub async fn title_of(&self, url: &str, live: Live) -> std::result::Result<TitleInfo, Option<String>> {
+        let (website, title, source) = self.read_title(url, live).await?;
+        let title_romaji = self.romanize_query(&title).map_err(|e| Some(e.to_string()))?;
+        let title_japanese = match crate::hitomi::title_pair(&title) {
+            Some((_, japanese)) => Some(japanese),
+            None => crate::query::has_japanese(&title).then(|| title.clone()),
+        };
+        let mut hits = [Hit {
+            website: website.to_string(),
+            is_legal: false,
+            path: String::new(),
+            url: url.to_string(),
+            language: crate::language::detect_all(&title).into_iter().map(str::to_string).collect(),
+            title: title.clone(),
+            title_romaji: title_romaji.clone(),
+            title_english: None,
+            is_new: false,
+        }];
+        self.fill_english(&mut hits).await.map_err(|e| Some(e.to_string()))?;
+        let [hit] = hits;
+
+        Ok(TitleInfo { website, title, source, title_japanese, title_romaji, title_english: hit.title_english })
+    }
+
+    /// The title of the work whose page is at `url`. The saved works answer first: the address is cleaned (the fragment, the
+    /// locale and the parameters that do not name the work are dropped, `/view/1/2` is `/gallery/1`) and looked up by its path,
+    /// with and without the slash at the end, so an address with more in it than the page needs still finds the work. A work
+    /// that is not saved is read from its page, the way the bot reads it (Hitomi.La: from the file of the gallery). `live`:
+    /// `off` answers from the database alone, `diff` (the default) falls back to the page, `force` always asks the page.
+    /// Returns the site, the title and where it is from (`database` or `page`). `Err(None)`: no site has such a page;
+    /// `Err(Some(why))`: no title.
+    async fn read_title(&self, url: &str, live: Live) -> std::result::Result<(&'static str, String, &'static str), Option<String>> {
+        let Some((index, site)) = self.sites.iter().enumerate().find(|(_, site)| site.matches(url)) else { return Err(None) };
+        let name = site.def.name;
+        let hitomi = site.def.format == Format::Hitomi;
+        let gallery_id: Option<u32> = if hitomi {
+            static ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let id = ID.get_or_init(|| regex::Regex::new(r"/(?:[^/]*-)?(\d+)\.html").unwrap());
+
+            id.captures(url).and_then(|c| c[1].parse().ok())
+        } else {
+            None
+        };
+        let cleaned = site.clean(url);
+        let path = match gallery_id {
+            Some(id) => Some(format!("/galleries/{id}.html")),
+            None => site.path_of(&cleaned),
+        };
+
+        if live != Live::Force {
+            if let Some(path) = &path {
+                let paths = [path.clone(), sites::toggle_slash(path)];
+
+                if let Some(saved) = self.store.title_at(name, &paths).await.map_err(|e| Some(e.to_string()))? {
+                    // Hitomi.La saves `English | 日本語`: the bot reads the Japanese title
+                    let title = match hitomi.then(|| crate::hitomi::title_pair(&saved)).flatten() {
+                        Some((_, japanese)) => japanese,
+                        None => saved,
+                    };
+
+                    return Ok((name, title, "database"));
+                }
+            }
+        }
+
+        if live == Live::Off {
+            return Err(Some("the work is not saved".to_string()));
+        }
+
+        if hitomi {
+            use crate::hitomi::Fetch as _;
+            let id = gallery_id.ok_or_else(|| Some("no gallery id in the address".to_string()))?;
+            let body = HitomiFetch { engine: self, index }.get(&format!("/galleries/{id}.js"), None).await.map_err(Some)?;
+            let gallery = crate::hitomi::parse_gallery(id, &String::from_utf8_lossy(&body)).ok_or_else(|| Some("the gallery has no title".to_string()))?;
+            let mut title = gallery.japanese_title.clone().unwrap_or_else(|| gallery.title.clone());
+
+            if let Some(artist) = gallery.artists.first() {
+                title.push(' ');
+                title.push_str(artist);
+            }
+
+            return Ok((name, title, "page"));
+        }
+
+        let (_, page) = self.get_page(index, &cleaned).await.map_err(Some)?;
+
+        crate::titles::title_of_page(name, &page).map(|title| (name, title, "page")).ok_or_else(|| Some("the page has no title".to_string()))
     }
 
     /// Whether the translation can be asked: Hitomi.La is one of the sites.
@@ -1714,6 +1809,33 @@ pub(crate) mod tests {
         assert_eq!(requests(&hits), (2, 2, 2));
     }
 
+    #[tokio::test]
+    async fn an_address_that_no_site_owns_has_no_title() {
+        let (engine, hits, _) = setup(&config()).await;
+
+        assert_eq!(engine.title_of("https://example.com/some/page", Live::Diff).await, Err(None));
+        assert_eq!(requests(&hits), (0, 0, 0), "no site is asked");
+    }
+
+    #[tokio::test]
+    async fn a_saved_work_answers_whatever_the_address_carries_besides_the_page() {
+        let (engine, hits, _) = setup(&config()).await;
+        engine.store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/12".into(), title: "Saved title".into(), romaji: "saved title".into(), language: None }]), false).await.unwrap();
+        let origin = engine.sites[0].search_url("q").unwrap().split("/ok").next().unwrap().to_string();
+        let page = format!("{origin}/work/12");
+
+        // a fragment, a query string and a slash at the end do not matter
+        for url in [page.clone(), format!("{page}/"), format!("{page}?utm_source=x&ref=y#top")] {
+            let info = engine.title_of(&url, Live::Diff).await.unwrap();
+            assert_eq!((info.website, info.title.as_str(), info.source, info.title_romaji.as_str()), ("Good", "Saved title", "database", "Saved title"), "{url}");
+            assert_eq!((info.title_japanese, info.title_english.as_ref().map(|t| t.text.as_str())), (None, Some("Saved title")), "a title in Latin letters is its own English title");
+        }
+        assert_eq!(requests(&hits), (0, 0, 0), "the database answered, no page was asked");
+
+        // a work that is not saved is not answered by `off`
+        assert!(matches!(engine.title_of(&format!("{origin}/work/13"), Live::Off).await, Err(Some(_))));
+    }
+
     #[test]
     fn the_the_of_a_translated_title_is_taken_off() {
         assert_eq!(without_the("The Phaethon Assault"), "Phaethon Assault");
@@ -2190,14 +2312,17 @@ pub(crate) mod tests {
         store.save_translations("k4", "google", "彼女B kanojo", "ja", 1, &[row("Her B", "彼女B kanojo", "google")]).await.unwrap();
 
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
-        let english: Vec<_> = outcome.results.iter().map(|hit| (hit.path.as_str(), hit.title_english.as_deref(), hit.title_english_source.as_deref())).collect();
+        let english: Vec<_> = outcome.results.iter().map(|hit| (hit.path.as_str(), hit.title_english.as_ref().map(|t| t.text.as_str()), hit.title_english.as_ref().map(|t| t.source.as_str()))).collect();
 
         assert!(english.contains(&("/1", Some("kanojo plain"), Some("official"))), "{english:?}");
         assert!(english.contains(&("/2", Some("kanojo"), Some("official"))), "{english:?}");
         assert!(english.contains(&("/3", Some("Her A"), Some("official"))), "Hitomi.La's is the work's own title: {english:?}");
         assert!(english.contains(&("/4", Some("Her B"), Some("google"))), "{english:?}");
         assert!(english.contains(&("/5", None, None)), "nothing saved, nothing asked: {english:?}");
-        let json = serde_json::to_value(&outcome.results[0]).unwrap();
-        assert!(json.get("titleEnglish").is_some() && json.get("titleEnglishSource").is_some());
+        // an object with the text and where it is from, `null` when there is none
+        let of = |path: &str| serde_json::to_value(outcome.results.iter().find(|hit| hit.path == path).unwrap()).unwrap();
+        assert_eq!(of("/4")["title_english"], serde_json::json!({ "text": "Her B", "source": "google" }));
+        assert!(of("/5")["title_english"].is_null());
+        assert!(of("/5").get("title_english_source").is_none());
     }
 }

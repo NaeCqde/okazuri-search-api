@@ -14,6 +14,7 @@
 
 use crate::engine::{Engine, Lang, Live, Request, Translator};
 use crate::romanizer::{Loanwords, Romanizer};
+use axum::extract::RawQuery;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -29,7 +30,7 @@ pub struct AppState {
     pub max_query_chars: usize,
     /// The search engine; `None` when `[search]` is off.
     pub search: Option<Arc<Engine>>,
-    /// The copy of the Worker's D1 database (`[d1] mirror_path`); `None` when `[d1]` is off and there is no file.
+    /// The copy of the Worker's D1 database (`[magazine] mirror_path`); `None` when `[magazine]` is off and there is no file.
     pub mirror_path: Option<std::path::PathBuf>,
 }
 
@@ -37,7 +38,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new().route("/health", get(health)).route("/romaji", get(romaji));
 
     if state.search.is_some() {
-        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
+        router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/okazuri/title", get(title)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
     }
 
     if state.mirror_path.is_some() {
@@ -50,7 +51,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// Says how long a cache (Cloudflare in front of this server, a browser) may keep an answer. Only a `200` is kept;
-/// a search that asks every site again (`live=on`) and the health check are never kept.
+/// a search that asks every site again (`live=force`) and the health check are never kept.
 async fn cache_control(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let path = request.uri().path().to_string();
     // Read the query the way the handlers do (percent-decoded, case-insensitive), so `live=ON` or `live=%6Fn` is not kept either.
@@ -60,6 +61,7 @@ async fn cache_control(request: axum::extract::Request, next: axum::middleware::
         "/okazuri/search" if !forced => 300,
         "/hitomila/translate" | "/google/translate" | "/auto/translate" | "/romaji" => 86_400,
         "/okazuri/sites" => 3_600,
+        "/okazuri/title" => 3_600,
         "/okazuri/magazine" | "/okazuri/magazines" | "/okazuri/works" => 300,
         _ => 0,
     };
@@ -277,6 +279,68 @@ async fn auto_translate(State(state): State<Arc<AppState>>, Query(params): Query
     }
 }
 
+/// The title of the work at each address (`url`, once or more): what the bot reads from the page of a work. An address that
+/// is no page of a site, or a page that gives no title, has `title: null` and says why in `error`. The saved works answer first
+/// (`source: "database"`); `live=off` never asks a page, `live=force` always does.
+async fn title(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> Response {
+    let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
+    let pairs: Vec<(String, String)> = Query::<Vec<(String, String)>>::try_from_uri(&format!("/?{}", raw.unwrap_or_default()).parse().unwrap_or_default())
+        .map(|query| query.0)
+        .unwrap_or_default();
+    let urls: Vec<String> = pairs.iter().filter(|(key, _)| key == "url").map(|(_, value)| value.trim().to_string()).filter(|url| !url.is_empty()).collect();
+    let live = match pairs.iter().find(|(key, _)| key == "live") {
+        None => Live::Diff,
+        Some((_, value)) => match Live::parse(value) {
+            Some(live) => live,
+            None => return invalid("live is off, diff or force"),
+        },
+    };
+
+    if urls.is_empty() || urls.len() > MAX_TITLE_URLS {
+        return invalid(&format!("url is required, 1 to {MAX_TITLE_URLS} times"));
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (place, url) in urls.iter().cloned().enumerate() {
+        let engine = engine.clone();
+
+        tasks.spawn(async move {
+            let found = match engine.title_of(&url, live).await {
+                Ok(info) => serde_json::json!({
+                    "url": url,
+                    "website": info.website,
+                    "title": info.title,
+                    "title_japanese": info.title_japanese,
+                    "title_romaji": info.title_romaji,
+                    "title_english": info.title_english,
+                    "source": info.source,
+                    "error": null,
+                }),
+                Err(None) => serde_json::json!({ "url": url, "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "source": null, "error": "unsupported website" }),
+                Err(Some(why)) => serde_json::json!({ "url": url, "website": null, "title": null, "title_japanese": null, "title_romaji": null, "title_english": null, "source": null, "error": why }),
+            };
+
+            (place, found)
+        });
+    }
+
+    let mut results = vec![serde_json::Value::Null; urls.len()];
+
+    while let Some(done) = tasks.join_next().await {
+        if let Ok((place, found)) = done {
+            results[place] = found;
+        }
+    }
+
+    json(StatusCode::OK, &serde_json::json!({ "total": results.len(), "results": results }))
+}
+
+/// The longest `q` of the lookups in the copy of the catalogue (`/okazuri/magazine`, `/okazuri/works`), in characters.
+const MAX_LOOKUP_CHARS: usize = 300;
+
+/// The most addresses one request to `/okazuri/title` may carry.
+const MAX_TITLE_URLS: usize = 10;
 #[derive(Deserialize)]
 struct MagazineQuery {
     q: Option<String>,
@@ -289,8 +353,8 @@ async fn magazine(State(state): State<Arc<AppState>>, Query(params): Query<Magaz
     let Some(path) = &state.mirror_path else { return StatusCode::NOT_FOUND.into_response() };
     let title = params.q.as_deref().map(str::trim).unwrap_or_default();
 
-    if title.is_empty() || title.chars().count() > state.max_query_chars {
-        return invalid(&format!("q is required, 1 to {} characters", state.max_query_chars));
+    if title.is_empty() || title.chars().count() > MAX_LOOKUP_CHARS {
+        return invalid(&format!("q is required, 1 to {} characters", MAX_LOOKUP_CHARS));
     }
 
     let limit = params.limit.unwrap_or(10);
@@ -370,8 +434,8 @@ async fn issue_works(State(state): State<Arc<AppState>>, Query(params): Query<Ma
     let Some(path) = &state.mirror_path else { return StatusCode::NOT_FOUND.into_response() };
     let name = params.q.as_deref().map(str::trim).unwrap_or_default();
 
-    if name.is_empty() || name.chars().count() > state.max_query_chars {
-        return invalid(&format!("q is required, 1 to {} characters", state.max_query_chars));
+    if name.is_empty() || name.chars().count() > MAX_LOOKUP_CHARS {
+        return invalid(&format!("q is required, 1 to {} characters", MAX_LOOKUP_CHARS));
     }
 
     match crate::mirror::mirror_issue_works(path, name).await {
@@ -561,6 +625,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_title_route_says_what_it_cannot_read() {
+        let (state, _) = search_state().await;
+
+        assert_eq!(get_from(state.clone(), "/okazuri/title").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _, body) = get_from(state.clone(), "/api/v1/okazuri/title?url=https%3A%2F%2Fexample.com%2Fx&url=https%3A%2F%2Fexample.org").await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["results"][0]["url"], "https://example.com/x");
+        assert_eq!(value["results"][1]["error"], "unsupported website");
+        assert!(value["results"][0]["title"].is_null());
+        assert_eq!(get_from(state.clone(), "/okazuri/title?url=https%3A%2F%2Fexample.com&live=maybe").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let many: String = (0..11).map(|n| format!("url=https%3A%2F%2Fexample.com%2F{n}&")).collect();
+        assert_eq!(get_from(state, &format!("/okazuri/title?{many}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
     async fn the_magazine_route_finds_the_issues_of_a_work_in_the_copy() {
         let dir = std::env::temp_dir().join(format!("okazuri-search-api-test-magazine-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -626,7 +709,6 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // no `off` here: the saved answers are the answer of `diff`, and the site is asked when there is none
         assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(get_from(state.clone(), &format!("/hitomila/translate?q={}&live=on", encode("姉弟"))).await.0, StatusCode::BAD_GATEWAY, "`on` is `force`, the old name");
         // Google Translate: the same input rules, and `off` with nothing saved is no translation
         assert_eq!(get_from(state.clone(), "/google/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/google/translate?q={}", encode("형제"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -661,13 +743,13 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["query"], "COMIC ExE");
         assert_eq!(json["results"][0]["website"], "Good");
-        assert_eq!(json["results"][0]["isLegal"], true);
+        assert_eq!(json["results"][0]["is_legal"], true);
         assert_eq!(json["results"][0]["title"], "COMIC ExE one");
         assert_eq!(json["results"][0]["path"], "/work/1");
         assert_eq!(json["results"][0]["url"], "http://127.0.0.1/work/1");
         assert_eq!(json["terms"], serde_json::json!(["comic", "exe"]));
         assert_eq!(json["total"], 2);
-        assert_eq!(json["results"][0]["isNew"], true, "this request saved it");
+        assert_eq!(json["results"][0]["is_new"], true, "this request saved it");
         assert_eq!(json["sites"].as_array().unwrap().len(), 3);
         assert_eq!(json["sites"][1]["status"], "failed");
 
@@ -676,7 +758,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(json["sites"][0]["status"], "cached");
-        assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["isNew"]), (2, &serde_json::json!(false)));
+        assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["is_new"]), (2, &serde_json::json!(false)));
 
         // live=force asks every site, cached or not; the works are found again and are not new
         let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}&live=force", encode("COMIC ExE"))).await;
@@ -702,7 +784,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(json["query"], "cheat", "the romaji is the query: no hentai or anything else is added");
         assert_eq!(json["terms"], serde_json::json!(["cheat"]));
         assert_eq!(json["results"][0]["title"], "cheat one", "the sites were asked the romaji, and the titles are matched with it");
-        assert_eq!(json["results"][0]["titleRomaji"], "cheat one");
+        assert_eq!(json["results"][0]["title_romaji"], "cheat one");
         assert_eq!(json["sites"][0]["queries"], serde_json::json!(["チート", "cheat"]), "a site that finds Japanese titles is asked both");
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
 

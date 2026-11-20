@@ -10,7 +10,7 @@
 //! no row reads, and a value that moves on with every write. The bookmark of the data in the mirror is
 //! kept in the mirror itself.
 
-use crate::config::D1Config;
+use crate::config::MagazineConfig;
 use crate::mirror::{content_hash, mirror_bookmark, mirror_content_hash, mirror_note_bookmark, rebuild_mirror};
 use crate::utils::{unix_now, Result};
 use serde_json::{json, Value};
@@ -43,11 +43,11 @@ pub struct Synced {
 }
 
 impl D1Client {
-    pub fn new(config: &D1Config, token: String) -> Self {
+    pub fn new(config: &MagazineConfig, token: String) -> Self {
         Self::with_base(config, token, API.to_string(), Duration::from_secs(1))
     }
 
-    pub fn with_base(config: &D1Config, token: String, base: String, poll_interval: Duration) -> Self {
+    pub fn with_base(config: &MagazineConfig, token: String, base: String, poll_interval: Duration) -> Self {
         Self {
             client: reqwest::Client::builder().timeout(Duration::from_secs(120)).build().expect("the HTTP client"),
             base,
@@ -283,10 +283,10 @@ INSERT INTO \"numbers\" (\"id\",\"name\",\"date\",\"magazine_id\") VALUES('BJ1',
     }
 
     fn client(port: u16, token: &str) -> Arc<D1Client> {
-        let config = D1Config {
+        let config = MagazineConfig {
             account_id: "acc".into(),
             database_id: "db".into(),
-            ..D1Config::default()
+            ..MagazineConfig::default()
         };
 
         Arc::new(D1Client::with_base(&config, token.into(), format!("http://127.0.0.1:{port}"), Duration::from_millis(1)))
