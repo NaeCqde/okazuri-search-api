@@ -95,7 +95,7 @@ google_bridge_token = ""
 # ("COMIC快楽天 2026年07月号" is "COMIC快楽天 2026 07", searched in romaji), and is searched like a request, newest issue first. A
 # query that is searched already is skipped. Needs [search]; the copy comes from [magazine].
 [prefetch]
-enabled = true
+enabled = false
 # The wait between two queries.
 query_delay_ms = 2000
 # The most queries in one round (0: all). The next round goes on from there.
