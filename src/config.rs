@@ -16,7 +16,6 @@ pub struct Config {
     pub search: SearchConfig,
     pub magazine: MagazineConfig,
     pub translation: TranslationConfig,
-    pub prefetch: PrefetchConfig,
     pub crawl: CrawlConfig,
     pub verify: VerifyConfig,
     pub cron: CronConfig,
@@ -147,6 +146,8 @@ pub struct MagazineConfig {
     pub mirror_path: PathBuf,
     /// How often to ask D1 whether the data changed (a call that costs no reads).
     pub check_interval_minutes: u64,
+    /// Searching ahead of time for the issues of the copy (`[magazine.prefetch]`).
+    pub prefetch: PrefetchConfig,
 }
 
 impl Default for MagazineConfig {
@@ -159,11 +160,12 @@ impl Default for MagazineConfig {
             tables: ["magazines", "numbers", "authors", "works"].map(String::from).to_vec(),
             mirror_path: PathBuf::from("d1-mirror.db"),
             check_interval_minutes: 10,
+            prefetch: PrefetchConfig::default(),
         }
     }
 }
 
-/// Searching ahead of time for the issues of the magazines in the mirror (`prefetch.rs`).
+/// Searching ahead of time for the issues of the magazines in the mirror (`prefetch.rs`): the section `[magazine.prefetch]`.
 /// Off unless `enabled` is true.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -333,7 +335,7 @@ mod tests {
         assert!(!config.cron.enabled);
         assert!(config.cron.jobs.is_empty());
         // the search engine and what feeds it are off
-        assert!(!config.search.enabled && !config.magazine.enabled && !config.prefetch.enabled);
+        assert!(!config.search.enabled && !config.magazine.enabled && !config.magazine.prefetch.enabled);
         assert_eq!(config.magazine.tables, ["magazines", "numbers", "authors", "works"]);
         assert_ne!(config.search.db_path, config.magazine.mirror_path, "two database files");
     }
@@ -350,11 +352,11 @@ mod tests {
     fn the_functions_are_switched_in_the_file() {
         let config: Config = toml::from_str(
             "[search]\nenabled = true\nttl_hours = 1\ndisabled_sites = [\"Sukebei\"]\n\
-             [magazine]\nenabled = true\naccount_id = \"a\"\ndatabase_id = \"d\"\n[prefetch]\nenabled = true\n",
+             [magazine]\nenabled = true\naccount_id = \"a\"\ndatabase_id = \"d\"\n[magazine.prefetch]\nenabled = true\n",
         )
         .unwrap();
 
-        assert!(config.search.enabled && config.magazine.enabled && config.prefetch.enabled);
+        assert!(config.search.enabled && config.magazine.enabled && config.magazine.prefetch.enabled);
         assert_eq!((config.search.ttl_hours, config.search.concurrency), (1, 8));
         assert_eq!(config.search.disabled_sites, ["Sukebei"]);
     }

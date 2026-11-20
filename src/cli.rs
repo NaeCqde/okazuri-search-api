@@ -26,7 +26,7 @@ pub const USAGE: &str = "okazuri-search-api\n\n\
 Usage: okazuri-search-api [command]\n\n\
 (no command)                           Start the server (same as `serve`)\n\
 serve                                  Start the server on the port of the config file, and what it switches on: [search],\n\
-                                       [magazine] with [prefetch], and [cron]\n\
+                                       [magazine] with [magazine.prefetch], and [cron]\n\
     --config <path>      Config file (default: config.toml in the current directory;\n\
                          a file that does not exist means the defaults)\n\
     --host <address>     Address to listen on (default: [server] host, 127.0.0.1)\n\
@@ -51,8 +51,8 @@ search <words>...                      Search the sites for the words (in romaji
     --config <path>      Config file\n\
 sync                                   Copy the magazine tables of the D1 database now ([magazine])\n\
     --config <path>      Config file\n\
-prefetch                               Search for the issues of the copy once through ([prefetch])\n\
-    --limit <n>          The most queries (default: [prefetch] max_queries_per_round)\n\
+prefetch                               Search for the issues of the copy once through ([magazine.prefetch])\n\
+    --limit <n>          The most queries (default: [magazine.prefetch] max_queries_per_round)\n\
     --config <path>      Config file\n\
 reromanize                             Make the romaji of the saved works again with the rules of this version, and\n\
                                        forget the searches that listed a work whose romaji changed (the prefetch,\n\
@@ -483,12 +483,12 @@ impl Background {
     fn check(config: &Config) -> Result<Self> {
         let d1 = if config.magazine.enabled { Some(Arc::new(d1_client(config)?)) } else { None };
 
-        if config.prefetch.enabled {
+        if config.magazine.prefetch.enabled {
             if !config.search.enabled {
-                return Err("[prefetch] needs [search] enabled = true".into());
+                return Err("[magazine.prefetch] needs [search] enabled = true".into());
             }
             if !config.magazine.enabled && !config.magazine.mirror_path.exists() {
-                log::warn!("[prefetch] is on, but there is no {} and [magazine] is off", config.magazine.mirror_path.display());
+                log::warn!("[magazine.prefetch] is on, but there is no {} and [magazine] is off", config.magazine.mirror_path.display());
             }
         }
 
@@ -500,7 +500,7 @@ impl Background {
             return Err("[verify] needs [search] enabled = true".into());
         }
 
-        Ok(Self { d1, prefetch: config.prefetch.enabled, crawl: config.crawl.enabled, verify: config.verify.enabled })
+        Ok(Self { d1, prefetch: config.magazine.prefetch.enabled, crawl: config.crawl.enabled, verify: config.verify.enabled })
     }
 }
 
@@ -553,7 +553,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         "search: {}, magazine: {}, prefetch: {}, crawl: {}, verify: {}, cron: {}",
         on_off(config.search.enabled),
         on_off(config.magazine.enabled),
-        on_off(config.prefetch.enabled),
+        on_off(config.magazine.prefetch.enabled),
         on_off(config.crawl.enabled),
         on_off(config.verify.enabled),
         on_off(scheduler.is_some()),
@@ -579,7 +579,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     }
     if let (true, Some(engine)) = (background.prefetch, engine) {
         let prefetcher =
-            Arc::new(Prefetcher::new(engine, config.magazine.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled));
+            Arc::new(Prefetcher::new(engine, config.magazine.mirror_path.clone(), config.magazine.prefetch.clone()).with_crawl(config.crawl.enabled));
 
         tasks.push(tokio::spawn(prefetcher.run(wake)));
     }
@@ -845,13 +845,13 @@ async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<Path
 async fn prefetch(limit: Option<usize>, config: Option<PathBuf>) -> Result<()> {
     let mut config = load(config).await?;
     config.search.enabled = true;
-    config.prefetch.enabled = true;
+    config.magazine.prefetch.enabled = true;
     if let Some(limit) = limit {
-        config.prefetch.max_queries_per_round = limit;
+        config.magazine.prefetch.max_queries_per_round = limit;
     }
 
     let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
-    let prefetcher = Prefetcher::new(engine, config.magazine.mirror_path.clone(), config.prefetch.clone()).with_crawl(config.crawl.enabled);
+    let prefetcher = Prefetcher::new(engine, config.magazine.mirror_path.clone(), config.magazine.prefetch.clone()).with_crawl(config.crawl.enabled);
     let round = prefetcher.round().await?;
 
     println!(
@@ -1018,7 +1018,7 @@ mod tests {
 
         // the prefetch needs the search
         let mut config = Config::default();
-        config.prefetch.enabled = true;
+        config.magazine.prefetch.enabled = true;
         assert!(Background::check(&config).err().expect("an error").to_string().contains("[search]"));
 
         // a D1 copy needs the ids and a token
