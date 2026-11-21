@@ -59,6 +59,8 @@ min_delay_ms = 1000
 # The most works kept from one site's list page, and the most in one answer (a request may use limit=).
 max_results_per_site = 50
 max_results = 100
+# The most saved works one search reads from the database, whatever the words are (the newest are kept).
+max_candidates = 800000
 # Sites to leave out (the names of GET /okazuri/sites). The demo server leaves out these three.
 disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 # A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The

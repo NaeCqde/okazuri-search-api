@@ -77,6 +77,9 @@ pub struct SearchConfig {
     pub max_results_per_site: usize,
     /// The most works in one answer (a request may ask for fewer with limit).
     pub max_results: usize,
+    /// The most saved works one search reads from the database, whatever the words are (the newest ones are kept; a set of more than 50,000
+    /// is not kept in memory). A word that is in more works than this is cut.
+    pub max_candidates: usize,
     /// Names of the sites (`GET /okazuri/sites`) that are left out.
     pub disabled_sites: Vec<String>,
     /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
@@ -109,6 +112,7 @@ impl Default for SearchConfig {
             site_delay_ms: BTreeMap::new(),
             max_results_per_site: 50,
             max_results: 100,
+            max_candidates: 800_000,
             disabled_sites: Vec::new(),
             skip_crawled: false,
             try_unsupported: false,
