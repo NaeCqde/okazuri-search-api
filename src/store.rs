@@ -19,7 +19,8 @@ use sea_orm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// What is known of one search (a query on a site).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,8 +55,18 @@ pub type Work = work::Model;
 /// The most rows `find` reads: a word that is in nearly every title would read the whole table.
 const MAX_CANDIDATES: u64 = 50_000;
 
+/// How many words keep their candidates in memory (a set of them is up to `MAX_CANDIDATES` rows).
+const CACHED_CANDIDATE_SETS: usize = 8;
+
+/// How long the candidates of a word are kept: the crawlers and the other processes write the same file, and this process cannot see it.
+const CANDIDATES_LIFETIME: Duration = Duration::from_secs(300);
+
+/// The candidates of the words asked lately (`SearchStore::candidates`), the oldest first.
+type CandidateSets = Vec<(String, Instant, Arc<Vec<Work>>)>;
+
 pub struct SearchStore {
     db: DatabaseConnection,
+    candidate_sets: Mutex<CandidateSets>,
 }
 
 impl SearchStore {
@@ -91,7 +102,7 @@ impl SearchStore {
 
         Self::create_tables(&db).await?;
 
-        Ok(Self { db })
+        Ok(Self { db, candidate_sets: Mutex::new(Vec::new()) })
     }
 
     async fn create_tables(db: &DatabaseConnection) -> Result<()> {
@@ -247,6 +258,7 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
+        self.forget_candidates();
 
         Ok(new)
     }
@@ -465,6 +477,7 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
+        self.forget_candidates();
 
         Ok(())
     }
@@ -587,6 +600,7 @@ impl SearchStore {
                 }
             }
             transaction.commit().await?;
+            self.forget_candidates();
         }
 
         Ok((looked, changed))
@@ -606,6 +620,7 @@ impl SearchStore {
             .exec_without_returning(&transaction)
             .await?;
         transaction.commit().await?;
+        self.forget_candidates();
 
         Ok(new as usize)
     }
@@ -689,6 +704,7 @@ impl SearchStore {
             .await?;
 
         transaction.commit().await?;
+        self.forget_candidates();
 
         Ok(new)
     }
@@ -811,14 +827,45 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
+        self.forget_candidates();
 
         Ok(forgotten)
     }
 
     /// The works whose title key has every one of `parts` in it (all works for none), the most recently saved first, at most
     /// `MAX_CANDIDATES`. This only narrows the rows; the caller still matches every word of its query.
+    ///
+    /// The rows of a word are kept for `CANDIDATES_LIFETIME` (reading up to 50,000 rows of a table of gigabytes takes seconds for a word that many works
+    /// have), and forgotten when this process writes a work.
     pub async fn candidates(&self, parts: &[&str]) -> Result<Vec<Work>> {
-        self.candidates_up_to(parts, MAX_CANDIDATES).await
+        let key = parts.join("\u{1}");
+
+        if let Some(kept) = self.kept_candidates(&key) {
+            return Ok(kept.as_ref().clone());
+        }
+
+        let found = Arc::new(self.candidates_up_to(parts, MAX_CANDIDATES).await?);
+
+        let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
+        sets.retain(|(kept, ..)| *kept != key);
+        if sets.len() >= CACHED_CANDIDATE_SETS {
+            sets.remove(0);
+        }
+        sets.push((key, Instant::now(), found.clone()));
+
+        Ok(found.as_ref().clone())
+    }
+
+    fn kept_candidates(&self, key: &str) -> Option<Arc<Vec<Work>>> {
+        let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
+        sets.retain(|(_, at, _)| at.elapsed() < CANDIDATES_LIFETIME);
+
+        sets.iter().find(|(kept, ..)| kept == key).map(|(_, _, works)| works.clone())
+    }
+
+    /// The saved candidates are not the works of the database any more: a write of this process changed them.
+    fn forget_candidates(&self) {
+        self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Vec<Work>> {
@@ -921,6 +968,27 @@ mod tests {
         assert_eq!((one.title.as_str(), one.updated_at), ("New title", 200), "the title is the last one the site gave");
         assert_eq!(one.first_seen, 100);
         assert_eq!(store.counts().await.unwrap(), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn the_candidates_of_a_word_are_kept_until_this_process_writes_a_work() {
+        let store = SearchStore::in_memory().await.unwrap();
+        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "Comic One")]), false).await.unwrap();
+
+        assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 1);
+
+        // a row that another process wrote is not seen while the candidates are kept
+        store
+            .db
+            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/2/', 'Comic Two', 'comic two', 'comictwo', 2, 2, NULL, 0, NULL)")
+            .await
+            .unwrap();
+        assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 1, "kept");
+        assert_eq!(store.candidates(&["comic", "two"]).await.unwrap().len(), 1, "another word is read from the database");
+
+        // a write of this process makes the next read go to the database
+        store.save("q", "A", 200, &Ok(vec![link("/g/3/", "Comic Three")]), false).await.unwrap();
+        assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -1263,6 +1331,8 @@ mod tests {
 
         // a removed work
         store.db.execute_unprepared("DELETE FROM works WHERE path = '/g/1/'").await.unwrap();
+        // (another process wrote it: the kept candidates are old when their time is over)
+        store.forget_candidates();
         assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/6/"]);
         assert_eq!(paths(store.candidates(&["shitara"]).await.unwrap()).await, ["/g/4/"]);
     }
