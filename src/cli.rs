@@ -10,6 +10,7 @@ use crate::d1::D1Client;
 use crate::engine::{Engine, Live, Request};
 use crate::crawl::Crawler;
 use crate::verify::Verifier;
+use crate::fill::TitleTranslator;
 use crate::prefetch::Prefetcher;
 use crate::romanizer::{Loanwords, Romanizer};
 use crate::store::SearchStore;
@@ -477,6 +478,7 @@ struct Background {
     prefetch: bool,
     crawl: bool,
     verify: bool,
+    fill: bool,
 }
 
 impl Background {
@@ -500,7 +502,17 @@ impl Background {
             return Err("[verify] needs [search] enabled = true".into());
         }
 
-        Ok(Self { d1, prefetch: config.magazine.prefetch.enabled, crawl: config.crawl.enabled, verify: config.verify.enabled })
+        if config.translation.fill.enabled && !config.search.enabled {
+            return Err("[translation.fill] needs [search] enabled = true".into());
+        }
+
+        Ok(Self {
+            d1,
+            prefetch: config.magazine.prefetch.enabled,
+            crawl: config.crawl.enabled,
+            verify: config.verify.enabled,
+            fill: config.translation.fill.enabled,
+        })
     }
 }
 
@@ -550,12 +562,13 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         .map_err(|e| format!("cannot listen on {address}: {e}"))?;
     log::info!("listening on http://{}", listener.local_addr()?);
     log::info!(
-        "search: {}, magazine: {}, prefetch: {}, crawl: {}, verify: {}, cron: {}",
+        "search: {}, magazine: {}, prefetch: {}, crawl: {}, verify: {}, fill: {}, cron: {}",
         on_off(config.search.enabled),
         on_off(config.magazine.enabled),
         on_off(config.magazine.prefetch.enabled),
         on_off(config.crawl.enabled),
         on_off(config.verify.enabled),
+        on_off(config.translation.fill.enabled),
         on_off(scheduler.is_some()),
     );
 
@@ -576,6 +589,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     }
     if let (true, Some(engine)) = (background.verify, engine.clone()) {
         tasks.push(tokio::spawn(Arc::new(Verifier::new(engine, config.verify.clone())?).run()));
+    }
+    if let (true, Some(engine)) = (background.fill, engine.clone()) {
+        tasks.push(tokio::spawn(Arc::new(TitleTranslator::new(engine, config.translation.fill.clone())).run()));
     }
     if let (true, Some(engine)) = (background.prefetch, engine) {
         let prefetcher =

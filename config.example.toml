@@ -90,6 +90,18 @@ google_bridge_url = ""
 # What the bridge wants in "Authorization: Bearer" (its BRIDGE_TOKEN). Empty for none.
 google_bridge_token = ""
 
+# Translating the Japanese titles of the saved works with Google Translate ahead of time, so that a result has its English title and a
+# search in English finds it. The newest works come first; a title that has a translation (Hitomi.La's, or a saved one) is skipped. One
+# title is asked for at a time. Needs [search]; the bridge above is the one that is asked.
+[translation.fill]
+enabled = false
+# The wait after each title that Google was asked for.
+pause_ms = 3000
+# The most titles asked in one round; the next round starts again from the newest works (the ones saved meanwhile come first).
+max_per_round = 1000
+# The wait before the next round when the last one did not use max_per_round (the titles are all translated, or Google does not answer).
+round_interval_minutes = 60
+
 # Searching ahead of time: the name of every issue in the copy becomes a query the way the bot makes it
 # ("COMIC快楽天 2026年07月号" is "COMIC快楽天 2026 07", searched in romaji), and is searched like a request, newest issue first. A
 # query that is searched already is skipped. Needs [search]; the copy comes from [magazine].

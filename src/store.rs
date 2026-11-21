@@ -130,6 +130,15 @@ impl SearchStore {
             .to_owned();
         db.execute(backend.build(&by_update)).await?;
 
+        // the English title of a result is looked up by the Japanese key of its title (`english_titles`)
+        let by_japanese = Index::create()
+            .name("translations_japanese_key")
+            .table(translation::Entity)
+            .col(translation::Column::JapaneseKey)
+            .if_not_exists()
+            .to_owned();
+        db.execute(backend.build(&by_japanese)).await?;
+
         Self::create_word_index(db).await
     }
 
@@ -719,6 +728,26 @@ impl SearchStore {
             .await?)
     }
 
+    /// The titles with Japanese letters, the newest saved first, `limit` of them after the place `before` (the `(updated_at, rowid)` of
+    /// the last title of the page before; none for the first page). Each is `(updated_at, rowid, title)`. The works whose page is gone have
+    /// no title and are not there.
+    pub async fn japanese_titles(&self, before: Option<(i64, i64)>, limit: u64) -> Result<Vec<(i64, i64, String)>> {
+        let (updated_at, rowid) = before.unwrap_or((i64::MAX, i64::MAX));
+        let statement = Statement::from_sql_and_values(
+            self.db.get_database_backend(),
+            "SELECT updated_at, rowid, title FROM works WHERE deleted = 0 AND title GLOB ? AND (updated_at, rowid) < (?, ?) \
+             ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+            ["*[\u{3040}-\u{30FF}\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}]*".into(), updated_at.into(), rowid.into(), (limit as i64).into()],
+        );
+
+        self.db
+            .query_all(statement)
+            .await?
+            .iter()
+            .map(|row| Ok((row.try_get::<i64>("", "updated_at")?, row.try_get::<i64>("", "rowid")?, row.try_get::<String>("", "title")?)))
+            .collect()
+    }
+
     /// The saved translations of a source (`hitomi` or `google`) that have the text (as `hitomi::squash` writes it) in
     /// their English title (`english`) or in their Japanese title, whatever text they were asked for: a translation
     /// Japanese to English answers English to Japanese too. With `exact` the title is the whole text (a machine translation
@@ -989,6 +1018,22 @@ mod tests {
         // a write of this process makes the next read go to the database
         store.save("q", "A", 200, &Ok(vec![link("/g/3/", "Comic Three")]), false).await.unwrap();
         assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_titles_with_japanese_letters_come_newest_first_in_pages() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "日本語 one"), link("/g/2/", "English only")]), false).await.unwrap();
+        store.save("q", "A", 200, &Ok(vec![link("/g/3/", "カタカナ"), link("/g/4/", "漢字")]), false).await.unwrap();
+
+        let first = store.japanese_titles(None, 2).await.unwrap();
+        assert_eq!(first.iter().map(|(_, _, title)| title.as_str()).collect::<Vec<_>>(), ["漢字", "カタカナ"], "the newest first, the same second last rowid first");
+        let (updated_at, rowid, _) = first.last().unwrap().clone();
+
+        let second = store.japanese_titles(Some((updated_at, rowid)), 2).await.unwrap();
+        assert_eq!(second.iter().map(|(_, _, title)| title.as_str()).collect::<Vec<_>>(), ["日本語 one"], "a title in Latin letters is not there");
+        assert!(store.japanese_titles(Some((second[0].0, second[0].1)), 2).await.unwrap().is_empty());
     }
 
     #[tokio::test]

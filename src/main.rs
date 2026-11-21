@@ -6,6 +6,7 @@ mod cron;
 mod d1;
 mod dataset;
 mod engine;
+mod fill;
 mod hitomi;
 mod language;
 mod entity;
