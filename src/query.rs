@@ -262,21 +262,30 @@ impl Terms {
     /// `kanojo ni dekiru koto (comic kairakuten 2018 8)` is a work of the issue, and `meguri dokoro 11-po (comic exe 61)`
     /// is not the issue `comic exe 11` (`comic exe` is in the parentheses), but `comic kairakuten (2026 nen 11 gatsu gou)`
     /// is the issue `comic kairakuten 2026 11`.
+    #[cfg(test)]
     pub fn matches_title(&self, title: &str) -> bool {
         let (outside, _) = split_parentheses(title);
 
         self.matches(title, &title_key(&outside))
     }
 
-    /// `matches_title` of a saved romaji whose `title_key` is known. A title in ASCII with no parenthesis is its own outside, and the
-    /// saved key is its key: the title is not split and folded again (a search matches hundreds of thousands of them).
-    pub fn matches_romaji(&self, title: &str, key: &str) -> bool {
-        if title.is_ascii() && !title.contains('(') {
-            self.matches(title, key)
-        } else {
-            self.matches_title(title)
-        }
+    /// `matches_title` of a saved romaji whose key outside its parentheses is known (`outside_key`): the title is not split and folded again
+    /// (a search matches hundreds of thousands of them).
+    pub fn matches_key(&self, title: &str, key: &str) -> bool {
+        self.matches(title, key)
     }
+}
+
+/// A title in ASCII with no parenthesis: what is outside its parentheses is all of it, and its key is the key of the title.
+pub fn is_plain(title: &str) -> bool {
+    title.is_ascii() && !title.contains('(')
+}
+
+/// The key of what is outside the parentheses of a title (`Terms::matches_title` matches with it).
+pub fn outside_key(title: &str) -> String {
+    let (outside, _) = split_parentheses(title);
+
+    title_key(&outside)
 }
 
 #[cfg(test)]
@@ -295,14 +304,14 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_romaji_is_matched_with_its_key_as_it_is_with_the_title() {
+    fn a_saved_romaji_is_matched_with_its_outside_key_as_it_is_with_the_title() {
         let titles = ["COMIC Kairakuten 2026 11", "work (COMIC kairakuten 2018 8)", "ai no uta", "maid ai", "Ｗork (ａi)", "tokyo 2026年07月号", "one(2nd)", ""];
 
         for query in ["ai", "kairakuten", "kairakuten 2018", "2026 11", "work", "maid ai", "tokyo 7", "2nd", "(2nd)"] {
             let terms = Terms::new(query);
 
             for title in titles {
-                assert_eq!(terms.matches_romaji(title, &title_key(title)), terms.matches_title(title), "{query:?} in {title:?}");
+                assert_eq!(terms.matches_key(title, &outside_key(title)), terms.matches_title(title), "{query:?} in {title:?}");
             }
         }
     }
