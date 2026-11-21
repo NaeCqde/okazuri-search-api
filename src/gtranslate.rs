@@ -19,8 +19,23 @@ pub fn request(text: &str, from: Lang, to: Lang) -> String {
     serde_json::json!([[["MkEWBc", inner, null, "generic"]]]).to_string()
 }
 
+/// What the model that made the translation is called in the answer (`[7][0][0][0]`): 3 for the Advanced model, 0 for the classic one. The
+/// classic one answers when Google does not honour the token (a headless Chrome on Linux makes such tokens about every other time).
+const MODEL_MARK_CLASSIC: i64 = 0;
+
+/// How many times a text is asked when the classic model answers it: a new token is made for each try, and it may be honoured.
+const ATTEMPTS: usize = 3;
+
+/// A translation, and whether the classic model made it (the token was not honoured). The answer does not say it when Google changes it:
+/// then the translation is taken as it is.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Answer {
+    pub text: String,
+    pub classic: bool,
+}
+
 /// The translation in the answer: the text of every sentence, joined. None when the answer has none.
-pub fn parse(body: &str) -> Option<String> {
+pub fn parse_answer(body: &str) -> Option<Answer> {
     for line in body.lines() {
         let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(line) else { continue };
 
@@ -34,8 +49,9 @@ pub fn parse(body: &str) -> Option<String> {
             let sentences = inner.get(1)?.get(0)?.get(0)?.get(5)?.as_array()?;
             let text: String = sentences.iter().filter_map(|s| s.get(0)?.as_str()).collect::<Vec<_>>().join(" ");
             let text = text.trim().to_string();
+            let classic = inner.get(7).and_then(|v| v.get(0)?.get(0)?.get(0)?.as_i64()) == Some(MODEL_MARK_CLASSIC);
 
-            return (!text.is_empty()).then_some(text);
+            return (!text.is_empty()).then_some(Answer { text, classic });
         }
     }
 
@@ -117,6 +133,27 @@ async fn token(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: L
 /// request was held back), sent from here; without one it is the request of this program, which has no token and gets the answer of
 /// the classic model.
 pub async fn translate(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: Lang, to: Lang) -> Result<String, String> {
+    // without a bridge the classic model is the answer that is asked for
+    let attempts = if bridge.url.is_empty() { 1 } else { ATTEMPTS };
+    let mut answer = ask(client, bridge, text, from, to).await?;
+
+    for attempt in 2..=attempts {
+        if !answer.classic {
+            break;
+        }
+        log::info!("Google Translate: the classic model answered {text:?} (the token was not honoured): try {attempt} of {attempts}");
+        answer = ask(client, bridge, text, from, to).await?;
+    }
+
+    if answer.classic && !bridge.url.is_empty() {
+        log::warn!("Google Translate: the classic model answered {text:?} {attempts} times: its answer is taken");
+    }
+
+    Ok(answer.text)
+}
+
+/// One request to Google Translate, with a new token from the bridge.
+async fn ask(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: Lang, to: Lang) -> Result<Answer, String> {
     let failed = |e: reqwest::Error| format!("Google Translate: {e}");
 
     wait_turn().await;
@@ -138,7 +175,7 @@ pub async fn translate(client: &reqwest::Client, bridge: Bridge<'_>, text: &str,
 
     let body = response.text().await.map_err(failed)?;
 
-    parse(&body).ok_or_else(|| "Google Translate: no translation in the answer".to_string())
+    parse_answer(&body).ok_or_else(|| "Google Translate: no translation in the answer".to_string())
 }
 
 #[cfg(test)]
@@ -229,8 +266,75 @@ mod tests {
     fn the_translation_is_read_from_the_answer() {
         let answer = ")]}'\n\n421\n[[\"wrb.fr\",\"MkEWBc\",\"[[null,null,null,[[[0,[[[null,8]],[true]]]],8],null,null,[\\\"パエトーン強襲戦\\\",\\\"ja\\\",\\\"en\\\",true,null,1]],[[[null,null,null,null,null,[[\\\"Assault on Phaeton\\\",null,null,null,null,null,\\\"パエトーン強襲戦\\\",1]],null,null,null,[]]],\\\"en\\\",1,\\\"ja\\\",[\\\"パエトーン強襲戦\\\",\\\"ja\\\",\\\"en\\\",true,null,1]],\\\"ja\\\",null,null,null,null,[[[0],[[6,1]]]]]\",null,null,null,\"generic\"],[\"di\",382]]\n25\n[[\"e\",4,null,null,505]]\n";
 
-        assert_eq!(parse(answer).as_deref(), Some("Assault on Phaeton"));
-        assert_eq!(parse(")]}'\n\n25\n[[\"e\",4,null,null,505]]\n"), None);
-        assert_eq!(parse(""), None);
+        // the mark of this answer is 0: the classic model made it
+        assert_eq!(parse_answer(answer), Some(Answer { text: "Assault on Phaeton".into(), classic: true }));
+        assert_eq!(parse_answer(")]}'\n\n25\n[[\"e\",4,null,null,505]]\n"), None);
+        assert_eq!(parse_answer(""), None);
+    }
+
+    /// A bridge and a "Google" on one local server, where the first `classic` answers are the classic model's (the mark 0), and then the
+    /// Advanced model's (the mark 3). Returns the address and the number of requests that "Google" got.
+    async fn google(classic: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let answer = |mark: u8, text: &str| format!(")]}}'\n\n100\n[[\"wrb.fr\",\"MkEWBc\",\"[[null,null,null,null,null,null,[\\\"姉弟\\\",\\\"ja\\\",\\\"en\\\",true,null,1]],[[[null,null,null,null,null,[[\\\"{text}\\\",null,null,null,null,null,\\\"姉弟\\\",1]],null,null,null,[]]],\\\"en\\\",1,\\\"ja\\\"],\\\"ja\\\",null,null,null,null,[[[{mark}],[[6,1]]]]]\",null,null,null,\"generic\"]]\n");
+        let (classic_answer, advanced_answer) = (answer(0, "Siblings (classic)"), answer(3, "Siblings"));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let router = Router::new()
+            .route(
+                "/token",
+                get(|headers: HeaderMap| async move {
+                    let host = headers["host"].to_str().unwrap().to_string();
+
+                    Json(serde_json::json!({ "model": 1, "request": { "url": format!("http://{host}/google"), "headers": {}, "body": "f.req=BODY&" } }))
+                }),
+            )
+            .route(
+                "/google",
+                post(move |State(counter): State<Arc<AtomicUsize>>| async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) < classic { classic_answer.clone() } else { advanced_answer.clone() }
+                }),
+            )
+            .with_state(counter);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        (url, asked)
+    }
+
+    #[tokio::test]
+    async fn a_text_that_the_classic_model_answered_is_asked_again_with_a_new_token() {
+        let (url, asked) = google(2).await;
+
+        let translated = translate(&reqwest::Client::new(), Bridge { url: &url, token: "" }, "姉弟", Lang::Japanese, Lang::English).await.unwrap();
+
+        assert_eq!(translated, "Siblings", "the third try is the Advanced model's");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn the_classic_answer_is_taken_after_the_last_try() {
+        let (url, asked) = google(usize::MAX).await;
+
+        let translated = translate(&reqwest::Client::new(), Bridge { url: &url, token: "" }, "姉弟", Lang::Japanese, Lang::English).await.unwrap();
+
+        assert_eq!(translated, "Siblings (classic)");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn an_advanced_answer_is_asked_once() {
+        let (url, asked) = google(0).await;
+
+        translate(&reqwest::Client::new(), Bridge { url: &url, token: "" }, "姉弟", Lang::Japanese, Lang::English).await.unwrap();
+
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
