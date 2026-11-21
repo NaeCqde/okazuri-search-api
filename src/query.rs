@@ -267,6 +267,16 @@ impl Terms {
 
         self.matches(title, &title_key(&outside))
     }
+
+    /// `matches_title` of a saved romaji whose `title_key` is known. A title in ASCII with no parenthesis is its own outside, and the
+    /// saved key is its key: the title is not split and folded again (a search matches hundreds of thousands of them).
+    pub fn matches_romaji(&self, title: &str, key: &str) -> bool {
+        if title.is_ascii() && !title.contains('(') {
+            self.matches(title, key)
+        } else {
+            self.matches_title(title)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,6 +292,19 @@ mod tests {
         }
         // a text that is not ASCII still goes through the normalization
         assert_eq!(title_key("ＣＯＭＩＣ 快楽天 ×"), "comic快楽天x");
+    }
+
+    #[test]
+    fn a_saved_romaji_is_matched_with_its_key_as_it_is_with_the_title() {
+        let titles = ["COMIC Kairakuten 2026 11", "work (COMIC kairakuten 2018 8)", "ai no uta", "maid ai", "Ｗork (ａi)", "tokyo 2026年07月号", "one(2nd)", ""];
+
+        for query in ["ai", "kairakuten", "kairakuten 2018", "2026 11", "work", "maid ai", "tokyo 7", "2nd", "(2nd)"] {
+            let terms = Terms::new(query);
+
+            for title in titles {
+                assert_eq!(terms.matches_romaji(title, &title_key(title)), terms.matches_title(title), "{query:?} in {title:?}");
+            }
+        }
     }
 
     #[test]

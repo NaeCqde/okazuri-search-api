@@ -62,7 +62,20 @@ const CACHED_CANDIDATE_SETS: usize = 8;
 const CANDIDATES_LIFETIME: Duration = Duration::from_secs(300);
 
 /// The candidates of the words asked lately (`SearchStore::candidates`), the oldest first.
-type CandidateSets = Vec<(String, Instant, Arc<Vec<Work>>)>;
+/// A work a search reads: only what the search needs (the dates, the mark of a page that is gone and the time of its last look stay in the
+/// database; a search reads hundreds of thousands of these rows, and every column is a cost).
+#[derive(Debug, Clone, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub struct Candidate {
+    pub website: String,
+    pub path: String,
+    pub title: String,
+    pub title_romaji: String,
+    /// `title_key` of the romaji: what the search narrows with, and matches an ASCII title with.
+    pub title_key: String,
+    pub language: Option<String>,
+}
+
+type CandidateSets = Vec<(String, Instant, Arc<Vec<Candidate>>)>;
 
 pub struct SearchStore {
     db: DatabaseConnection,
@@ -903,16 +916,16 @@ impl SearchStore {
     ///
     /// The rows of a word are kept for `CANDIDATES_LIFETIME` (reading up to 50,000 rows of a table of gigabytes takes seconds for a word that many works
     /// have), and forgotten when this process writes a work.
-    pub async fn candidates(&self, parts: &[&str]) -> Result<Vec<Work>> {
+    pub async fn candidates(&self, parts: &[&str]) -> Result<Arc<Vec<Candidate>>> {
         let key = parts.join("\u{1}");
 
         let started = Instant::now();
 
+        // the saved rows are shared, not copied: a word of 700,000 works is hundreds of megabytes
         if let Some(kept) = self.kept_candidates(&key) {
-            let works = kept.as_ref().clone();
-            log::info!("candidates of {parts:?}: {} saved, copied in {} ms", works.len(), started.elapsed().as_millis());
+            log::info!("candidates of {parts:?}: {} saved, shared in {} ms", kept.len(), started.elapsed().as_millis());
 
-            return Ok(works);
+            return Ok(kept);
         }
 
         let found = Arc::new(self.candidates_up_to(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed)).await?);
@@ -925,7 +938,7 @@ impl SearchStore {
         }
         sets.push((key, Instant::now(), found.clone()));
 
-        Ok(found.as_ref().clone())
+        Ok(found)
     }
 
     /// The most rows a search of the database reads, for every word and every condition (the newest ones are kept). It also forgets the
@@ -935,7 +948,7 @@ impl SearchStore {
         self.forget_candidates();
     }
 
-    fn kept_candidates(&self, key: &str) -> Option<Arc<Vec<Work>>> {
+    fn kept_candidates(&self, key: &str) -> Option<Arc<Vec<Candidate>>> {
         let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
         sets.retain(|(_, at, _)| at.elapsed() < CANDIDATES_LIFETIME);
 
@@ -947,7 +960,8 @@ impl SearchStore {
         self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
-    async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Vec<Work>> {
+    /// The SQL of the candidates with the columns that are read (`w.*` is every column of a work).
+    fn candidates_statement(&self, parts: &[&str], most: u64, columns: &str) -> Statement {
         use sea_orm::Value;
 
         let mut filters: Vec<&str> = Vec::new();
@@ -984,11 +998,27 @@ impl SearchStore {
         let statement = Statement::from_sql_and_values(
             self.db.get_database_backend(),
             format!(
-                "SELECT w.* FROM works w JOIN (SELECT rowid AS r, updated_at AS u FROM works {condition} ORDER BY updated_at DESC, rowid ASC LIMIT ?) x \
+                "SELECT {columns} FROM works w JOIN (SELECT rowid AS r, updated_at AS u FROM works {condition} ORDER BY updated_at DESC, rowid ASC LIMIT ?) x \
                  ON w.rowid = x.r ORDER BY x.u DESC, x.r ASC"
             ),
             values,
         );
+
+        statement
+    }
+
+    async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Vec<Candidate>> {
+        use sea_orm::FromQueryResult;
+
+        let statement = self.candidates_statement(parts, most, "w.website, w.path, w.title, w.title_romaji, w.title_key, w.language");
+
+        Ok(Candidate::find_by_statement(statement).all(&self.db).await?)
+    }
+
+    /// The candidates with every column of the works, read from the database every time (for the tests).
+    #[cfg(test)]
+    pub async fn candidates_owned(&self, parts: &[&str]) -> Result<Vec<Work>> {
+        let statement = self.candidates_statement(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed), "w.*");
 
         Ok(work::Entity::find().from_raw_sql(statement).all(&self.db).await?)
     }
@@ -1043,7 +1073,7 @@ mod tests {
             ["website", "path", "title", "title_romaji", "title_key", "first_seen", "updated_at", "language", "deleted", "checked_at"]
         );
 
-        let works = store.candidates(&[]).await.unwrap();
+        let works = store.candidates_owned(&[]).await.unwrap();
         assert_eq!(works.len(), 2);
         let two = works.iter().find(|w| w.path == "/g/2/").unwrap();
         assert_eq!(two.title, "Two  ＣＯＭＩＣ", "the title is saved as the site wrote it");
@@ -1061,7 +1091,7 @@ mod tests {
         store.save("q1", "A", 100, &Ok(vec![link("/g/1/", "Old title")]), false).await.unwrap();
         store.save("q2", "A", 200, &Ok(vec![link("/g/1/", "New title"), link("/g/2/", "Other")]), false).await.unwrap();
 
-        let works = store.candidates(&[]).await.unwrap();
+        let works = store.candidates_owned(&[]).await.unwrap();
         assert_eq!(works.len(), 2, "/g/1/ is not saved twice");
         let one = works.iter().find(|w| w.path == "/g/1/").unwrap();
         assert_eq!((one.title.as_str(), one.updated_at), ("New title", 200), "the title is the last one the site gave");
@@ -1116,14 +1146,14 @@ mod tests {
         // the same works again: they are not new, and their rows are left as they are
         let new = store.save("q", "A", 200, &Ok(vec![link("/g/1/", "One"), link("/g/3/", "Three")]), false).await.unwrap();
         assert_eq!(new, ["/g/3/"]);
-        let works = store.candidates(&[]).await.unwrap();
+        let works = store.candidates_owned(&[]).await.unwrap();
         assert_eq!(works.iter().find(|w| w.path == "/g/1/").unwrap().updated_at, 100, "untouched");
         assert_eq!(works.iter().find(|w| w.path == "/g/3/").unwrap().updated_at, 200);
 
         // a title that changed is written, and it is not a new work
         let new = store.save("q", "A", 300, &Ok(vec![link("/g/1/", "One (2nd)")]), false).await.unwrap();
         assert!(new.is_empty());
-        let one = store.candidates(&[]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
+        let one = store.candidates_owned(&[]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
         assert_eq!((one.title.as_str(), one.updated_at, one.first_seen), ("One (2nd)", 300, 100));
         assert_eq!(one.title_key, "one(2nd)", "the key follows the title");
     }
@@ -1139,7 +1169,7 @@ mod tests {
             .await
             .unwrap();
 
-        let saved = store.candidates(&[]).await.unwrap();
+        let saved = store.candidates_owned(&[]).await.unwrap();
         let mut paths: Vec<_> = saved.iter().map(|w| (w.path.as_str(), w.title.as_str(), w.first_seen)).collect();
         paths.sort();
 
@@ -1153,7 +1183,7 @@ mod tests {
         // the list of the first query follows the rename, so it is not read as a work that is gone
         let gone = store.save("q", "A", 300, &Ok(vec![link("/g/1", "One (new title)")]), true).await.unwrap();
         assert!(gone.is_empty());
-        assert!(store.candidates(&[]).await.unwrap().iter().any(|w| w.path == "/g/1"));
+        assert!(store.candidates_owned(&[]).await.unwrap().iter().any(|w| w.path == "/g/1"));
     }
 
     #[tokio::test]
@@ -1165,7 +1195,7 @@ mod tests {
         assert_eq!(store.due_checks("Site", 0, 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
 
         store.record_checks("Site", &[("/a".into(), true), ("/b".into(), false)], 200).await.unwrap();
-        assert_eq!(paths(store.candidates(&["title"]).await.unwrap()).await, ["/b"], "the work that is gone is not found: its title is blank");
+        assert_eq!(paths(store.candidates_owned(&["title"]).await.unwrap()).await, ["/b"], "the work that is gone is not found: its title is blank");
         assert!(store.due_checks("Site", 150, 10).await.unwrap().is_empty(), "looked at since 150");
         assert_eq!(store.due_checks("Site", 300, 10).await.unwrap(), ["/b"], "a look that is old is made again; /a is not a work any more");
         assert!(store.works_after(None, 10).await.unwrap().iter().all(|w| w.path != "/a"), "an export or a rewrite does not see it either");
@@ -1175,7 +1205,7 @@ mod tests {
         store.save_crawled("Site", 300, &[work("/a"), work("/d")], None).await.unwrap();
         let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), title_key: "titlea".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None };
         assert_eq!(store.import_works(vec![gone]).await.unwrap(), 0);
-        let mut found = paths(store.candidates(&["title"]).await.unwrap()).await;
+        let mut found = paths(store.candidates_owned(&["title"]).await.unwrap()).await;
         found.sort();
         assert_eq!(found, ["/b", "/c", "/d"]);
         assert_eq!(store.due_checks("Site", 400, 10).await.unwrap(), ["/c", "/d", "/b"], "the works never looked at first, then the oldest look");
@@ -1234,7 +1264,7 @@ mod tests {
         store.save("q", "A", 1, &Ok(vec![link("/g/1/", "on A")]), false).await.unwrap();
         store.save("q", "B", 1, &Ok(vec![link("/g/1/", "on B")]), false).await.unwrap();
 
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 2);
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1244,7 +1274,7 @@ mod tests {
         store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One"), link("/g/2/", "Two")]), false).await.unwrap();
         store.save("q", "A", 200, &Ok(vec![link("/g/2/", "Two")]), false).await.unwrap();
 
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 2, "the list may have been cut short");
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 2, "the list may have been cut short");
     }
 
     #[tokio::test]
@@ -1252,17 +1282,17 @@ mod tests {
         let store = SearchStore::in_memory().await.unwrap();
 
         store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One"), link("/g/2/", "Two"), link("/g/3/", "Three")]), true).await.unwrap();
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 3);
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 3);
 
         // a failure changes nothing: the old works are all there
         store.save("q", "A", 150, &Err("HTTP 500".to_string()), true).await.unwrap();
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 3);
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 3);
 
         // the next whole list has no /g/1/ and no /g/3/: they are gone; /g/4/ is new
         let new = store.save("q", "A", 200, &Ok(vec![link("/g/2/", "Two"), link("/g/4/", "Four")]), true).await.unwrap();
 
         assert_eq!(new, ["/g/4/"]);
-        let mut paths: Vec<String> = store.candidates(&[]).await.unwrap().into_iter().map(|w| w.path).collect();
+        let mut paths: Vec<String> = store.candidates_owned(&[]).await.unwrap().into_iter().map(|w| w.path).collect();
         paths.sort();
         assert_eq!(paths, ["/g/2/", "/g/4/"]);
     }
@@ -1278,7 +1308,7 @@ mod tests {
         // q1 no longer lists anything on A: /g/2/ of A is gone, /g/1/ of A is still listed by q2, /g/2/ of B is not A's
         store.save("q1", "A", 200, &Ok(vec![]), true).await.unwrap();
 
-        let mut found: Vec<(String, String)> = store.candidates(&[]).await.unwrap().into_iter().map(|w| (w.website, w.path)).collect();
+        let mut found: Vec<(String, String)> = store.candidates_owned(&[]).await.unwrap().into_iter().map(|w| (w.website, w.path)).collect();
         found.sort();
         assert_eq!(found, [("A".to_string(), "/g/1/".to_string()), ("B".to_string(), "/g/2/".to_string())]);
     }
@@ -1309,7 +1339,7 @@ mod tests {
         store.save("q", "A", 100, &Ok(vec![link("/g/1/", "One")]), true).await.unwrap();
         store.save("q", "A", 200, &Ok(vec![]), true).await.unwrap();
 
-        let paths: Vec<String> = store.candidates(&[]).await.unwrap().into_iter().map(|w| w.path).collect();
+        let paths: Vec<String> = store.candidates_owned(&[]).await.unwrap().into_iter().map(|w| w.path).collect();
         assert_eq!(paths, ["/old"]);
     }
 
@@ -1322,7 +1352,7 @@ mod tests {
 
         let state = &store.states("q").await.unwrap()["A"];
         assert_eq!((state.ok, state.error.as_deref(), state.searched_at, state.count), (false, Some("HTTP 500"), 200, 1));
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 1);
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 1);
 
         store.save("q", "B", 300, &Err("blocked".to_string()), false).await.unwrap();
         assert!(!store.states("q").await.unwrap()["B"].ok);
@@ -1342,12 +1372,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(titles(&store.candidates(&["comic快楽天"]).await.unwrap()), ["COMIC 快楽天 2026年7月号"], "spaces are not in the key");
-        assert_eq!(titles(&store.candidates(&["comicexe"]).await.unwrap()), ["COMIC E×E 11"], "nor is the sign");
-        assert_eq!(store.candidates(&["nothing"]).await.unwrap().len(), 0);
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 3);
+        assert_eq!(titles(&store.candidates_owned(&["comic快楽天"]).await.unwrap()), ["COMIC 快楽天 2026年7月号"], "spaces are not in the key");
+        assert_eq!(titles(&store.candidates_owned(&["comicexe"]).await.unwrap()), ["COMIC E×E 11"], "nor is the sign");
+        assert_eq!(store.candidates_owned(&["nothing"]).await.unwrap().len(), 0);
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 3);
         // a % or a _ in the prefilter is a character, not a wildcard
-        assert_eq!(store.candidates(&["%"]).await.unwrap().len(), 0);
+        assert_eq!(store.candidates_owned(&["%"]).await.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -1358,7 +1388,7 @@ mod tests {
         store.save("new", "A", 200, &Ok(vec![link("/2", "newer")]), false).await.unwrap();
         store.save("same", "A", 200, &Ok(vec![link("/3", "also newer")]), false).await.unwrap();
 
-        assert_eq!(titles(&store.candidates(&[]).await.unwrap()), ["newer", "also newer", "older"], "ties keep the order they were saved in");
+        assert_eq!(titles(&store.candidates_owned(&[]).await.unwrap()), ["newer", "also newer", "older"], "ties keep the order they were saved in");
     }
 
     #[tokio::test]
@@ -1372,17 +1402,21 @@ mod tests {
         drop(store);
 
         let again = SearchStore::open(&path).await.unwrap();
-        assert_eq!(titles(&again.candidates(&[]).await.unwrap()), ["One"]);
+        assert_eq!(titles(&again.candidates_owned(&[]).await.unwrap()), ["One"]);
         drop(again);
 
         let _ = fs::remove_dir_all(dir);
     }
     /// What `instr` says: the works (the newest first) whose key has the piece.
     async fn by_instr(store: &SearchStore, part: &str, most: usize) -> Vec<String> {
-        store.candidates(&[]).await.unwrap().into_iter().filter(|w| w.title_key.contains(part)).take(most).map(|w| w.path).collect()
+        store.candidates_owned(&[]).await.unwrap().into_iter().filter(|w| w.title_key.contains(part)).take(most).map(|w| w.path).collect()
     }
 
     async fn paths(works: Vec<Work>) -> Vec<String> {
+        works.into_iter().map(|w| w.path).collect()
+    }
+
+    async fn paths_of_candidates(works: Vec<Candidate>) -> Vec<String> {
         works.into_iter().map(|w| w.path).collect()
     }
 
@@ -1416,12 +1450,12 @@ mod tests {
 
         // 3 characters or more: by the index; 2 or fewer: by instr; with a character that is not a letter
         for part in ["kyoudai", "comic", "shitara", "deshi", "idai", "kyo", "ane", "(2nd)", "nothere", "\"", "kyoudai\""] {
-            let found = paths(store.candidates(&[part]).await.unwrap()).await;
+            let found = paths(store.candidates_owned(&[part]).await.unwrap()).await;
 
             assert_eq!(found, by_instr(&store, part, usize::MAX).await, "{part}");
         }
         // the newest first
-        assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/6/", "/g/1/", "/g/2/"]);
+        assert_eq!(paths(store.candidates_owned(&["kyoudai"]).await.unwrap()).await, ["/g/6/", "/g/1/", "/g/2/"]);
     }
 
     #[tokio::test]
@@ -1434,13 +1468,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(paths(store.candidates(&["ai"]).await.unwrap()).await, ["/g/1/", "/g/3/"], "not maid, main or kai (saved in the same second: the order they were saved in)");
+        assert_eq!(paths(store.candidates_owned(&["ai"]).await.unwrap()).await, ["/g/1/", "/g/3/"], "not maid, main or kai (saved in the same second: the order they were saved in)");
         // a title that changes leaves and enters the index
-        let one = store.candidates(&["ai"]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
+        let one = store.candidates_owned(&["ai"]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
         store.rewrite_romaji(&[(one, "plain".into())]).await.unwrap();
-        assert_eq!(paths(store.candidates(&["ai"]).await.unwrap()).await, ["/g/3/"]);
+        assert_eq!(paths(store.candidates_owned(&["ai"]).await.unwrap()).await, ["/g/3/"]);
         // a short piece that is not letters and digits is still a part of the key
-        assert_eq!(store.candidates(&["!"]).await.unwrap().len(), 1);
+        assert_eq!(store.candidates_owned(&["!"]).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1449,12 +1483,12 @@ mod tests {
         let work = |n: usize| NewWork { path: format!("/g/{n}/"), title: "ai item".into(), romaji: "ai item".into(), language: None };
 
         store.save_crawled("A", 1, &(0..10).map(work).collect::<Vec<_>>(), None).await.unwrap();
-        assert_eq!(store.candidates(&["item"]).await.unwrap().len(), 10);
+        assert_eq!(store.candidates_owned(&["item"]).await.unwrap().len(), 10);
 
         store.set_max_candidates(4);
-        assert_eq!(store.candidates(&["item"]).await.unwrap().len(), 4, "a long word, and the saved set is forgotten");
-        assert_eq!(store.candidates(&["ai"]).await.unwrap().len(), 4, "a short word");
-        assert_eq!(store.candidates(&[]).await.unwrap().len(), 4, "no word at all");
+        assert_eq!(store.candidates_owned(&["item"]).await.unwrap().len(), 4, "a long word, and the saved set is forgotten");
+        assert_eq!(store.candidates_owned(&["ai"]).await.unwrap().len(), 4, "a short word");
+        assert_eq!(store.candidates_owned(&[]).await.unwrap().len(), 4, "no word at all");
     }
 
     #[tokio::test]
@@ -1462,8 +1496,8 @@ mod tests {
         let store = some_works().await;
 
         // "kyoudai" is in 3 works: with at most 2 it is the newest 2; with 3 it is all of them
-        assert_eq!(paths(store.candidates_up_to(&["kyoudai"], 2).await.unwrap()).await, by_instr(&store, "kyoudai", 2).await);
-        assert_eq!(paths(store.candidates_up_to(&["kyoudai"], 3).await.unwrap()).await, by_instr(&store, "kyoudai", 3).await);
+        assert_eq!(paths_of_candidates(store.candidates_up_to(&["kyoudai"], 2).await.unwrap()).await, by_instr(&store, "kyoudai", 2).await);
+        assert_eq!(paths_of_candidates(store.candidates_up_to(&["kyoudai"], 3).await.unwrap()).await, by_instr(&store, "kyoudai", 3).await);
         assert_eq!(store.candidates_up_to(&["kyoudai"], 3).await.unwrap().len(), 3);
     }
 
@@ -1472,17 +1506,17 @@ mod tests {
         let store = some_works().await;
 
         // a new romaji of /g/2/ (the same row, another key)
-        let work = store.candidates(&["comic"]).await.unwrap().into_iter().find(|w| w.path == "/g/2/").unwrap();
+        let work = store.candidates_owned(&["comic"]).await.unwrap().into_iter().find(|w| w.path == "/g/2/").unwrap();
         store.rewrite_romaji(&[(work, "totally different".into())]).await.unwrap();
-        assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/6/", "/g/1/"]);
-        assert_eq!(paths(store.candidates(&["different"]).await.unwrap()).await, ["/g/2/"]);
+        assert_eq!(paths(store.candidates_owned(&["kyoudai"]).await.unwrap()).await, ["/g/6/", "/g/1/"]);
+        assert_eq!(paths(store.candidates_owned(&["different"]).await.unwrap()).await, ["/g/2/"]);
 
         // a removed work
         store.db.execute_unprepared("DELETE FROM works WHERE path = '/g/1/'").await.unwrap();
         // (another process wrote it: the kept candidates are old when their time is over)
         store.forget_candidates();
-        assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/6/"]);
-        assert_eq!(paths(store.candidates(&["shitara"]).await.unwrap()).await, ["/g/4/"]);
+        assert_eq!(paths(store.candidates_owned(&["kyoudai"]).await.unwrap()).await, ["/g/6/"]);
+        assert_eq!(paths(store.candidates_owned(&["shitara"]).await.unwrap()).await, ["/g/4/"]);
     }
 
     #[tokio::test]
@@ -1504,8 +1538,8 @@ mod tests {
         drop(store);
 
         let store = SearchStore::open(&path).await.unwrap();
-        assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/1/"]);
-        assert_eq!(paths(store.candidates(&["other"]).await.unwrap()).await, ["/g/2/"]);
+        assert_eq!(paths(store.candidates_owned(&["kyoudai"]).await.unwrap()).await, ["/g/1/"]);
+        assert_eq!(paths(store.candidates_owned(&["other"]).await.unwrap()).await, ["/g/2/"]);
 
         fs::remove_dir_all(&dir).ok();
     }

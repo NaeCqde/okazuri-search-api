@@ -683,7 +683,7 @@ mod tests {
 
         crawler.walk(index, &source).await.unwrap();
 
-        let found = store.candidates(&["worknumber100"]).await.unwrap();
+        let found = store.candidates_owned(&["worknumber100"]).await.unwrap();
         assert_eq!(found.iter().map(|work| work.path.as_str()).collect::<Vec<_>>(), ["/work/100"]);
     }
 

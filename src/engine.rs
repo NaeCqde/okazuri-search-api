@@ -801,27 +801,30 @@ impl Engine {
         let candidates = self.store.candidates(&terms.prefilters()).await?;
         let rows = candidates.len();
         laps.lap("candidates");
-        for work in candidates {
-            // a site that is left out does not answer, whatever was saved of it
-            let Some(&index) = self.active.iter().find(|&&i| self.sites[i].def.name == work.website) else { continue };
-            if exclude.contains(&index) {
-                continue;
-            }
 
-            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
-            if terms.matches_title(&work.title_romaji) {
+        // the searched site of a name: found once, not by walking the sites for each of the rows (a site that is left out does not answer,
+        // whatever was saved of it)
+        let site_of: HashMap<&str, usize> = self.active.iter().filter(|index| !exclude.contains(index)).map(|&index| (self.sites[index].def.name, index)).collect();
+        let nothing_is_new = fetched.new.is_empty();
+
+        for work in candidates.iter() {
+            let Some(&index) = site_of.get(work.website.as_str()) else { continue };
+
+            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue); only the
+            // works that have it are copied
+            if terms.matches_romaji(&work.title_romaji, &work.title_key) {
                 let site = &self.sites[index];
-                let is_new = fetched.new.contains(&(work.website.clone(), work.path.clone()));
+                let is_new = !nothing_is_new && fetched.new.contains(&(work.website.clone(), work.path.clone()));
 
                 hits.push(Hit {
-                    website: work.website,
+                    website: work.website.clone(),
                     is_legal: site.def.legal,
                     url: site.address(&work.path),
-                    path: work.path,
-                    title: work.title,
-                    title_romaji: work.title_romaji,
+                    path: work.path.clone(),
+                    title: work.title.clone(),
+                    title_romaji: work.title_romaji.clone(),
                     title_english: None,
-                    language: work.language.map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
+                    language: work.language.as_deref().map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
                     is_new,
                 });
             }
@@ -1817,7 +1820,7 @@ pub(crate) mod tests {
         let done = engine.reromanize_works().await.unwrap();
 
         assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
-        let saved = store.candidates(&[]).await.unwrap();
+        let saved = store.candidates_owned(&[]).await.unwrap();
         let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
         assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
         assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
@@ -2153,7 +2156,7 @@ pub(crate) mod tests {
         // whatever the query, this site lists the same work
         engine.search(&Request::new("anything")).await.unwrap();
 
-        let saved = store.candidates(&[]).await.unwrap();
+        let saved = store.candidates_owned(&[]).await.unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].title, "COMIC快楽天 2026年7月号", "the title as the site writes it");
         assert!(saved[0].title_romaji.contains("kairakuten"), "{}", saved[0].title_romaji);
