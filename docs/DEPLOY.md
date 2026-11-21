@@ -91,7 +91,7 @@ account_id = "<Cloudflare のアカウント ID>"
 database_id = "<D1 データベースの ID>"
 # api_token は環境変数 CLOUDFLARE_API_TOKEN から読む(D1 を編集できる API トークン)
 
-[prefetch]
+[magazine.prefetch]
 enabled = true
 ```
 
