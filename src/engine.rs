@@ -677,22 +677,37 @@ impl Engine {
     /// The answer to a request: the sites are asked (unless the request says not to), and then the saved works
     /// whose title has every word of the query are the result.
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
+        let mut laps = crate::utils::Laps::new();
         let mut outcome = self.search_all(request).await?;
+        laps.lap("search_all");
 
         // `total` is how many works there are, whatever the limit cuts
         outcome.total = outcome.results.len();
         outcome.total_legal = outcome.results.iter().filter(|hit| hit.is_legal).count();
         outcome.total_illegal = outcome.total - outcome.total_legal;
         outcome.results.truncate(request.limit.max(1));
+        laps.lap("count");
         self.fill_english(&mut outcome.results).await?;
+        laps.lap("fill_english");
+
+        log::info!("timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, outcome.total);
 
         Ok(outcome)
     }
 
     /// `search` with every work in `results`: the works of the English (or Japanese) title are in it, once.
     async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
-        let mut outcome = self.search_one(request).await?;
+        let mut laps = crate::utils::Laps::new();
+        let outcome = self.search_one(request).await?;
+        laps.lap("first search");
+        let outcome = self.search_all_more(request, outcome, &mut laps).await;
+        log::info!("timing of the two searches of {:?}: {laps}", request.query);
 
+        outcome
+    }
+
+    /// The rest of `search_all`: the other title is looked for, and searched.
+    async fn search_all_more(self: &Arc<Self>, request: &Request<'_>, mut outcome: Outcome, laps: &mut crate::utils::Laps) -> Result<Outcome> {
         if request.translator == Translator::None {
             return Ok(outcome);
         }
@@ -703,14 +718,18 @@ impl Engine {
                 return Ok(outcome);
             }
 
-            let Some(found) = self.japanese_of(request.query, request.translator, request.live).await else { return Ok(outcome) };
+            let found = self.japanese_of(request.query, request.translator, request.live).await;
+            laps.lap("japanese title");
+            let Some(found) = found else { return Ok(outcome) };
             let text = found.japanese.trim().to_string();
 
             if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
                 return Ok(outcome);
             }
 
-            match self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await {
+            let more = self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await;
+            laps.lap("search of the Japanese title");
+            match more {
                 Ok(more) => {
                     let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
                     let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
@@ -725,14 +744,18 @@ impl Engine {
         }
 
         // the English title: its works are in the answer too. A failure leaves the English search out, not the search
-        let Some(english) = self.english_of(request.query, request.translator, request.live).await else { return Ok(outcome) };
+        let english = self.english_of(request.query, request.translator, request.live).await;
+        laps.lap("english title");
+        let Some(english) = english else { return Ok(outcome) };
         let text = english.english.trim().to_string();
 
         if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
             return Ok(outcome);
         }
 
-        match self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await {
+        let more = self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await;
+        laps.lap("search of the English title");
+        match more {
             Ok(more) => {
                 let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
                 let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
@@ -748,8 +771,10 @@ impl Engine {
 
     /// The search of one query (`search` does it for the English title too). Every work is in `results`, with no English titles yet.
     async fn search_one(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
+        let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.query);
+        laps.lap("plan");
 
         if terms.is_empty() {
             return Err("the query is empty".into());
@@ -762,6 +787,7 @@ impl Engine {
             exclude.push(index);
         }
         let exclude = exclude.as_slice();
+        laps.lap("hitomi list");
 
         let fetched = match request.live {
             Live::Off => Fetched::default(),
@@ -769,42 +795,56 @@ impl Engine {
             Live::Force => self.fetch_with(request.query, true, true, exclude).await?,
         };
 
-        let mut hits: Vec<Hit> = Vec::new();
-        for work in self.store.candidates(&terms.prefilters()).await? {
-            // a site that is left out does not answer, whatever was saved of it
-            let Some(&index) = self.active.iter().find(|&&i| self.sites[i].def.name == work.website) else { continue };
-            if exclude.contains(&index) {
-                continue;
-            }
+        laps.lap("sites asked");
 
-            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
-            if terms.matches_title(&work.title_romaji) {
+        let mut hits: Vec<Hit> = Vec::new();
+        let candidates = self.store.candidates(&terms.prefilters()).await?;
+        let rows = candidates.len();
+        laps.lap("candidates");
+
+        // the searched site of a name: found once, not by walking the sites for each of the rows (a site that is left out does not answer,
+        // whatever was saved of it)
+        let site_of: HashMap<&str, usize> = self.active.iter().filter(|index| !exclude.contains(index)).map(|&index| (self.sites[index].def.name, index)).collect();
+        let nothing_is_new = fetched.new.is_empty();
+
+        for work in candidates.iter() {
+            let Some(&index) = site_of.get(work.website.as_str()) else { continue };
+
+            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue); only the
+            // works that have it are copied
+            if terms.matches_romaji(&work.title_romaji, &work.title_key) {
                 let site = &self.sites[index];
-                let is_new = fetched.new.contains(&(work.website.clone(), work.path.clone()));
+                let is_new = !nothing_is_new && fetched.new.contains(&(work.website.clone(), work.path.clone()));
 
                 hits.push(Hit {
-                    website: work.website,
+                    website: work.website.clone(),
                     is_legal: site.def.legal,
                     url: site.address(&work.path),
-                    path: work.path,
-                    title: work.title,
-                    title_romaji: work.title_romaji,
+                    path: work.path.clone(),
+                    title: work.title.clone(),
+                    title_romaji: work.title_romaji.clone(),
                     title_english: None,
-                    language: work.language.map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
+                    language: work.language.as_deref().map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
                     is_new,
                 });
             }
         }
+
+        laps.lap("match");
 
         // the sites in their order; in a site, the works seen last come first (the order of the database)
         hits.sort_by_key(|hit| self.order.get(hit.website.as_str()).copied().unwrap_or(usize::MAX));
 
         let hits = dedupe_by_url(hits);
         let total = hits.len();
+        laps.lap("sort");
+        let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
+        laps.lap("site reports");
+        log::info!("timing of the search of {:?} ({rows} candidates, {total} works): {laps}", request.query);
 
         Ok(Outcome {
             sites: {
-                let mut sites = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
+                let mut sites = reports;
                 if let Some(index) = unlisted.filter(|index| !request.exclude.contains(index)) {
                     sites.push(SiteReport {
                         website: self.sites[index].def.name.to_string(),
@@ -1166,17 +1206,22 @@ impl Engine {
             return Ok((Vec::new(), true));
         }
 
+        let mut laps = crate::utils::Laps::new();
         let saved = self.store.translations(&key, "hitomi").await?;
+        laps.lap("saved");
 
         if live != Live::Force && !saved.is_empty() {
+            log::info!("timing of the Hitomi.La translation of {text:?}: {laps}");
             return Ok((saved.into_iter().map(Translation::from).collect(), true));
         }
 
         // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
         if live != Live::Force {
             let others = self.store.translations_with("hitomi", from == Lang::English, &key, false, 20).await?;
+            laps.lap("other direction");
 
             if !others.is_empty() {
+                log::info!("timing of the Hitomi.La translation of {text:?}: {laps}");
                 let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english_key.clone() } else { row.japanese_key.clone() };
                 let mut found: Vec<Translation> = others
                     .into_iter()
@@ -1198,9 +1243,12 @@ impl Engine {
         }
 
         let found = self.ask_translations(text, from).await?;
+        laps.lap("asked the site");
         let rows: Vec<_> = found.iter().enumerate().map(|(place, found)| found.row(place as i64)).collect();
 
         self.store.save_translations(&key, "hitomi", text.trim(), from.code(), unix_now(), &rows).await?;
+        laps.lap("save");
+        log::info!("timing of the Hitomi.La translation of {text:?}: {laps}");
 
         Ok((found, false))
     }
@@ -1216,24 +1264,35 @@ impl Engine {
             return Err("nothing to translate".into());
         }
 
+        let mut laps = crate::utils::Laps::new();
+
         if live != Live::Force {
-            if let Some(row) = self.store.translations(&key, "google").await?.into_iter().next() {
+            let row = self.store.translations(&key, "google").await?.into_iter().next();
+            laps.lap("saved");
+            if let Some(row) = row {
+                log::info!("timing of the Google translation of {text:?}: {laps}");
                 return Ok((Translation::from(row), true));
             }
 
             // the other direction, asked before: its other side is the text
-            if let Some(row) = self.store.translations_with("google", from == Lang::English, &key, true, 1).await?.into_iter().next() {
+            let row = self.store.translations_with("google", from == Lang::English, &key, true, 1).await?.into_iter().next();
+            laps.lap("other direction");
+            if let Some(row) = row {
+                log::info!("timing of the Google translation of {text:?}: {laps}");
                 return Ok((Translation { exact: true, ..Translation::from(row) }, true));
             }
         }
 
         let translated = crate::gtranslate::translate(&self.client, self.bridge(), text.trim(), from, from.other()).await?;
+        laps.lap("asked Google");
         let translated = if from == Lang::Japanese { without_the(&translated) } else { translated };
 
         let (english, japanese) = if from == Lang::English { (text.trim().to_string(), translated) } else { (translated, text.trim().to_string()) };
         let translation = Translation { id: 0, url: String::new(), english, japanese, exact: false, source: "google".into() };
 
         self.store.save_translations(&key, "google", text.trim(), from.code(), unix_now(), &[translation.row(0)]).await?;
+        laps.lap("save");
+        log::info!("timing of the Google translation of {text:?}: {laps}");
 
         Ok((translation, false))
     }
@@ -1761,7 +1820,7 @@ pub(crate) mod tests {
         let done = engine.reromanize_works().await.unwrap();
 
         assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
-        let saved = store.candidates(&[]).await.unwrap();
+        let saved = store.candidates_owned(&[]).await.unwrap();
         let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
         assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
         assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
@@ -2097,7 +2156,7 @@ pub(crate) mod tests {
         // whatever the query, this site lists the same work
         engine.search(&Request::new("anything")).await.unwrap();
 
-        let saved = store.candidates(&[]).await.unwrap();
+        let saved = store.candidates_owned(&[]).await.unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].title, "COMIC快楽天 2026年7月号", "the title as the site writes it");
         assert!(saved[0].title_romaji.contains("kairakuten"), "{}", saved[0].title_romaji);

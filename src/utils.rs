@@ -10,6 +10,35 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The time of each stage of a piece of work: `lap` names the stage that just ended, and `Display` is "stage 12 ms, stage 3 ms".
+pub struct Laps {
+    last: std::time::Instant,
+    stages: Vec<(&'static str, u128)>,
+}
+
+impl Laps {
+    pub fn new() -> Self {
+        Self { last: std::time::Instant::now(), stages: Vec::new() }
+    }
+
+    pub fn lap(&mut self, stage: &'static str) {
+        self.stages.push((stage, self.last.elapsed().as_millis()));
+        self.last = std::time::Instant::now();
+    }
+}
+
+impl std::fmt::Display for Laps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total: u128 = self.stages.iter().map(|(_, ms)| ms).sum();
+
+        for (stage, ms) in &self.stages {
+            write!(f, "{stage} {ms} ms, ")?;
+        }
+
+        write!(f, "total {total} ms")
+    }
+}
+
 /// The distance between a hiragana and the katakana of the same sound.
 const KANA_OFFSET: u32 = 0x60;
 

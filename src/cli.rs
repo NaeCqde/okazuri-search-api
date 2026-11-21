@@ -448,6 +448,7 @@ fn load_romanizer(config: &Config) -> Result<Arc<Romanizer>> {
 async fn open_engine(config: &Config, romanizer: Arc<Romanizer>) -> Result<Arc<Engine>> {
     let store = SearchStore::open(&config.search.db_path).await?;
     store.set_max_candidates(config.search.max_candidates);
+    store.set_candidate_cache_min_ms(config.search.candidate_cache_min_ms);
 
     // the bridge of Google Translate is in [translation], the engine reads it with the settings of the search
     let mut search = config.search.clone();
