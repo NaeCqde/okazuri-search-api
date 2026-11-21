@@ -128,6 +128,29 @@ pub struct TranslationConfig {
     pub google_bridge_url: String,
     /// What the bridge wants in `Authorization: Bearer` (its `BRIDGE_TOKEN`); empty for none.
     pub google_bridge_token: String,
+    /// Translating the titles of the saved works ahead of time (`[translation.fill]`).
+    pub fill: FillConfig,
+}
+
+/// Translating the Japanese titles of the saved works with Google Translate, a few at a time, so that a result has its English title and
+/// a search in English finds it (`fill.rs`). The newest works come first, and a title that has a translation is skipped. Off unless
+/// `enabled` is true.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FillConfig {
+    pub enabled: bool,
+    /// The wait after each title that Google was asked for.
+    pub pause_ms: u64,
+    /// The most titles asked in one round; the next round starts again from the newest works (the ones saved meanwhile come first).
+    pub max_per_round: usize,
+    /// The wait before the next round when the last one did not use `max_per_round` (the titles are all translated, or Google does not answer).
+    pub round_interval_minutes: u64,
+}
+
+impl Default for FillConfig {
+    fn default() -> Self {
+        Self { enabled: false, pause_ms: 3000, max_per_round: 1000, round_interval_minutes: 60 }
+    }
 }
 
 /// The magazines and the works of the Worker's D1 database, copied (`d1.rs`, `mirror.rs`). Off unless `enabled` is true.

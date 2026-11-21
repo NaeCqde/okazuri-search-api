@@ -298,6 +298,15 @@ momon:GA と Nya:Hentai の WordPress API、DLsite、Wnacg、AsmHentai、HentaiE
 - **複数のマシンで:** それぞれに `shard = "k/N"` を指定し、それぞれで `export`(`okazuri-search-api export out.jsonl.br`。JSON Lines を brotli で圧縮)を行い、サーバーで
   `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` を実行します。保存済みの作品はそのままです。
 
+## タイトルの事前翻訳(`[translation.fill]`)
+
+結果の英語タイトル(`title_english`)と、英語での検索は、そのタイトルの翻訳が保存されているときだけ効きます。Hitomi.La のタイトルには翻訳があります(作品が両方のタイトルを持つので)。
+ほかのサイトのタイトルには、翻訳する前は何もありません。`[translation.fill] enabled = true` にすると、サーバーは、保存済みの作品を新しいほうから順に見て、日本語を含み、
+翻訳のないタイトルを、Google 翻訳(`[translation]` のブリッジ)に 1 つずつ尋ねて保存します(`source` は `google`。ずっと残ります)。1 つ尋ねるごとに `pause_ms`(3 秒)待ちます。
+1 回に尋ねるのは `max_per_round`(1000)までで、次の回は、また新しい作品から始めます(その間に保存された作品が先に来ます)。翻訳済みのタイトルは飛ばします。
+Google が 5 回続けて答えなかったときは、その回をやめ、`round_interval_minutes`(60)待ちます。答えがなかったタイトルは、プログラムを起動し直すまで尋ねません。
+検索のリクエストが使うブリッジと同じなので、`pause_ms` を短くしすぎないでください。
+
 ## ページがなくなった作品(`[verify]`)
 
 サイトによっては、ページがなくなった作品を一覧に出し続けます。`[verify] enabled = true` にすると、サーバーは、それが分かるサイト(RokuHentai、DLsite、HentaiEnvy、Nya:Hentai、
