@@ -825,21 +825,16 @@ impl SearchStore {
         let mut query = work::Entity::find();
         // the index is made of pieces of 3 characters: a shorter piece can only be looked for in the rows the others leave
         let (long, short): (Vec<&str>, Vec<&str>) = parts.iter().copied().partition(|part| part.chars().count() >= 3);
-        let mut indexed = false;
-
         if !long.is_empty() {
-            // all the pieces in one MATCH: the works that have every one of them, which is few even when each piece is common
+            // all the pieces in one MATCH: the works that have every one of them. Whatever the number of works is, the index is used: the
+            // newest `most` of them are read through it (walking the works from the newest and looking at every title reads a table of
+            // gigabytes, row by row, for a piece that many works have)
             let phrases = long.iter().map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(" AND ");
 
-            if self.within(&phrases, most).await? {
-                query = query.filter(Expr::cust_with_values("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)", [phrases]));
-                indexed = true;
-            }
+            query = query.filter(Expr::cust_with_values("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)", [phrases]));
         }
-        // no index (the pieces together are in more than `most` works, or there is no piece of 3): the works are walked from the newest,
-        // which stops after `most` of them
-        let walked = if indexed { short } else { parts.to_vec() };
-        for part in walked {
+        // the pieces of less than 3 characters are looked for in the works the others leave (in all the works when there is no other)
+        for part in short {
             query = query.filter(Expr::cust_with_values("instr(title_key, ?) > 0", [part]));
         }
 
@@ -850,23 +845,6 @@ impl SearchStore {
             .limit(most)
             .all(&self.db)
             .await?)
-    }
-
-    /// Do no more than `most` works match (the FTS5 query `phrases`)? Counts only up to `most + 1`, so a common piece is not counted
-    /// to its end.
-    async fn within(&self, phrases: &str, most: u64) -> Result<bool> {
-        let row = self
-            .db
-            .query_one(Statement::from_sql_and_values(
-                self.db.get_database_backend(),
-                "SELECT count(*) AS n FROM (SELECT 1 FROM works_fts WHERE works_fts MATCH ? LIMIT ?)",
-                [phrases.into(), (most + 1).into()],
-            ))
-            .await?
-            .ok_or("no count")?;
-        let found: i64 = row.try_get("", "n")?;
-
-        Ok(found as u64 <= most)
     }
 
     /// How many queries and works are saved (for the tests).
@@ -1264,15 +1242,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_piece_that_too_many_works_have_is_read_from_the_newest_up_to_the_most() {
+    async fn a_piece_that_many_works_have_gives_the_newest_up_to_the_most() {
         let store = some_works().await;
 
-        // "kyoudai" is in 3 works: with at most 2 it is the newest 2 (by instr, which stops there); with 3 it is all of them (by the index)
+        // "kyoudai" is in 3 works: with at most 2 it is the newest 2; with 3 it is all of them
         assert_eq!(paths(store.candidates_up_to(&["kyoudai"], 2).await.unwrap()).await, by_instr(&store, "kyoudai", 2).await);
         assert_eq!(paths(store.candidates_up_to(&["kyoudai"], 3).await.unwrap()).await, by_instr(&store, "kyoudai", 3).await);
         assert_eq!(store.candidates_up_to(&["kyoudai"], 3).await.unwrap().len(), 3);
-        assert!(store.within("\"kyoudai\"", 3).await.unwrap());
-        assert!(!store.within("\"kyoudai\"", 2).await.unwrap(), "3 works have it, and 2 is the most");
     }
 
     #[tokio::test]
@@ -1391,7 +1367,7 @@ mod tests {
         // a short word is looked for in the works the long ones leave, and a piece that nothing has finds nothing
         assert_eq!(store.candidates_up_to(&["alpha", "ra"], 5).await.unwrap().len(), 1);
         assert_eq!(store.candidates_up_to(&["alpha", "zz"], 5).await.unwrap().len(), 0);
-        // the words that are common together are walked from the newest, up to the most
+        // the words that are common together: the newest, up to the most
         assert_eq!(store.candidates_up_to(&["item", "ite"], 4).await.unwrap().len(), 4);
     }
 }
