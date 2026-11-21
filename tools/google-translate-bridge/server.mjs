@@ -21,7 +21,7 @@
 //   MIN_DELAY_MS  the least time between two translations (default 1500)
 //   HEADLESS      0 shows the window of Chrome (default 1)
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,10 +34,18 @@ const PROFILE = resolve(process.env.PROFILE ?? fileURLToPath(new URL('./profile'
 const MIN_DELAY_MS = Number(process.env.MIN_DELAY_MS ?? 1500);
 const HEADLESS = (process.env.HEADLESS ?? '1') !== '0';
 const ANSWER_TIMEOUT_MS = 30_000;
+// A call to Chrome that is not answered, and a text that takes longer than this in all, mean that Chrome is stuck: it is started again.
+const CALL_TIMEOUT_MS = 20_000;
+const JOB_TIMEOUT_MS = 50_000;
+// Failures of the page itself (Google did not answer) in a row, after which Chrome is started again too.
+const MAX_FAILURES = 3;
 const MAX_TEXT_CHARS = 300;
 const ADVANCED = 1;
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+/** Chrome does not answer (or is gone): a reason to start it again, not a failure of one text. */
+class StuckError extends Error {}
 
 /** A minimal client of the DevTools protocol of Chrome. */
 class Cdp {
@@ -46,6 +54,10 @@ class Cdp {
     this.last = 0;
     this.pending = new Map();
     this.listeners = new Set();
+    socket.addEventListener('close', () => {
+      for (const waiting of this.pending.values()) waiting.reject(new Error('the DevTools socket closed'));
+      this.pending.clear();
+    });
     socket.addEventListener('message', (event) => {
       const message = JSON.parse(event.data);
       if (message.id) {
@@ -58,11 +70,21 @@ class Cdp {
     });
   }
 
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = CALL_TIMEOUT_MS) {
     const id = ++this.last;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params, sessionId }));
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new StuckError(`${method} was not answered in ${timeoutMs / 1000} seconds`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
+      try {
+        this.socket.send(JSON.stringify({ id, method, params, sessionId }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new StuckError(error.message));
+      }
     });
   }
 
@@ -73,6 +95,8 @@ class Cdp {
 }
 
 function startChrome() {
+  // a Chrome that a bridge before this one (or a crash) left on the profile would refuse this one: it is killed first
+  spawnSync('pkill', ['-9', '-f', `--user-data-dir=${PROFILE}`]);
   return new Promise((resolveStart, reject) => {
     const proc = spawn(
       CHROME,
@@ -116,11 +140,64 @@ async function openPage() {
   return { proc, cdp, sessionId, call };
 }
 
-const pagePromise = openPage();
-pagePromise.catch((error) => {
-  console.error(`cannot start Chrome: ${error.message}`);
-  process.exit(1);
-});
+let pagePromise = null;
+let restarts = 0;
+let failures = 0;
+
+/** Chrome with its page; started when it is wanted, and again after `restartBrowser`. */
+function getPage() {
+  if (pagePromise) return pagePromise;
+
+  const promise = openPage();
+  pagePromise = promise;
+  promise.then(
+    (page) => {
+      const gone = (why) => {
+        if (pagePromise !== promise) return;
+        console.error(`${why}: Chrome is started again at the next text`);
+        pagePromise = null;
+        resetState();
+      };
+      page.proc.on('exit', (code) => gone(`Chrome exited with ${code}`));
+      page.cdp.socket.addEventListener('close', () => gone('the DevTools socket closed'));
+    },
+    (error) => {
+      console.error(`cannot start Chrome: ${error.message}`);
+      if (pagePromise === promise) pagePromise = null;
+    },
+  );
+
+  return promise;
+}
+
+/** Kills Chrome and all the processes under it (its helpers), the children first. */
+function killChrome(proc) {
+  let pids = [proc.pid];
+  try {
+    const table = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' }).stdout.trim().split('\n').map((line) => line.trim().split(/\s+/).map(Number));
+    for (let i = 0; i < pids.length; i++) for (const [pid, ppid] of table) if (ppid === pids[i] && !pids.includes(pid)) pids.push(pid);
+  } catch {
+    // the tree is not known: only Chrome itself is killed
+  }
+  for (const pid of pids.reverse()) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // gone already
+    }
+  }
+}
+
+/** Kills Chrome (and its page) and forgets the state of the page: the next text starts a new one. */
+function restartBrowser(reason) {
+  const old = pagePromise;
+  pagePromise = null;
+  restarts++;
+  failures = 0;
+  console.error(`restarting Chrome (${restarts}): ${reason}`);
+  resetState();
+  old?.then((page) => killChrome(page.proc)).catch(() => {});
+}
 
 // What the page may do: its request for the translation is taken (and failed, so that Google does not get it twice), what it does
 // not need to make one (images, fonts, the other RPCs) is failed, and while `letThrough` is set everything goes on (to choose 高度).
@@ -134,6 +211,15 @@ let warm = false; // the page is open, and the next text can be given to it with
 let uses = 0;
 let chosen = false;
 let handlerSet = false;
+
+function resetState() {
+  waiting = null;
+  letThrough = false;
+  warm = false;
+  uses = 0;
+  chosen = false;
+  handlerSet = false;
+}
 
 async function setUp({ cdp, sessionId, call }) {
   if (handlerSet) return;
@@ -237,7 +323,7 @@ async function chooseAdvanced(page, text, from, to) {
 }
 
 async function token(text, from, to) {
-  const page = await pagePromise;
+  const page = await getPage();
   await setUp(page);
   let got = await request(page, text, from, to);
 
@@ -254,10 +340,32 @@ async function token(text, from, to) {
   return { model: got.model, request: { url: got.url, headers: got.headers, body: got.body } };
 }
 
+/** One text, with a limit of time. Chrome that does not answer (or a text that takes too long) is started again, and so is Chrome
+ * after `MAX_FAILURES` texts in a row that the page did not make a request for. */
+async function guarded(job) {
+  let timer;
+  try {
+    const result = await Promise.race([
+      job(),
+      new Promise((_, reject) => (timer = setTimeout(() => reject(new StuckError(`the text took more than ${JOB_TIMEOUT_MS / 1000} seconds`)), JOB_TIMEOUT_MS))),
+    ]);
+    failures = 0;
+
+    return result;
+  } catch (error) {
+    if (error instanceof StuckError) restartBrowser(error.message);
+    else if (++failures >= MAX_FAILURES) restartBrowser(`${failures} texts in a row failed (${error.message})`);
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // one text at a time, with a pause between two
 let queue = Promise.resolve();
 function enqueue(job) {
-  const run = queue.then(job);
+  const run = queue.then(() => guarded(job));
   queue = run.catch(() => {}).then(() => sleep(MIN_DELAY_MS));
   return run;
 }
@@ -272,7 +380,7 @@ const languages = new Set(['ja', 'en']);
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
-  if (url.pathname === '/health') return reply(res, 200, { ok: true, warm, uses });
+  if (url.pathname === '/health') return reply(res, 200, { ok: true, warm, uses, restarts });
   if (url.pathname !== '/token') return reply(res, 404, { error: 'not found' });
   if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return reply(res, 401, { error: 'unauthorized' });
 
@@ -292,11 +400,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => console.error(`google-translate-bridge on http://${HOST}:${PORT}`));
+getPage(); // Chrome is started now, so that the first text does not wait for it
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
     try {
-      (await pagePromise).proc.kill();
+      const page = await pagePromise;
+      if (page) killChrome(page.proc);
     } finally {
       process.exit(0);
     }
