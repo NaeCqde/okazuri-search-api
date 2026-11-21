@@ -898,7 +898,11 @@ impl SearchStore {
     }
 
     async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Vec<Work>> {
-        let mut query = work::Entity::find();
+        use sea_orm::Value;
+
+        let mut filters: Vec<&str> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+
         // the index is made of pieces of 3 characters: a shorter piece can only be looked for in the rows the others leave
         let (long, short): (Vec<&str>, Vec<&str>) = parts.iter().copied().partition(|part| part.chars().count() >= 3);
         if !long.is_empty() {
@@ -907,20 +911,30 @@ impl SearchStore {
             // gigabytes, row by row, for a piece that many works have)
             let phrases = long.iter().map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(" AND ");
 
-            query = query.filter(Expr::cust_with_values("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)", [phrases]));
+            filters.push("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)");
+            values.push(phrases.into());
         }
         // the pieces of less than 3 characters are looked for in the works the others leave (in all the works when there is no other)
         for part in short {
-            query = query.filter(Expr::cust_with_values("instr(title_key, ?) > 0", [part]));
+            filters.push("instr(title_key, ?) > 0");
+            values.push(part.into());
         }
 
-        Ok(query
-            .order_by_desc(work::Column::UpdatedAt)
-            // works saved at the same second keep the order they were saved in
-            .order_by_asc(Expr::cust("rowid"))
-            .limit(most)
-            .all(&self.db)
-            .await?)
+        // Only the row numbers and the dates are sorted (the newest `most` of them), and the rows are read after that: sorting whole rows
+        // (their titles are most of the bytes) takes twice as long for a piece that 300,000 works have. Works saved at the same second keep
+        // the order they were saved in.
+        let condition = if filters.is_empty() { String::new() } else { format!("WHERE {}", filters.join(" AND ")) };
+        values.push((most as i64).into());
+        let statement = Statement::from_sql_and_values(
+            self.db.get_database_backend(),
+            format!(
+                "SELECT w.* FROM works w JOIN (SELECT rowid AS r, updated_at AS u FROM works {condition} ORDER BY updated_at DESC, rowid ASC LIMIT ?) x \
+                 ON w.rowid = x.r ORDER BY x.u DESC, x.r ASC"
+            ),
+            values,
+        );
+
+        Ok(work::Entity::find().from_raw_sql(statement).all(&self.db).await?)
     }
 
     /// How many queries and works are saved (for the tests).
