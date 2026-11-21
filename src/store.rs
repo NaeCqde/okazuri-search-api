@@ -52,11 +52,11 @@ pub struct NewWork {
 /// A saved work.
 pub type Work = work::Model;
 
-/// The most rows `find` reads: a word that is in nearly every title would read the whole table.
-const MAX_CANDIDATES: u64 = 50_000;
-
-/// How many words keep their candidates in memory (a set of them is up to `MAX_CANDIDATES` rows).
+/// How many words keep their candidates in memory.
 const CACHED_CANDIDATE_SETS: usize = 8;
+
+/// A set of more rows than this is not kept (there is no cap on the rows read, and eight sets of 300,000 rows would be gigabytes).
+const MOST_KEPT_ROWS: usize = 50_000;
 
 /// How long the candidates of a word are kept: the crawlers and the other processes write the same file, and this process cannot see it.
 const CANDIDATES_LIFETIME: Duration = Duration::from_secs(300);
@@ -861,11 +861,10 @@ impl SearchStore {
         Ok(forgotten)
     }
 
-    /// The works whose title key has every one of `parts` in it (all works for none), the most recently saved first, at most
-    /// `MAX_CANDIDATES`. This only narrows the rows; the caller still matches every word of its query.
+    /// The works whose title key has every one of `parts` in it (all works for none), the most recently saved first, all of them
+    /// (there is no cap: a word that many works have is read whole). This only narrows the rows; the caller still matches every word of its query.
     ///
-    /// The rows of a word are kept for `CANDIDATES_LIFETIME` (reading up to 50,000 rows of a table of gigabytes takes seconds for a word that many works
-    /// have), and forgotten when this process writes a work.
+    /// The rows of a word are kept for `CANDIDATES_LIFETIME` (reading the rows of a table of gigabytes takes seconds for a word that many works have), and forgotten when this process writes a work.
     pub async fn candidates(&self, parts: &[&str]) -> Result<Vec<Work>> {
         let key = parts.join("\u{1}");
 
@@ -873,7 +872,11 @@ impl SearchStore {
             return Ok(kept.as_ref().clone());
         }
 
-        let found = Arc::new(self.candidates_up_to(parts, MAX_CANDIDATES).await?);
+        let found = Arc::new(self.candidates_up_to(parts, i64::MAX as u64).await?);
+
+        if found.len() > MOST_KEPT_ROWS {
+            return Ok(Arc::try_unwrap(found).unwrap_or_else(|shared| shared.as_ref().clone()));
+        }
 
         let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
         sets.retain(|(kept, ..)| *kept != key);
