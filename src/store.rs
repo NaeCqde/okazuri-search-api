@@ -906,11 +906,17 @@ impl SearchStore {
     pub async fn candidates(&self, parts: &[&str]) -> Result<Vec<Work>> {
         let key = parts.join("\u{1}");
 
+        let started = Instant::now();
+
         if let Some(kept) = self.kept_candidates(&key) {
-            return Ok(kept.as_ref().clone());
+            let works = kept.as_ref().clone();
+            log::info!("candidates of {parts:?}: {} saved, copied in {} ms", works.len(), started.elapsed().as_millis());
+
+            return Ok(works);
         }
 
         let found = Arc::new(self.candidates_up_to(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed)).await?);
+        log::info!("candidates of {parts:?}: {} read from the database in {} ms", found.len(), started.elapsed().as_millis());
 
         let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
         sets.retain(|(kept, ..)| *kept != key);
