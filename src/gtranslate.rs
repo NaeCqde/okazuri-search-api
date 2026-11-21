@@ -81,12 +81,16 @@ struct Token {
 /// The headers of the page's request that the token is made for (the browser makes the rest, and the token is checked against these).
 const TOKEN_HEADERS: [&str; 5] = ["x-goog-batchexecute-bgr", "content-type", "x-same-domain", "user-agent", "referer"];
 
+/// How long the bridge is waited for. It answers in a few seconds (it takes the texts one at a time, with a pause between two); a bridge that
+/// does not answer is a bridge that is stuck, and a search must not wait a minute for it: the translation is left out and the search goes on.
+const BRIDGE_TIMEOUT_SECS: u64 = 20;
+
 /// The request of the page for this text, with its token, from the bridge.
 async fn token(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: Lang, to: Lang) -> Result<Token, String> {
     let mut request = client
         .get(format!("{}/token", bridge.url.trim_end_matches('/')))
         .query(&[("from", from.code()), ("to", to.code()), ("text", text)])
-        .timeout(std::time::Duration::from_secs(60));
+        .timeout(std::time::Duration::from_secs(BRIDGE_TIMEOUT_SECS));
     if !bridge.token.is_empty() {
         request = request.bearer_auth(bridge.token);
     }
