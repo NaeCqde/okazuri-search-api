@@ -58,6 +58,9 @@ const MAX_CANDIDATES: u64 = 50_000;
 /// How many words keep their candidates in memory (a set of them is up to `MAX_CANDIDATES` rows).
 const CACHED_CANDIDATE_SETS: usize = 8;
 
+/// A word is kept in memory only when reading its rows from the database took this long (milliseconds).
+const CACHE_MIN_MS: u64 = 5000;
+
 /// How long the candidates of a word are kept: the crawlers and the other processes write the same file, and this process cannot see it.
 const CANDIDATES_LIFETIME: Duration = Duration::from_secs(300);
 
@@ -82,6 +85,8 @@ pub struct SearchStore {
     candidate_sets: Mutex<CandidateSets>,
     /// The most rows one search of the database reads (`[search] max_candidates`).
     max_candidates: std::sync::atomic::AtomicU64,
+    /// The milliseconds the read of a word has to take for its rows to be kept (`[search] candidate_cache_min_ms`).
+    cache_min_ms: std::sync::atomic::AtomicU64,
 }
 
 impl SearchStore {
@@ -117,7 +122,7 @@ impl SearchStore {
 
         Self::create_tables(&db).await?;
 
-        Ok(Self { db, candidate_sets: Mutex::new(Vec::new()), max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
+        Ok(Self { db, candidate_sets: Mutex::new(Vec::new()), max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), cache_min_ms: std::sync::atomic::AtomicU64::new(CACHE_MIN_MS) })
     }
 
     async fn create_tables(db: &DatabaseConnection) -> Result<()> {
@@ -931,6 +936,11 @@ impl SearchStore {
         let found = Arc::new(self.candidates_up_to(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed)).await?);
         log::info!("candidates of {parts:?}: {} read from the database in {} ms", found.len(), started.elapsed().as_millis());
 
+        // only a word that was slow to read is kept: the others cost less to read again than the memory they hold
+        if started.elapsed().as_millis() < u128::from(self.cache_min_ms.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Ok(found);
+        }
+
         let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
         sets.retain(|(kept, ..)| *kept != key);
         if sets.len() >= CACHED_CANDIDATE_SETS {
@@ -943,6 +953,12 @@ impl SearchStore {
 
     /// The most rows a search of the database reads, for every word and every condition (the newest ones are kept). It also forgets the
     /// saved candidates: they were cut by the old number.
+    /// The milliseconds the read of a word has to take for its rows to be kept (`[search] candidate_cache_min_ms`); the kept ones are forgotten.
+    pub fn set_candidate_cache_min_ms(&self, milliseconds: u64) {
+        self.cache_min_ms.store(milliseconds, std::sync::atomic::Ordering::Relaxed);
+        self.forget_candidates();
+    }
+
     pub fn set_max_candidates(&self, most: usize) {
         self.max_candidates.store(most as u64, std::sync::atomic::Ordering::Relaxed);
         self.forget_candidates();
@@ -1100,8 +1116,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_word_that_was_slow_to_read_is_kept() {
+        let store = SearchStore::in_memory().await.unwrap();
+        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "Comic One")]), false).await.unwrap();
+
+        // read in a few milliseconds: not worth the memory
+        store.candidates(&["comic"]).await.unwrap();
+        assert!(store.kept_candidates("comic").is_none());
+
+        // every read counts as slow
+        store.set_candidate_cache_min_ms(0);
+        store.candidates(&["comic"]).await.unwrap();
+        assert!(store.kept_candidates("comic").is_some());
+
+        // no read is slow enough: nothing is kept, and what was kept is forgotten
+        store.set_candidate_cache_min_ms(u64::MAX);
+        assert!(store.kept_candidates("comic").is_none());
+        store.candidates(&["comic"]).await.unwrap();
+        assert!(store.kept_candidates("comic").is_none());
+    }
+
+    #[tokio::test]
     async fn the_candidates_of_a_word_are_kept_until_this_process_writes_a_work() {
         let store = SearchStore::in_memory().await.unwrap();
+        store.set_candidate_cache_min_ms(0);
         store.save("q", "A", 100, &Ok(vec![link("/g/1/", "Comic One")]), false).await.unwrap();
 
         assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 1);
