@@ -119,6 +119,12 @@ pub fn romaji(text: &str, romanizer: &crate::romanizer::Romanizer) -> Result<Str
 /// (NFKC: `ＣＯＭＩＣ` is `COMIC`), lower case, `×` as `x`, and no white space at all (sites put a space
 /// into `COMIC 快楽天` and not into `COMIC快楽天`).
 pub fn title_key(text: &str) -> String {
+    // NFKC leaves ASCII as it is, and an ASCII letter has an ASCII lower case: the titles in romaji (every candidate of a search has its title
+    // keyed again) skip the normalization, which is most of the time of this function
+    if text.is_ascii() {
+        return text.chars().filter(|c| !c.is_whitespace()).map(|c| c.to_ascii_lowercase()).collect();
+    }
+
     text.replace('×', "x")
         .nfkc()
         .flat_map(char::to_lowercase)
@@ -266,6 +272,17 @@ impl Terms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_of_an_ascii_text_is_the_same_with_and_without_the_normalization() {
+        let slow = |text: &str| -> String { text.replace('×', "x").nfkc().flat_map(char::to_lowercase).filter(|c| !c.is_whitespace()).collect() };
+
+        for text in ["COMIC Kairakuten 2026 11", "  Tab\tand\nnewline\x0b\x0cand\rreturn ", "work (Series) [English] 100%", "", "ABC-def_GHI.jkl", "\u{7f}\u{1}control"] {
+            assert_eq!(title_key(text), slow(text), "{text:?}");
+        }
+        // a text that is not ASCII still goes through the normalization
+        assert_eq!(title_key("ＣＯＭＩＣ 快楽天 ×"), "comic快楽天x");
+    }
 
     #[test]
     fn the_title_of_the_work_is_what_is_left_without_what_the_site_puts_around_it() {
