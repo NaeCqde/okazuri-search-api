@@ -41,3 +41,11 @@ On the server: `google_bridge_url = "http://100.x.y.z:8130"` and `google_bridge_
 `--disable-blink-features=AutomationControlled` matters: a Chrome that says it is automated gets a token that Google does not
 honour (the answer is then the one without a token). Stop the bridge before starting it again: a Chrome that is still running with the
 same profile makes the new one misbehave. The check of the token can change at any time: the ignored test of `gtranslate.rs` says when.
+
+## When Chrome is stuck
+
+A call to Chrome that is not answered in 20 seconds, or a text that takes more than 50 seconds in all, means that Chrome is stuck (the
+page does not answer, and everything behind it in the queue waited for it for ever before this check): the request fails with 502, Chrome
+and its helper processes are killed, and the next text starts a new Chrome. Chrome is also started again after 3 texts in a row that the
+page made no request for, and when Chrome exits or its DevTools socket closes. A Chrome left on the profile by a crash is killed when a new
+one starts. `/health` has `restarts`, the number of times Chrome was started again.
