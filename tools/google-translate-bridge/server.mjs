@@ -96,7 +96,7 @@ class Cdp {
 
 function startChrome() {
   // a Chrome that a bridge before this one (or a crash) left on the profile would refuse this one: it is killed first
-  spawnSync('pkill', ['-9', '-f', `--user-data-dir=${PROFILE}`]);
+  spawnSync('pkill', ['-9', '-f', '--', `--user-data-dir=${PROFILE}`]);
   return new Promise((resolveStart, reject) => {
     const proc = spawn(
       CHROME,
