@@ -67,6 +67,8 @@ type CandidateSets = Vec<(String, Instant, Arc<Vec<Work>>)>;
 pub struct SearchStore {
     db: DatabaseConnection,
     candidate_sets: Mutex<CandidateSets>,
+    /// The most rows one search of the database reads (`[search] max_candidates`).
+    max_candidates: std::sync::atomic::AtomicU64,
 }
 
 impl SearchStore {
@@ -102,7 +104,7 @@ impl SearchStore {
 
         Self::create_tables(&db).await?;
 
-        Ok(Self { db, candidate_sets: Mutex::new(Vec::new()) })
+        Ok(Self { db, candidate_sets: Mutex::new(Vec::new()), max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
     }
 
     async fn create_tables(db: &DatabaseConnection) -> Result<()> {
@@ -175,6 +177,41 @@ impl SearchStore {
         if works != indexed {
             log::info!("works_fts: indexing {works} works ({indexed} were indexed)");
             db.execute_unprepared("INSERT INTO works_fts(works_fts) VALUES ('rebuild')").await?;
+        }
+
+        Self::create_whole_word_index(db, works).await
+    }
+
+    /// The index of the words of the romaji titles (`works_words`): FTS5 with the unicode61 tokenizer, whose tokens are whole words. A piece
+    /// of less than 3 characters (`ai`) has no trigram, and a search of it by `instr` reads every row (and also finds it inside `maid`); here
+    /// the works that have it as a word are found without reading the others. Kept up to date by three triggers, and made again when it has
+    /// not as many works as the table.
+    async fn create_whole_word_index(db: &DatabaseConnection, works: i64) -> Result<()> {
+        for sql in [
+            "CREATE VIRTUAL TABLE IF NOT EXISTS works_words USING fts5(title_romaji, content='works', content_rowid='rowid', tokenize='unicode61')",
+            "CREATE TRIGGER IF NOT EXISTS works_words_insert AFTER INSERT ON works BEGIN
+                INSERT INTO works_words(rowid, title_romaji) VALUES (new.rowid, new.title_romaji);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS works_words_delete AFTER DELETE ON works BEGIN
+                INSERT INTO works_words(works_words, rowid, title_romaji) VALUES ('delete', old.rowid, old.title_romaji);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS works_words_update AFTER UPDATE OF title_romaji ON works BEGIN
+                INSERT INTO works_words(works_words, rowid, title_romaji) VALUES ('delete', old.rowid, old.title_romaji);
+                INSERT INTO works_words(rowid, title_romaji) VALUES (new.rowid, new.title_romaji);
+            END",
+        ] {
+            db.execute_unprepared(sql).await?;
+        }
+
+        let indexed: i64 = db
+            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS indexed FROM works_words_docsize"))
+            .await?
+            .ok_or("no count")?
+            .try_get("", "indexed")?;
+
+        if works != indexed {
+            log::info!("works_words: indexing {works} works ({indexed} were indexed)");
+            db.execute_unprepared("INSERT INTO works_words(works_words) VALUES ('rebuild')").await?;
         }
 
         Ok(())
@@ -873,7 +910,7 @@ impl SearchStore {
             return Ok(kept.as_ref().clone());
         }
 
-        let found = Arc::new(self.candidates_up_to(parts, MAX_CANDIDATES).await?);
+        let found = Arc::new(self.candidates_up_to(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed)).await?);
 
         let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
         sets.retain(|(kept, ..)| *kept != key);
@@ -883,6 +920,13 @@ impl SearchStore {
         sets.push((key, Instant::now(), found.clone()));
 
         Ok(found.as_ref().clone())
+    }
+
+    /// The most rows a search of the database reads, for every word and every condition (the newest ones are kept). It also forgets the
+    /// saved candidates: they were cut by the old number.
+    pub fn set_max_candidates(&self, most: usize) {
+        self.max_candidates.store(most as u64, std::sync::atomic::Ordering::Relaxed);
+        self.forget_candidates();
     }
 
     fn kept_candidates(&self, key: &str) -> Option<Arc<Vec<Work>>> {
@@ -914,10 +958,16 @@ impl SearchStore {
             filters.push("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)");
             values.push(phrases.into());
         }
-        // the pieces of less than 3 characters are looked for in the works the others leave (in all the works when there is no other)
+        // a short piece of letters and digits is a word (`ai` is not `maid`): the works that have it are found in the word index. Any other
+        // short piece (Japanese, a symbol) is looked for in the works the others leave (in all the works when there is no other)
         for part in short {
-            filters.push("instr(title_key, ?) > 0");
-            values.push(part.into());
+            if part.chars().all(|c| c.is_ascii_alphanumeric()) {
+                filters.push("rowid IN (SELECT rowid FROM works_words WHERE works_words MATCH ?)");
+                values.push(format!("\"{part}\"").into());
+            } else {
+                filters.push("instr(title_key, ?) > 0");
+                values.push(part.into());
+            }
         }
 
         // Only the row numbers and the dates are sorted (the newest `most` of them), and the rows are read after that: sorting whole rows
@@ -1359,13 +1409,46 @@ mod tests {
         let store = some_works().await;
 
         // 3 characters or more: by the index; 2 or fewer: by instr; with a character that is not a letter
-        for part in ["kyoudai", "comic", "shitara", "deshi", "idai", "kyo", "ane", "(2nd)", "de", "ab", "k", "nothere", "\"", "kyoudai\""] {
+        for part in ["kyoudai", "comic", "shitara", "deshi", "idai", "kyo", "ane", "(2nd)", "nothere", "\"", "kyoudai\""] {
             let found = paths(store.candidates(&[part]).await.unwrap()).await;
 
             assert_eq!(found, by_instr(&store, part, usize::MAX).await, "{part}");
         }
         // the newest first
         assert_eq!(paths(store.candidates(&["kyoudai"]).await.unwrap()).await, ["/g/6/", "/g/1/", "/g/2/"]);
+    }
+
+    #[tokio::test]
+    async fn a_short_piece_of_letters_is_a_word_of_the_romaji_and_not_a_part_of_one() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into(), language: None };
+
+        store
+            .save_crawled("A", 1, &[work(1, "AI generated"), work(2, "maid and main"), work(3, "love ai, ai!"), work(4, "kai")], None)
+            .await
+            .unwrap();
+
+        assert_eq!(paths(store.candidates(&["ai"]).await.unwrap()).await, ["/g/1/", "/g/3/"], "not maid, main or kai (saved in the same second: the order they were saved in)");
+        // a title that changes leaves and enters the index
+        let one = store.candidates(&["ai"]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
+        store.rewrite_romaji(&[(one, "plain".into())]).await.unwrap();
+        assert_eq!(paths(store.candidates(&["ai"]).await.unwrap()).await, ["/g/3/"]);
+        // a short piece that is not letters and digits is still a part of the key
+        assert_eq!(store.candidates(&["!"]).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_most_rows_is_a_setting_for_every_word() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let work = |n: usize| NewWork { path: format!("/g/{n}/"), title: "ai item".into(), romaji: "ai item".into(), language: None };
+
+        store.save_crawled("A", 1, &(0..10).map(work).collect::<Vec<_>>(), None).await.unwrap();
+        assert_eq!(store.candidates(&["item"]).await.unwrap().len(), 10);
+
+        store.set_max_candidates(4);
+        assert_eq!(store.candidates(&["item"]).await.unwrap().len(), 4, "a long word, and the saved set is forgotten");
+        assert_eq!(store.candidates(&["ai"]).await.unwrap().len(), 4, "a short word");
+        assert_eq!(store.candidates(&[]).await.unwrap().len(), 4, "no word at all");
     }
 
     #[tokio::test]
@@ -1493,10 +1576,11 @@ mod tests {
         let found = store.candidates_up_to(&["alpha", "beta"], 5).await.unwrap();
         assert_eq!(found.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), ["/g/100/"]);
 
-        // a short word is looked for in the works the long ones leave, and a piece that nothing has finds nothing
-        assert_eq!(store.candidates_up_to(&["alpha", "ra"], 5).await.unwrap().len(), 1);
+        // a short word is a word, looked for in the works the long ones leave: `ra` is inside `rare` and is not a word of it
+        assert_eq!(store.candidates_up_to(&["alpha", "ra"], 5).await.unwrap().len(), 0);
         assert_eq!(store.candidates_up_to(&["alpha", "zz"], 5).await.unwrap().len(), 0);
         // the words that are common together: the newest, up to the most
-        assert_eq!(store.candidates_up_to(&["item", "ite"], 4).await.unwrap().len(), 4);
+        assert_eq!(store.candidates_up_to(&["item", "alpha"], 4).await.unwrap().len(), 4);
+        assert_eq!(store.candidates_up_to(&["item", "30"], 4).await.unwrap().len(), 1, "a number is a word too");
     }
 }
