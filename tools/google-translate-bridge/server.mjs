@@ -18,6 +18,7 @@
 //   BRIDGE_TOKEN  if set, a request needs `Authorization: Bearer <token>`
 //   CHROME        path of Chrome (default: the one of macOS)
 //   PROFILE       the profile of Chrome, where "Advanced" is remembered (default: ./profile)
+//   CHROME_ARGS   more arguments for Chrome, separated by spaces
 //   MIN_DELAY_MS  the least time between two translations (default 1500)
 //   HEADLESS      0 shows the window of Chrome (default 1)
 
@@ -33,6 +34,8 @@ const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/M
 const PROFILE = resolve(process.env.PROFILE ?? fileURLToPath(new URL('./profile', import.meta.url)));
 const MIN_DELAY_MS = Number(process.env.MIN_DELAY_MS ?? 1500);
 const HEADLESS = (process.env.HEADLESS ?? '1') !== '0';
+// more arguments for Chrome, separated by spaces (`--no-sandbox` in a container that runs as root)
+const CHROME_ARGS = (process.env.CHROME_ARGS ?? '').split(/\s+/).filter(Boolean);
 const ANSWER_TIMEOUT_MS = 30_000;
 // A call to Chrome that is not answered, and a text that takes longer than this in all, mean that Chrome is stuck: it is started again.
 const CALL_TIMEOUT_MS = 20_000;
@@ -100,7 +103,7 @@ function startChrome() {
   return new Promise((resolveStart, reject) => {
     const proc = spawn(
       CHROME,
-      [...(HEADLESS ? ['--headless=new'] : ['--window-position=-3000,0']), '--remote-debugging-port=0', `--user-data-dir=${PROFILE}`, '--no-first-run', '--disable-blink-features=AutomationControlled',  '--no-default-browser-check', '--disable-gpu', '--window-size=1200,900', '--lang=ja', 'about:blank'],
+      [...(HEADLESS ? ['--headless=new'] : ['--window-position=-3000,0']), '--remote-debugging-port=0', `--user-data-dir=${PROFILE}`, '--no-first-run', '--disable-blink-features=AutomationControlled',  '--no-default-browser-check', '--disable-gpu', '--window-size=1200,900', '--lang=ja', ...CHROME_ARGS, 'about:blank'],
       { stdio: ['ignore', 'ignore', 'pipe'] },
     );
     let seen = '';
