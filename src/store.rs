@@ -8,7 +8,7 @@
 
 use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work};
 use crate::language;
-use crate::query::title_key;
+use crate::query::outside_key;
 use crate::sites::toggle_slash;
 use crate::utils::Result;
 use sea_orm::sea_query::{Expr, Index, OnConflict};
@@ -58,6 +58,9 @@ const MAX_CANDIDATES: u64 = 50_000;
 /// How many words keep their candidates in memory (a set of them is up to `MAX_CANDIDATES` rows).
 const CACHED_CANDIDATE_SETS: usize = 8;
 
+/// The version of the keys and the indexes (`PRAGMA user_version`).
+const INDEX_VERSION: i64 = 1;
+
 /// A word is kept in memory only when reading its rows from the database took this long (milliseconds).
 const CACHE_MIN_MS: u64 = 5000;
 
@@ -83,13 +86,10 @@ struct CandidateRow {
 pub struct Candidate {
     /// The place of the name of its site in `Candidates::websites`.
     pub site: u16,
-    /// The key of what is outside the parentheses of the title, when the title has a parenthesis (`query::outside_key`): found once, when the
-    /// rows are read, not for each search that matches them. None: the title is its own outside, and `title_key` is that key.
-    pub outside_key: Option<String>,
     pub path: String,
     pub title: String,
     pub title_romaji: String,
-    /// `title_key` of the romaji: what the search narrows with, and matches a title that has no parenthesis with.
+    /// The key of what is outside the parentheses of the romaji (`query::outside_key`): what the search narrows with and matches.
     pub title_key: String,
     pub language: Option<String>,
 }
@@ -193,75 +193,121 @@ impl SearchStore {
         Self::create_word_index(db).await
     }
 
-    /// The index of the title keys (`works_fts`): FTS5 with the trigram tokenizer, which finds the works whose key has a
-    /// piece of text in it (3 characters or more) without reading every row. It has no copy of the keys (the table `works` is its
-    /// content: only the pieces of 3 characters are kept in it), and three triggers keep it up to date. It is made again
-    /// when it has not as many works as the table (a new index, an older database).
+    /// The two indexes of the titles, made again when the database has the old ones (`user_version` 0): the key of a work is then the key of
+    /// what is outside its parentheses (`query::outside_key`), as the search matches it, and both indexes have the name of the site.
     async fn create_word_index(db: &DatabaseConnection) -> Result<()> {
+        let backend = db.get_database_backend();
+        let version: i64 = db
+            .query_one(Statement::from_string(backend, "PRAGMA user_version"))
+            .await?
+            .ok_or("no version")?
+            .try_get("", "user_version")?;
+
+        if version < INDEX_VERSION {
+            log::info!("the search database is changed to version {INDEX_VERSION}: the keys and the indexes are made again");
+            for sql in [
+                "DROP TRIGGER IF EXISTS works_fts_insert",
+                "DROP TRIGGER IF EXISTS works_fts_delete",
+                "DROP TRIGGER IF EXISTS works_fts_update",
+                "DROP TABLE IF EXISTS works_fts",
+                "DROP TRIGGER IF EXISTS works_words_insert",
+                "DROP TRIGGER IF EXISTS works_words_delete",
+                "DROP TRIGGER IF EXISTS works_words_update",
+                "DROP TABLE IF EXISTS works_words",
+            ] {
+                db.execute_unprepared(sql).await?;
+            }
+
+            Self::rewrite_keys(db).await?;
+        }
+
+        // the index of the title keys: FTS5 with the trigram tokenizer, which finds the works whose key has a piece of text in it (3
+        // characters or more) without reading every row, and counts them by site. It has no copy of the keys (the table `works` is its
+        // content), and three triggers keep it up to date.
+        Self::create_index(db, "works_fts", "title_key", "trigram").await?;
+        // the index of the words of the romaji titles: whole words, for a piece of less than 3 characters (`ai` has no trigram, and is not
+        // `maid`)
+        Self::create_index(db, "works_words", "title_romaji", "unicode61").await?;
+
+        db.execute_unprepared(&format!("PRAGMA user_version = {INDEX_VERSION}")).await?;
+
+        Ok(())
+    }
+
+    /// An FTS5 index of a column of `works` and of the name of the site, kept up to date by three triggers, and made again when it has not as
+    /// many works as the table.
+    async fn create_index(db: &DatabaseConnection, name: &str, column: &str, tokenizer: &str) -> Result<()> {
         for sql in [
-            "CREATE VIRTUAL TABLE IF NOT EXISTS works_fts USING fts5(title_key, content='works', content_rowid='rowid', tokenize='trigram')",
-            "CREATE TRIGGER IF NOT EXISTS works_fts_insert AFTER INSERT ON works BEGIN
-                INSERT INTO works_fts(rowid, title_key) VALUES (new.rowid, new.title_key);
-            END",
-            "CREATE TRIGGER IF NOT EXISTS works_fts_delete AFTER DELETE ON works BEGIN
-                INSERT INTO works_fts(works_fts, rowid, title_key) VALUES ('delete', old.rowid, old.title_key);
-            END",
-            "CREATE TRIGGER IF NOT EXISTS works_fts_update AFTER UPDATE OF title_key ON works BEGIN
-                INSERT INTO works_fts(works_fts, rowid, title_key) VALUES ('delete', old.rowid, old.title_key);
-                INSERT INTO works_fts(rowid, title_key) VALUES (new.rowid, new.title_key);
-            END",
+            format!("CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5({column}, website, content='works', content_rowid='rowid', tokenize='{tokenizer}')"),
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS {name}_insert AFTER INSERT ON works BEGIN
+                    INSERT INTO {name}(rowid, {column}, website) VALUES (new.rowid, new.{column}, new.website);
+                END"
+            ),
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS {name}_delete AFTER DELETE ON works BEGIN
+                    INSERT INTO {name}({name}, rowid, {column}, website) VALUES ('delete', old.rowid, old.{column}, old.website);
+                END"
+            ),
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS {name}_update AFTER UPDATE OF {column}, website ON works BEGIN
+                    INSERT INTO {name}({name}, rowid, {column}, website) VALUES ('delete', old.rowid, old.{column}, old.website);
+                    INSERT INTO {name}(rowid, {column}, website) VALUES (new.rowid, new.{column}, new.website);
+                END"
+            ),
         ] {
-            db.execute_unprepared(sql).await?;
+            db.execute_unprepared(&sql).await?;
         }
 
         let counts = db
             .query_one(Statement::from_string(
                 db.get_database_backend(),
-                "SELECT (SELECT count(*) FROM works) AS works, (SELECT count(*) FROM works_fts_docsize) AS indexed",
+                format!("SELECT (SELECT count(*) FROM works) AS works, (SELECT count(*) FROM {name}_docsize) AS indexed"),
             ))
             .await?
             .ok_or("no count")?;
         let (works, indexed): (i64, i64) = (counts.try_get("", "works")?, counts.try_get("", "indexed")?);
 
         if works != indexed {
-            log::info!("works_fts: indexing {works} works ({indexed} were indexed)");
-            db.execute_unprepared("INSERT INTO works_fts(works_fts) VALUES ('rebuild')").await?;
+            log::info!("{name}: indexing {works} works ({indexed} were indexed)");
+            db.execute_unprepared(&format!("INSERT INTO {name}({name}) VALUES ('rebuild')")).await?;
         }
 
-        Self::create_whole_word_index(db, works).await
+        Ok(())
     }
 
-    /// The index of the words of the romaji titles (`works_words`): FTS5 with the unicode61 tokenizer, whose tokens are whole words. A piece
-    /// of less than 3 characters (`ai`) has no trigram, and a search of it by `instr` reads every row (and also finds it inside `maid`); here
-    /// the works that have it as a word are found without reading the others. Kept up to date by three triggers, and made again when it has
-    /// not as many works as the table.
-    async fn create_whole_word_index(db: &DatabaseConnection, works: i64) -> Result<()> {
-        for sql in [
-            "CREATE VIRTUAL TABLE IF NOT EXISTS works_words USING fts5(title_romaji, content='works', content_rowid='rowid', tokenize='unicode61')",
-            "CREATE TRIGGER IF NOT EXISTS works_words_insert AFTER INSERT ON works BEGIN
-                INSERT INTO works_words(rowid, title_romaji) VALUES (new.rowid, new.title_romaji);
-            END",
-            "CREATE TRIGGER IF NOT EXISTS works_words_delete AFTER DELETE ON works BEGIN
-                INSERT INTO works_words(works_words, rowid, title_romaji) VALUES ('delete', old.rowid, old.title_romaji);
-            END",
-            "CREATE TRIGGER IF NOT EXISTS works_words_update AFTER UPDATE OF title_romaji ON works BEGIN
-                INSERT INTO works_words(works_words, rowid, title_romaji) VALUES ('delete', old.rowid, old.title_romaji);
-                INSERT INTO works_words(rowid, title_romaji) VALUES (new.rowid, new.title_romaji);
-            END",
-        ] {
-            db.execute_unprepared(sql).await?;
+    /// Writes the key of what is outside the parentheses of the romaji into `title_key`, for every work whose key is another one.
+    async fn rewrite_keys(db: &DatabaseConnection) -> Result<()> {
+        let backend = db.get_database_backend();
+        let (mut after, mut written) = (0_i64, 0_usize);
+
+        loop {
+            let rows = db
+                .query_all(Statement::from_sql_and_values(
+                    backend,
+                    "SELECT rowid AS r, title_romaji, title_key FROM works WHERE rowid > ? ORDER BY rowid LIMIT 20000",
+                    [after.into()],
+                ))
+                .await?;
+            let Some(last) = rows.last() else { break };
+            after = last.try_get("", "r")?;
+
+            let transaction = db.begin().await?;
+            for row in &rows {
+                let (rowid, romaji, key): (i64, String, String) = (row.try_get("", "r")?, row.try_get("", "title_romaji")?, row.try_get("", "title_key")?);
+                let outside = outside_key(&romaji);
+
+                if outside != key {
+                    transaction
+                        .execute(Statement::from_sql_and_values(backend, "UPDATE works SET title_key = ? WHERE rowid = ?", [outside.into(), rowid.into()]))
+                        .await?;
+                    written += 1;
+                }
+            }
+            transaction.commit().await?;
         }
 
-        let indexed: i64 = db
-            .query_one(Statement::from_string(db.get_database_backend(), "SELECT count(*) AS indexed FROM works_words_docsize"))
-            .await?
-            .ok_or("no count")?
-            .try_get("", "indexed")?;
-
-        if works != indexed {
-            log::info!("works_words: indexing {works} works ({indexed} were indexed)");
-            db.execute_unprepared("INSERT INTO works_words(works_words) VALUES ('rebuild')").await?;
-        }
+        log::info!("title_key: {written} keys written");
 
         Ok(())
     }
@@ -493,7 +539,7 @@ impl SearchStore {
                     path: Set(item.path.clone()),
                     title: Set(item.title.clone()),
                     title_romaji: Set(item.romaji.clone()),
-                    title_key: Set(title_key(&item.romaji)),
+                    title_key: Set(outside_key(&item.romaji)),
                     first_seen: Set(now),
                     updated_at: Set(now),
                     language: Set(item.language.clone()),
@@ -506,7 +552,7 @@ impl SearchStore {
                     let mut changed = known.clone().into_active_model();
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
-                    changed.title_key = Set(title_key(&item.romaji));
+                    changed.title_key = Set(outside_key(&item.romaji));
                     changed.language = Set(item.language.clone());
                     changed.updated_at = Set(now);
                     changed.update(db).await?;
@@ -519,6 +565,9 @@ impl SearchStore {
         let new = added.iter().filter_map(|row| row.path.clone().take()).collect();
 
         if !added.is_empty() {
+            // the answer lists the last added first: the works of a page are added from the last of the list, so the first of the list is the
+            // last added, and a page keeps the order the site gave it
+            added.reverse();
             work::Entity::insert_many(added).exec_without_returning(db).await?;
         }
 
@@ -676,7 +725,7 @@ impl SearchStore {
                     let romaji = language::strip_flags(&row.title_romaji);
                     work::Entity::update_many()
                         .col_expr(work::Column::Title, Expr::value(title))
-                        .col_expr(work::Column::TitleKey, Expr::value(title_key(&romaji)))
+                        .col_expr(work::Column::TitleKey, Expr::value(outside_key(&romaji)))
                         .col_expr(work::Column::TitleRomaji, Expr::value(romaji))
                         .col_expr(work::Column::Language, Expr::value(now))
                         .filter(work::Column::Website.eq(row.website.as_str()))
@@ -922,7 +971,7 @@ impl SearchStore {
         for (known, romaji) in changes {
             let mut changed = known.clone().into_active_model();
             changed.title_romaji = Set(romaji.clone());
-            changed.title_key = Set(title_key(romaji));
+            changed.title_key = Set(outside_key(romaji));
             changed.language = Set(language::detect(&known.title).or(known.language.clone()));
             changed.update(&transaction).await?;
 
@@ -945,6 +994,69 @@ impl SearchStore {
         self.forget_candidates();
 
         Ok(forgotten)
+    }
+
+    /// The SQL of the row numbers of the works of a site that a `Matcher` finds, through the indexes.
+    fn rowids(matcher: &crate::query::Matcher, website: &str) -> (String, Vec<sea_orm::Value>) {
+        let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
+        let long = (!matcher.long.is_empty()).then(|| {
+            let pieces = matcher.long.iter().map(|piece| quote(piece)).collect::<Vec<_>>().join(" AND ");
+
+            format!("website : {} AND title_key : ({pieces})", quote(website))
+        });
+        let short = (!matcher.short.is_empty()).then(|| {
+            let words = matcher.short.iter().map(|word| quote(word)).collect::<Vec<_>>().join(" AND ");
+
+            format!("website : {} AND title_romaji : ({words})", quote(website))
+        });
+
+        match (long, short) {
+            (Some(long), Some(short)) => (
+                // both sets are made once and joined (a `rowid IN (SELECT ... FROM works_words ...)` asks the index again for every row of the other one)
+                "WITH f AS MATERIALIZED (SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ?), \
+                 w AS MATERIALIZED (SELECT rowid AS r FROM works_words WHERE works_words MATCH ?) SELECT r FROM f JOIN w USING (r)"
+                    .to_string(),
+                vec![long.into(), short.into()],
+            ),
+            (Some(long), None) => ("SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ?".to_string(), vec![long.into()]),
+            (None, Some(short)) => ("SELECT rowid AS r FROM works_words WHERE works_words MATCH ?".to_string(), vec![short.into()]),
+            (None, None) => ("SELECT rowid AS r FROM works WHERE 0".to_string(), Vec::new()),
+        }
+    }
+
+    /// How many works of a site `matcher` finds in the indexes. The works are not read: this takes milliseconds for a word that 700,000 works have.
+    pub async fn count_found(&self, matcher: &crate::query::Matcher, website: &str) -> Result<usize> {
+        let (sql, values) = Self::rowids(matcher, website);
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(self.db.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
+            .await?
+            .ok_or("no count")?;
+
+        Ok(row.try_get::<i64>("", "n")?.max(0) as usize)
+    }
+
+    /// The `limit` works of a site that `matcher` finds, the last added first (the order of the rows).
+    pub async fn top_found(&self, matcher: &crate::query::Matcher, website: &str, limit: usize) -> Result<Vec<Candidate>> {
+        use sea_orm::FromQueryResult;
+
+        let (sql, mut values) = Self::rowids(matcher, website);
+        values.push((limit as i64).into());
+        let statement = Statement::from_sql_and_values(
+            self.db.get_database_backend(),
+            format!(
+                "SELECT w.website, w.path, w.title, w.title_romaji, w.title_key, w.language FROM works w \
+                 JOIN (SELECT r FROM ({sql}) ORDER BY r DESC LIMIT ?) x ON w.rowid = x.r ORDER BY x.r DESC"
+            ),
+            values,
+        );
+
+        Ok(CandidateRow::find_by_statement(statement)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| Candidate { site: 0, path: row.path, title: row.title, title_romaji: row.title_romaji, title_key: row.title_key, language: row.language })
+            .collect())
     }
 
     /// The works whose title key has every one of `parts` in it (all works for none), the most recently saved first, at most
@@ -1037,17 +1149,13 @@ impl SearchStore {
             }
         }
 
-        // Only the row numbers and the dates are sorted (the newest `most` of them), and the rows are read after that: sorting whole rows
-        // (their titles are most of the bytes) takes twice as long for a piece that 300,000 works have. Works saved at the same second keep
-        // the order they were saved in.
+        // The newest `most` works are the last added ones (the largest row numbers). Only the row numbers are sorted, and the rows are read after
+        // that: sorting whole rows (their titles are most of the bytes) takes twice as long for a piece that 300,000 works have.
         let condition = if filters.is_empty() { String::new() } else { format!("WHERE {}", filters.join(" AND ")) };
         values.push((most as i64).into());
         let statement = Statement::from_sql_and_values(
             self.db.get_database_backend(),
-            format!(
-                "SELECT {columns} FROM works w JOIN (SELECT rowid AS r, updated_at AS u FROM works {condition} ORDER BY updated_at DESC, rowid ASC LIMIT ?) x \
-                 ON w.rowid = x.r ORDER BY x.u DESC, x.r ASC"
-            ),
+            format!("SELECT {columns} FROM works w JOIN (SELECT rowid AS r FROM works {condition} ORDER BY rowid DESC LIMIT ?) x ON w.rowid = x.r ORDER BY x.r DESC"),
             values,
         );
 
@@ -1074,7 +1182,6 @@ impl SearchStore {
 
             works.push(Candidate {
                 site: site as u16,
-                outside_key: (!crate::query::is_plain(&row.title_romaji)).then(|| crate::query::outside_key(&row.title_romaji)),
                 path: row.path,
                 title: row.title,
                 title_romaji: row.title_romaji,
@@ -1221,7 +1328,7 @@ mod tests {
         store.save("q", "A", 200, &Ok(vec![link("/g/3/", "カタカナ"), link("/g/4/", "漢字")]), false).await.unwrap();
 
         let first = store.japanese_titles(None, 2).await.unwrap();
-        assert_eq!(first.iter().map(|(_, _, title)| title.as_str()).collect::<Vec<_>>(), ["漢字", "カタカナ"], "the newest first, the same second last rowid first");
+        assert_eq!(first.iter().map(|(_, _, title)| title.as_str()).collect::<Vec<_>>(), ["カタカナ", "漢字"], "the newest first, the same second last rowid first");
         let (updated_at, rowid, _) = first.last().unwrap().clone();
 
         let second = store.japanese_titles(Some((updated_at, rowid)), 2).await.unwrap();
@@ -1248,7 +1355,7 @@ mod tests {
         assert!(new.is_empty());
         let one = store.candidates_owned(&[]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
         assert_eq!((one.title.as_str(), one.updated_at, one.first_seen), ("One (2nd)", 300, 100));
-        assert_eq!(one.title_key, "one(2nd)", "the key follows the title");
+        assert_eq!(one.title_key, "one", "the key is the key of what is outside the parentheses");
     }
 
     #[tokio::test]
@@ -1481,7 +1588,7 @@ mod tests {
         store.save("new", "A", 200, &Ok(vec![link("/2", "newer")]), false).await.unwrap();
         store.save("same", "A", 200, &Ok(vec![link("/3", "also newer")]), false).await.unwrap();
 
-        assert_eq!(titles(&store.candidates_owned(&[]).await.unwrap()), ["newer", "also newer", "older"], "ties keep the order they were saved in");
+        assert_eq!(titles(&store.candidates_owned(&[]).await.unwrap()), ["also newer", "newer", "older"], "the last added first");
     }
 
     #[tokio::test]
@@ -1610,6 +1717,45 @@ mod tests {
         store.forget_candidates();
         assert_eq!(paths(store.candidates_owned(&["kyoudai"]).await.unwrap()).await, ["/g/6/"]);
         assert_eq!(paths(store.candidates_owned(&["shitara"]).await.unwrap()).await, ["/g/4/"]);
+    }
+
+    #[tokio::test]
+    async fn a_database_of_the_old_version_gets_the_keys_outside_the_parentheses_and_the_new_indexes() {
+        let dir = std::env::temp_dir().join(format!("okazuri-version-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("search.db");
+
+        let store = SearchStore::open(&path).await.unwrap();
+        // the database of version 0: the key is the key of the whole title, and the indexes have no site
+        for sql in [
+            "DROP TRIGGER works_fts_insert", "DROP TRIGGER works_fts_delete", "DROP TRIGGER works_fts_update", "DROP TABLE works_fts",
+            "DROP TRIGGER works_words_insert", "DROP TRIGGER works_words_delete", "DROP TRIGGER works_words_update", "DROP TABLE works_words",
+            "CREATE VIRTUAL TABLE works_fts USING fts5(title_key, content='works', content_rowid='rowid', tokenize='trigram')",
+            "PRAGMA user_version = 0",
+            "INSERT INTO works VALUES ('Site', '/g/1/', 'One (Comic Two)', 'one (comic two)', 'one(comictwo)', 1, 1, NULL, 0, NULL)",
+            "INSERT INTO works VALUES ('Site', '/g/2/', 'Comic Two', 'comic two', 'comictwo', 2, 2, NULL, 0, NULL)",
+        ] {
+            store.db.execute_unprepared(sql).await.unwrap();
+        }
+        drop(store);
+
+        let store = SearchStore::open(&path).await.unwrap();
+        let works = store.candidates_owned(&[]).await.unwrap();
+        assert_eq!(works.iter().find(|w| w.path == "/g/1/").unwrap().title_key, "one", "the key is what is outside the parentheses");
+
+        // the index has the new keys and the site: the work whose title has the words only in its parentheses is not found
+        let matcher = crate::query::Matcher { long: vec!["comic".into()], short: Vec::new() };
+        assert_eq!(store.count_found(&matcher, "Site").await.unwrap(), 1);
+        assert_eq!(store.count_found(&matcher, "Other").await.unwrap(), 0);
+        let top = store.top_found(&matcher, "Site", 5).await.unwrap();
+        assert_eq!(top.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), ["/g/2/"]);
+
+        // opened again, nothing is made again
+        drop(store);
+        let store = SearchStore::open(&path).await.unwrap();
+        assert_eq!(store.count_found(&matcher, "Site").await.unwrap(), 1);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
