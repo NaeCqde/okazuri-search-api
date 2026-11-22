@@ -160,6 +160,7 @@ impl Crawler {
                 continue;
             }
             match engine.site_named(&name) {
+                Some(index) if engine.is_disabled(index) => log::info!("crawl: {name} is in [search] disabled_sites, left out"),
                 Some(index) => chosen.push((index, source)),
                 None => log::warn!("crawl: {name} is not one of the sites of this program, left out"),
             }
@@ -548,6 +549,18 @@ mod tests {
         let source = Source::Pages(format!("http://127.0.0.1:{port}/list/{{n}}"));
 
         (Arc::new(Crawler::with_sources(engine, config, vec![("Listed".to_string(), source)]).unwrap()), store)
+    }
+
+    #[tokio::test]
+    async fn a_disabled_site_is_not_crawled() {
+        let store = Arc::new(SearchStore::in_memory().await.unwrap());
+        let search = SearchConfig { min_delay_ms: 0, disabled_sites: vec!["listed".into()], ..SearchConfig::default() };
+        let engine = Engine::with_sites(vec![Site::new(def("Listed", 1))], &search, store, crate::testing::romanizer_arc());
+        let source = Source::Pages("http://127.0.0.1:1/list/{n}".to_string());
+
+        let crawler = Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), source)]).unwrap();
+
+        assert!(crawler.sources.is_empty());
     }
 
     #[test]
