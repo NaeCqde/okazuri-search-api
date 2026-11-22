@@ -172,6 +172,8 @@ hitomi_index = "index-all.nozomi"
 hitomi_batch = 100
 # The newest pages are read until one is known (so a long pause is caught up); this is only the most pages of one reading.
 refresh_pages = 1000
+# How long a walk that failed waits before it starts again. A ban of the address (E-Hentai: 5 minutes the first time, 1 hour the next) says
+# how long it lasts, and the walk waits that long when it is longer than this.
 retry_minutes = 10
 
 # Looking at the page of every saved work of the sites that tell when a work is gone (RokuHentai, DLsite, HentaiEnvy, Nya:Hentai, momon:GA,

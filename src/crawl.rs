@@ -63,6 +63,33 @@ const EMPTY_PAGES_AT_START: usize = 20;
 /// The most pages of a list of pages in a row that may have no new work before a first walk takes the list for read to its end.
 const IDLE_PAGES_AT_END: usize = 100;
 
+/// The time a ban of the address lasts, plus half a minute, from the page of the site ("The ban expires in 5 minutes and 0 seconds",
+/// "... in 1 hours"). `None` when the error is not a ban or names no time.
+fn ban_wait(error: &str) -> Option<Duration> {
+    if !error.contains("banned") {
+        return None;
+    }
+
+    let rest = error.split("expires in").nth(1)?;
+    let words: Vec<&str> = rest.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect();
+    let mut seconds = 0u64;
+
+    for pair in words.windows(2) {
+        let Ok(number) = pair[0].parse::<u64>() else { continue };
+        let unit = match pair[1] {
+            word if word.starts_with("day") => 86_400,
+            word if word.starts_with("hour") => 3_600,
+            word if word.starts_with("minute") => 60,
+            word if word.starts_with("second") => 1,
+            _ => continue,
+        };
+        seconds = seconds.saturating_add(number.saturating_mul(unit));
+    }
+
+    // a page of a site must not park the walk for good: at most a week
+    (seconds > 0).then(|| Duration::from_secs(seconds.min(7 * 86_400) + 30))
+}
+
 /// The waits, in seconds, before a page that failed is asked again (then the walk gives up until `retry_minutes` have passed).
 const STEP_RETRY_SECS: [u64; 4] = [5, 20, 60, 120];
 
@@ -228,8 +255,10 @@ impl Crawler {
                     }
                 }
                 Err(e) => {
-                    log::warn!("crawl {name}: {e}, again in {} minutes", retry.as_secs() / 60);
-                    tokio::time::sleep(retry).await;
+                    // a ban says how long it lasts: the next try waits that long (a request while banned may make it longer)
+                    let wait = ban_wait(&e).map_or(retry, |ban| ban.max(retry));
+                    log::warn!("crawl {name}: {e}, again in {} minutes", wait.as_secs() / 60);
+                    tokio::time::sleep(wait).await;
                 }
             }
         }
@@ -485,6 +514,20 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_ban_is_waited_for_as_long_as_the_site_says() {
+        use super::ban_wait;
+        use std::time::Duration;
+
+        let ban = |tail: &str| format!("the address is banned by the site for a while (This IP address has been temporarily banned due to an excessive request rate. {tail})");
+
+        assert_eq!(ban_wait(&ban("The ban expires in 5 minutes and 0 seconds")), Some(Duration::from_secs(330)));
+        assert_eq!(ban_wait(&ban("The ban expires in 1 hours")), Some(Duration::from_secs(3630)));
+        assert_eq!(ban_wait(&ban("The ban expires in 1 days, 2 hours and 3 minutes")), Some(Duration::from_secs(86_400 + 7_200 + 180 + 30)));
+        assert_eq!(ban_wait(&ban("")), None, "a ban without a time is waited for as long as `retry_minutes`");
+        assert_eq!(ban_wait("HTTP 503"), None);
+    }
+
     use super::*;
     use crate::config::SearchConfig;
     use crate::sites::{Clean, Format, SiteDef, Support};
