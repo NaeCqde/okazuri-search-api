@@ -82,13 +82,20 @@ struct Searched<'a> {
     items: usize,
 }
 
+/// How many works an answer has, and how many of them are of the legal sites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Counts {
+    total: usize,
+    legal: usize,
+}
+
 /// The matching works of one search: the candidates they stand in, in the order of the answer.
 struct Lite {
     set: Arc<Candidates>,
     items: Vec<Item>,
     /// How many works each site has in the answer (by `Engine::sites`), when the indexes of the database were asked: `set` is then only the
     /// head of the answer. None: `items` is all of it.
-    counts: Option<Vec<usize>>,
+    counts: Option<Counts>,
     /// What the indexes were asked (to leave it out of the other title's search).
     matcher: Option<crate::query::Matcher>,
     /// The answer but its works (`results` is empty).
@@ -100,7 +107,7 @@ struct Merged {
     sets: Vec<Arc<Candidates>>,
     items: Vec<Item>,
     /// As `Lite::counts`, of all the searches together.
-    counts: Option<Vec<usize>>,
+    counts: Option<Counts>,
     matcher: Option<crate::query::Matcher>,
     meta: Outcome,
 }
@@ -731,8 +738,8 @@ impl Engine {
         // `total` is how many works there are, whatever the limit cuts
         match counts {
             Some(counts) => {
-                meta.total = counts.iter().sum();
-                meta.total_legal = counts.iter().enumerate().filter(|(site, _)| self.sites[*site].def.legal).map(|(_, n)| n).sum();
+                meta.total = counts.total;
+                meta.total_legal = counts.legal;
             }
             None => {
                 meta.total = items.len();
@@ -787,15 +794,14 @@ impl Engine {
         let after = Searched {
             indexed: merged.counts.is_some(),
             matcher: merged.matcher.as_ref(),
-            total: merged.counts.as_ref().map_or(0, |counts| counts.iter().sum()),
+            total: merged.counts.map_or(0, |counts| counts.total),
             items: merged.items.len(),
         };
         match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after)).await {
             Ok(more) => {
-                if let (Some(counts), Some(more_counts)) = (merged.counts.as_mut(), more.counts.as_ref()) {
-                    for (site, n) in more_counts.iter().enumerate() {
-                        counts[site] += n;
-                    }
+                if let (Some(counts), Some(more_counts)) = (merged.counts.as_mut(), more.counts) {
+                    counts.total += more_counts.total;
+                    counts.legal += more_counts.legal;
                 }
 
                 // a work that is in the answer already (the same address) is not in it twice
@@ -931,7 +937,7 @@ impl Engine {
         };
         laps.lap("found");
 
-        let total = counts.as_ref().map_or(items.len(), |counts| counts.iter().sum());
+        let total = counts.map_or(items.len(), |counts| counts.total);
 
         let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
         laps.lap("site reports");
@@ -1010,10 +1016,23 @@ impl Engine {
         Ok((candidates, items))
     }
 
-    /// The works of the answer from the indexes of the database: how many works each site has (no work is read for that), and the head of the
+    /// How many works `matcher` finds in the sites that are searched, and how many of them are of the legal sites. A count with a site in it is
+    /// slow (the index walks the long list of the works of the site), so the whole table is counted and the works of the sites that are left out
+    /// are taken off, and only the few legal sites are named.
+    async fn count_answer(&self, matcher: &crate::query::Matcher, left_out: &[&str], legal: &[&str]) -> Result<Counts> {
+        let mut total = self.store.count_found(matcher, None).await?;
+        if !left_out.is_empty() {
+            total = total.saturating_sub(self.store.count_found(matcher, Some(left_out)).await?);
+        }
+        let legal = if legal.is_empty() { 0 } else { self.store.count_found(matcher, Some(legal)).await? };
+
+        Ok(Counts { total, legal })
+    }
+
+    /// The works of the answer from the indexes of the database: how many works there are (no work is read for that), and the head of the
     /// answer (the last added first in a site, the sites in their order), `request.limit` works. `after` is an earlier search of the same
     /// request: its works are not counted again, and its place in the answer is not filled again. Returns the head as candidates and places,
-    /// the counts by site, and how many rows were read.
+    /// the counts, and how many rows were read.
     async fn indexed_items(
         &self,
         request: &Request<'_>,
@@ -1021,8 +1040,19 @@ impl Engine {
         after: Option<&Searched<'_>>,
         fetched: &Fetched,
         exclude: &[usize],
-    ) -> Result<(Arc<Candidates>, Vec<Item>, Option<Vec<usize>>, usize)> {
-        let mut counts = vec![0_usize; self.sites.len()];
+    ) -> Result<(Arc<Candidates>, Vec<Item>, Option<Counts>, usize)> {
+        let order = self.sites_in_order(exclude);
+        let left_out: Vec<&str> = (0..self.sites.len()).filter(|index| !order.contains(index)).map(|index| self.sites[index].def.name).collect();
+        let legal: Vec<&str> = order.iter().filter(|index| self.sites[**index].def.legal).map(|index| self.sites[*index].def.name).collect();
+
+        let mut counts = self.count_answer(matcher, &left_out, &legal).await?;
+        // the works that the earlier search has are not counted again: what both find is counted once
+        let both = after.and_then(|after| after.matcher).map(|earlier| matcher.and(earlier));
+        if let Some(both) = &both {
+            let twice = self.count_answer(both, &left_out, &legal).await?;
+            counts = Counts { total: counts.total.saturating_sub(twice.total), legal: counts.legal.saturating_sub(twice.legal) };
+        }
+
         let mut websites: Vec<String> = Vec::new();
         let mut works: Vec<Candidate> = Vec::new();
         let mut items: Vec<Item> = Vec::new();
@@ -1030,24 +1060,20 @@ impl Engine {
         // and those that this search also finds are filtered out of what it reads, so that many more are read
         let mut left = request.limit.max(1).saturating_sub(after.map_or(0, |after| after.items));
         let spare = after.map_or(0, |after| after.total);
-        let both = after.and_then(|after| after.matcher).map(|earlier| matcher.and(earlier));
 
-        for index in self.sites_in_order(exclude) {
-            let name = self.sites[index].def.name;
-            let found = self.store.count_found(matcher, name).await?;
-            // the works that the earlier search has are not counted again: what both find is counted once
-            let count = match &both {
-                Some(both) => found - self.store.count_found(both, name).await?.min(found),
-                None => found,
-            };
-            counts[index] = count;
-
-            if found == 0 || left == 0 {
-                continue;
+        for index in order {
+            if counts.total == 0 || left == 0 {
+                break;
             }
 
-            let rows = self.store.top_found(matcher, name, (left + spare).min(found)).await?;
+            let name = self.sites[index].def.name;
+            let rows = self.store.top_found(matcher, name, left + spare).await?;
+            if rows.is_empty() {
+                continue;
+            }
             websites.push(name.to_string());
+            // (some of the rows may be the works of the earlier search, which are filtered out: only the ones above its number are sure to stay)
+            left = left.saturating_sub(rows.len().saturating_sub(spare));
 
             for mut row in rows {
                 row.site = (websites.len() - 1) as u16;
@@ -1056,8 +1082,6 @@ impl Engine {
                 items.push(Item { set: 0, index: works.len() as u32, site: index as u16, is_new });
                 works.push(row);
             }
-
-            left = left.saturating_sub(count.min(left));
         }
 
         let rows = works.len();
@@ -2355,6 +2379,13 @@ pub(crate) mod tests {
 
             assert_eq!(found, expected, "{query}");
             assert_eq!(outcome.total, expected.len(), "{query}");
+            // Good is the legal site, and it has half of the works
+            assert_eq!((outcome.total_legal, outcome.total_illegal), (expected.len() / 2, expected.len() - expected.len() / 2), "{query}");
+
+            // a site that is left out is not counted
+            let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();
+            let without = engine.search(&Request { live: Live::Off, exclude: &leave_out, ..Request::new(query) }).await.unwrap();
+            assert_eq!((without.total, without.total_legal), (expected.len() / 2, 0), "{query}");
 
             // a page that is cut: the totals are those of the whole answer, and the page is the head of it
             let head = engine.search(&Request { live: Live::Off, limit: 3, ..Request::new(query) }).await.unwrap();

@@ -976,18 +976,24 @@ impl SearchStore {
         Ok(forgotten)
     }
 
-    /// The SQL of the row numbers of the works of a site that a `Matcher` finds, through the indexes.
-    fn rowids(matcher: &crate::query::Matcher, website: &str) -> (String, Vec<sea_orm::Value>) {
+    /// The SQL of the row numbers of the works that a `Matcher` finds through the indexes, of the given sites (all the works for None). A site
+    /// in the query makes it slower (the index walks the long list of the works of the site), so it is asked for only when it is needed.
+    fn rowids(matcher: &crate::query::Matcher, websites: Option<&[&str]>) -> (String, Vec<sea_orm::Value>) {
         let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
+        let sites = match websites {
+            Some(names) if !names.is_empty() => format!(" AND website : ({})", names.iter().map(|name| quote(name)).collect::<Vec<_>>().join(" OR ")),
+            Some(_) => return ("SELECT rowid AS r FROM works WHERE 0".to_string(), Vec::new()),
+            None => String::new(),
+        };
         let long = (!matcher.long.is_empty()).then(|| {
             let pieces = matcher.long.iter().map(|piece| quote(piece)).collect::<Vec<_>>().join(" AND ");
 
-            format!("website : {} AND title_key : ({pieces})", quote(website))
+            format!("title_key : ({pieces}){sites}")
         });
         let short = (!matcher.short.is_empty()).then(|| {
             let words = matcher.short.iter().map(|word| quote(word)).collect::<Vec<_>>().join(" AND ");
 
-            format!("website : {} AND title_romaji : ({words})", quote(website))
+            format!("title_romaji : ({words}){sites}")
         });
 
         match (long, short) {
@@ -1004,9 +1010,10 @@ impl SearchStore {
         }
     }
 
-    /// How many works of a site `matcher` finds in the indexes. The works are not read: this takes milliseconds for a word that 700,000 works have.
-    pub async fn count_found(&self, matcher: &crate::query::Matcher, website: &str) -> Result<usize> {
-        let (sql, values) = Self::rowids(matcher, website);
+    /// How many works of the sites (all the works for None) `matcher` finds in the indexes. The works are not read: without a site this takes
+    /// tens of milliseconds for a word that 700,000 works have.
+    pub async fn count_found(&self, matcher: &crate::query::Matcher, websites: Option<&[&str]>) -> Result<usize> {
+        let (sql, values) = Self::rowids(matcher, websites);
         let row = self
             .db
             .query_one(Statement::from_sql_and_values(self.db.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
@@ -1020,7 +1027,7 @@ impl SearchStore {
     pub async fn top_found(&self, matcher: &crate::query::Matcher, website: &str, limit: usize) -> Result<Vec<Candidate>> {
         use sea_orm::FromQueryResult;
 
-        let (sql, mut values) = Self::rowids(matcher, website);
+        let (sql, mut values) = Self::rowids(matcher, Some(&[website]));
         values.push((limit as i64).into());
         let statement = Statement::from_sql_and_values(
             self.db.get_database_backend(),
@@ -1635,15 +1642,18 @@ mod tests {
 
         // the index has the new keys and the site: the work whose title has the words only in its parentheses is not found
         let matcher = crate::query::Matcher { long: vec!["comic".into()], short: Vec::new() };
-        assert_eq!(store.count_found(&matcher, "Site").await.unwrap(), 1);
-        assert_eq!(store.count_found(&matcher, "Other").await.unwrap(), 0);
+        assert_eq!(store.count_found(&matcher, Some(&["Site"])).await.unwrap(), 1);
+        assert_eq!(store.count_found(&matcher, Some(&["Other"])).await.unwrap(), 0);
+        assert_eq!(store.count_found(&matcher, None).await.unwrap(), 1, "all the sites");
+        assert_eq!(store.count_found(&matcher, Some(&[])).await.unwrap(), 0, "no site");
+        assert_eq!(store.count_found(&matcher, Some(&["Other", "Site"])).await.unwrap(), 1);
         let top = store.top_found(&matcher, "Site", 5).await.unwrap();
         assert_eq!(top.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), ["/g/2/"]);
 
         // opened again, nothing is made again
         drop(store);
         let store = SearchStore::open(&path).await.unwrap();
-        assert_eq!(store.count_found(&matcher, "Site").await.unwrap(), 1);
+        assert_eq!(store.count_found(&matcher, Some(&["Site"])).await.unwrap(), 1);
 
         fs::remove_dir_all(&dir).ok();
     }
