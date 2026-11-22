@@ -923,7 +923,7 @@ impl Engine {
         // (the trigram index has no key for a name of less than 3 characters: the sites of the tests have such names)
         let matcher = match &after {
             Some(after) if !after.indexed => None,
-            _ if self.active.iter().any(|index| self.sites[*index].def.name.chars().count() < 3) => None,
+            _ if self.sites.iter().any(|site| site.def.name.chars().count() < 3) => None,
             _ => terms.matcher(),
         };
         if matcher.is_none() && after.as_ref().is_some_and(|after| after.indexed) {
@@ -931,9 +931,9 @@ impl Engine {
         }
 
         let (candidates, items, counts, rows) = match &matcher {
-            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched, exclude).await?,
+            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched, request.exclude).await?,
             None => {
-                let (candidates, items) = self.scanned_items(&terms, &fetched, exclude).await?;
+                let (candidates, items) = self.scanned_items(&terms, &fetched, request.exclude).await?;
                 laps.lap("candidates and match");
                 let rows = candidates.len();
 
@@ -977,9 +977,11 @@ impl Engine {
         Ok(Lite { set: candidates, items, counts, matcher, meta })
     }
 
-    /// The searched sites that are not left out, in the order of the answer.
+    /// The sites that are not left out by the request, in the order of the answer (the searched sites first).
     fn sites_in_order(&self, exclude: &[usize]) -> Vec<usize> {
-        let mut sites: Vec<usize> = self.active.iter().copied().filter(|index| !exclude.contains(index)).collect();
+        // every site that is not left out by the request: the works that are saved of a site that is not searched (it is off in the config, or
+        // its list is not whole yet) are in the answer too, after the works of the searched sites
+        let mut sites: Vec<usize> = (0..self.sites.len()).filter(|index| !exclude.contains(index)).collect();
         sites.sort_by_key(|index| self.order.get(self.sites[*index].def.name).copied().unwrap_or(usize::MAX));
 
         sites
@@ -995,7 +997,7 @@ impl Engine {
         let site_of: Vec<Option<usize>> = candidates
             .websites
             .iter()
-            .map(|name| self.active.iter().copied().find(|index| !exclude.contains(index) && self.sites[*index].def.name == name))
+            .map(|name| (0..self.sites.len()).find(|index| !exclude.contains(index) && self.sites[*index].def.name == name))
             .collect();
         let nothing_is_new = fetched.new.is_empty();
         let mut items: Vec<Item> = Vec::new();
@@ -2716,14 +2718,21 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_works_of_a_site_that_is_left_out_are_not_in_the_answer() {
+    async fn the_saved_works_of_a_site_that_is_off_are_in_the_answer_and_those_of_a_site_the_request_leaves_out_are_not() {
         let (engine, _, store) = setup(&SearchConfig { disabled_sites: vec!["good".into()], ..config() }).await;
-        store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/1".into(), title: "saved title".into(), romaji: "saved title".into(), language: None }]), false).await.unwrap();
+        let work = |n: usize| NewWork { path: format!("/work/{n}"), title: format!("saved title {n}"), romaji: format!("saved title {n}"), language: None };
+        store.save("q", "Good", 1, &Ok(vec![work(1)]), false).await.unwrap();
+        store.save("q", "Failing", 1, &Ok(vec![work(2)]), false).await.unwrap();
 
+        // the site is off in the config (it is not asked), and what is saved of it is in the answer, after the works of the sites that are asked
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("saved") }).await.unwrap();
+        assert_eq!((outcome.total, outcome.total_legal), (2, 1));
+        assert_eq!(outcome.results.iter().map(|hit| hit.website.as_str()).collect::<Vec<_>>(), ["Failing", "Good"]);
 
-        assert_eq!(outcome.total, 0);
-        assert_eq!(store.counts().await.unwrap().1, 1, "the work is still saved");
+        // the request leaves it out: it is not in the answer
+        let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();
+        let outcome = engine.search(&Request { live: Live::Off, exclude: &leave_out, ..Request::new("saved") }).await.unwrap();
+        assert_eq!((outcome.total, outcome.total_legal), (1, 0));
     }
 
     #[tokio::test]
