@@ -101,7 +101,7 @@ impl Prefetcher {
                 break;
             }
 
-            match self.engine.fetch_with(&query, false, false, &left_out).await {
+            match self.engine.fetch_with(&query, false, &left_out).await {
                 Ok(fetched) => {
                     round.searched += 1;
                     log::info!(
@@ -160,7 +160,7 @@ impl Prefetcher {
                 }
             }
 
-            match self.engine.fetch_with(english, false, false, left_out).await {
+            match self.engine.fetch_with(english, false, left_out).await {
                 Ok(fetched) => {
                     round.english += 1;
                     log::info!("prefetch: {query:?} in English {english:?}: {} sites asked, {} new works", fetched.asked.len(), fetched.new.len());

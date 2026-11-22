@@ -641,9 +641,8 @@ impl Engine {
         Ok(Plan { input, query, times })
     }
 
-    /// The sites to ask, each with the queries that are missing or old (all of them with `refresh`). A slow site is left
-    /// out unless `slow_too`.
-    async fn due(&self, plan: &Plan, slow_too: bool, refresh: bool, exclude: &[usize]) -> Result<Vec<(usize, Vec<String>)>> {
+    /// The sites to ask, each with the queries that are missing or old (all of them with `refresh`).
+    async fn due(&self, plan: &Plan, refresh: bool, exclude: &[usize]) -> Result<Vec<(usize, Vec<String>)>> {
         let now = unix_now();
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut due = Vec::new();
@@ -658,11 +657,6 @@ impl Engine {
 
             let site = &self.sites[index];
             let mut missing = Vec::new();
-
-            // the prefetch does not wait for a slow site
-            if !slow_too && Self::is_slow(site) {
-                continue;
-            }
 
             for text in self.queries_for(site, plan) {
                 if !states.contains_key(&text) {
@@ -694,7 +688,7 @@ impl Engine {
     pub async fn is_fresh_without(&self, query: &str, exclude: &[usize]) -> Result<bool> {
         let plan = self.plan(query)?;
 
-        Ok(self.due(&plan, false, false, exclude).await?.is_empty())
+        Ok(self.due(&plan, false, exclude).await?.is_empty())
     }
 
     /// The searched sites whose whole list the crawl has read: their works are saved already, so the prefetch leaves them out and
@@ -706,14 +700,14 @@ impl Engine {
     }
 
     /// Asks `query` to the sites whose answer is missing or older than `ttl_hours` (a failure: `retry_failed_minutes`),
-    /// and saves the works that are new. A request asks the slow sites too (`slow_too`), the prefetch does not.
+    /// and saves the works that are new. A slow site is asked too: the prefetch is the job of the sites that have no whole list.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn fetch(self: &Arc<Self>, query: &str, slow_too: bool) -> Result<Fetched> {
-        self.fetch_with(query, slow_too, false, &[]).await
+    pub async fn fetch(self: &Arc<Self>, query: &str) -> Result<Fetched> {
+        self.fetch_with(query, false, &[]).await
     }
 
     /// Like `fetch`; with `refresh` every site is asked, whether its answer is up to date or not.
-    pub async fn fetch_with(self: &Arc<Self>, query: &str, slow_too: bool, refresh: bool, exclude: &[usize]) -> Result<Fetched> {
+    pub async fn fetch_with(self: &Arc<Self>, query: &str, refresh: bool, exclude: &[usize]) -> Result<Fetched> {
         let plan = self.plan(query)?;
 
         if plan.query.is_empty() {
@@ -723,7 +717,7 @@ impl Engine {
         let mut fetched = Fetched::default();
         let mut tasks = tokio::task::JoinSet::new();
 
-        for (index, texts) in self.due(&plan, slow_too, refresh, exclude).await? {
+        for (index, texts) in self.due(&plan, refresh, exclude).await? {
             fetched.asked.insert(index);
 
             let engine = self.clone();
@@ -922,8 +916,8 @@ impl Engine {
 
         let fetched = match request.live {
             Live::Off => Fetched::default(),
-            Live::Diff => self.fetch_with(request.query, true, false, exclude).await?,
-            Live::Force => self.fetch_with(request.query, true, true, exclude).await?,
+            Live::Diff => self.fetch_with(request.query, false, exclude).await?,
+            Live::Force => self.fetch_with(request.query, true, exclude).await?,
         };
 
         laps.lap("sites asked");
@@ -2134,16 +2128,16 @@ pub(crate) mod tests {
     async fn fetch_skips_a_query_that_is_young_and_asks_again_when_it_is_old() {
         // this is what the prefetch does; a request asks every site
         let (engine, hits, _) = setup(&config()).await;
-        engine.fetch("q", false).await.unwrap();
-        engine.fetch("q", false).await.unwrap();
+        engine.fetch("q").await.unwrap();
+        engine.fetch("q").await.unwrap();
         assert_eq!(requests(&hits), (1, 1, 1), "a failure is not asked again at once either");
         assert!(engine.is_fresh("q").await.unwrap());
         assert!(!engine.is_fresh("never searched").await.unwrap());
 
         // everything is old at once with a ttl of 0, and so are the failures with a retry time of 0
         let (engine, hits, _) = setup(&SearchConfig { ttl_hours: 0, retry_failed_minutes: 0, ..config() }).await;
-        engine.fetch("q", false).await.unwrap();
-        engine.fetch("q", false).await.unwrap();
+        engine.fetch("q").await.unwrap();
+        engine.fetch("q").await.unwrap();
         assert_eq!(requests(&hits), (2, 2, 2));
         assert!(!engine.is_fresh("q").await.unwrap());
     }
@@ -2543,7 +2537,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_slow_site_is_asked_one_form_and_not_by_the_prefetch() {
+    async fn a_slow_site_is_asked_one_form_by_the_prefetch_too() {
         let (port, hits) = server().await;
         let work = format!(r"^http://127\.0\.0\.1:{port}/work/\d+");
         let slow = Box::leak(Box::new(SiteDef { delay_ms: 20_000, ..*leak("Slow", work.clone(), format!("http://127.0.0.1:{port}/ok?q={{q}}"), false) }));
@@ -2555,13 +2549,13 @@ pub(crate) mod tests {
             crate::testing::romanizer_arc(),
         );
 
-        // the prefetch asks the fast site only, in both forms
-        let fetched = engine.fetch("快楽天", false).await.unwrap();
-        assert_eq!(fetched.asked.len(), 1);
-        assert_eq!((hits.ok.load(Ordering::SeqCst), hits.failing.load(Ordering::SeqCst)), (0, 2));
-        assert!(engine.is_fresh("快楽天").await.unwrap(), "and a query is fresh without the slow site");
+        // the prefetch asks the slow site too, once, as the query was written, and the fast site in both forms
+        let fetched = engine.fetch("快楽天").await.unwrap();
+        assert_eq!(fetched.asked.len(), 2);
+        assert_eq!((hits.ok.load(Ordering::SeqCst), hits.failing.load(Ordering::SeqCst)), (1, 2));
+        assert!(engine.is_fresh("快楽天").await.unwrap());
 
-        // a request asks the slow site too, once, as it was written
+        // so a request has nothing left to ask
         let outcome = engine.search(&Request::new("快楽天")).await.unwrap();
         let queries = |name: &str| outcome.sites.iter().find(|s| s.website == name).unwrap().queries.clone();
         assert_eq!(queries("Slow"), ["快楽天"]);
@@ -2591,9 +2585,9 @@ pub(crate) mod tests {
         assert!(outcome.sites.iter().all(|s| s.queries == ["COMIC ExE"]));
 
         // fresh means every form of the query is fetched: the Japanese form is not
-        engine.fetch("kairakuten 2026", false).await.unwrap();
+        engine.fetch("kairakuten 2026").await.unwrap();
         assert!(!engine.is_fresh("快楽天 2026 7").await.unwrap());
-        engine.fetch("快楽天 2026 7", false).await.unwrap();
+        engine.fetch("快楽天 2026 7").await.unwrap();
         assert!(engine.is_fresh("快楽天 2026 7").await.unwrap());
     }
 
@@ -2740,7 +2734,7 @@ pub(crate) mod tests {
         // the prefetch is fetch and is_fresh: they work on the sites that are active, like a request
         let (engine, hits, _) = setup(&SearchConfig { disabled_sites: vec!["failing".into(), "BLOCKED".into()], ..config() }).await;
 
-        let fetched = engine.fetch("q", false).await.unwrap();
+        let fetched = engine.fetch("q").await.unwrap();
 
         assert_eq!(fetched.asked.len(), 1);
         assert_eq!(requests(&hits), (1, 0, 0));
@@ -2771,7 +2765,7 @@ pub(crate) mod tests {
         let (engine, hits, _) = setup(&config()).await;
 
         assert!(engine.search(&Request::new("   ")).await.is_err());
-        assert!(engine.fetch("   ", false).await.is_err());
+        assert!(engine.fetch("   ").await.is_err());
         assert_eq!(requests(&hits), (0, 0, 0));
     }
 
