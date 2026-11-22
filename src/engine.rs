@@ -1311,7 +1311,9 @@ impl Engine {
         }
         // E-Hentai answers 200 with a short page that says the address is banned for a while: not a page without works
         if body.len() < 2000 && body.contains("temporarily banned") {
-            return Err(format!("the address is banned by the site for a while ({})", body.trim().chars().take(120).collect::<String>()));
+            // the whole page (under 2000 bytes) is kept: it says how long the ban lasts
+            let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Err(format!("the address is banned by the site for a while ({text})"));
         }
         if status != 200 {
             return Err(format!("HTTP {status}"));
