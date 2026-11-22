@@ -257,7 +257,7 @@ impl Default for CrawlConfig {
             hitomi_index: "index-all.nozomi".to_string(),
             hitomi_batch: 100,
             refresh_pages: 1000,
-            retry_minutes: 10,
+            retry_minutes: 5,
         }
     }
 }

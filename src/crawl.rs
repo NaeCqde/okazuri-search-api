@@ -63,7 +63,7 @@ const EMPTY_PAGES_AT_START: usize = 20;
 /// The most pages of a list of pages in a row that may have no new work before a first walk takes the list for read to its end.
 const IDLE_PAGES_AT_END: usize = 100;
 
-/// The time a ban of the address lasts, plus half a minute, from the page of the site ("The ban expires in 5 minutes and 0 seconds",
+/// The time a ban of the address lasts, from the page of the site ("The ban expires in 5 minutes and 0 seconds",
 /// "... in 1 hours"). `None` when the error is not a ban or names no time.
 fn ban_wait(error: &str) -> Option<Duration> {
     if !error.contains("banned") {
@@ -87,7 +87,7 @@ fn ban_wait(error: &str) -> Option<Duration> {
     }
 
     // a page of a site must not park the walk for good: at most a week
-    (seconds > 0).then(|| Duration::from_secs(seconds.min(7 * 86_400) + 30))
+    (seconds > 0).then(|| Duration::from_secs(seconds.min(7 * 86_400)))
 }
 
 /// The waits, in seconds, before a page that failed is asked again (then the walk gives up until `retry_minutes` have passed).
@@ -521,9 +521,9 @@ mod tests {
 
         let ban = |tail: &str| format!("the address is banned by the site for a while (This IP address has been temporarily banned due to an excessive request rate. {tail})");
 
-        assert_eq!(ban_wait(&ban("The ban expires in 5 minutes and 0 seconds")), Some(Duration::from_secs(330)));
-        assert_eq!(ban_wait(&ban("The ban expires in 1 hours")), Some(Duration::from_secs(3630)));
-        assert_eq!(ban_wait(&ban("The ban expires in 1 days, 2 hours and 3 minutes")), Some(Duration::from_secs(86_400 + 7_200 + 180 + 30)));
+        assert_eq!(ban_wait(&ban("The ban expires in 5 minutes and 0 seconds")), Some(Duration::from_secs(300)));
+        assert_eq!(ban_wait(&ban("The ban expires in 1 hours")), Some(Duration::from_secs(3600)));
+        assert_eq!(ban_wait(&ban("The ban expires in 1 days, 2 hours and 3 minutes")), Some(Duration::from_secs(86_400 + 7_200 + 180)));
         assert_eq!(ban_wait(&ban("")), None, "a ban without a time is waited for as long as `retry_minutes`");
         assert_eq!(ban_wait("HTTP 503"), None);
     }
