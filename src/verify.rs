@@ -37,6 +37,10 @@ impl Verifier {
             };
             let index = engine.site_named(known).ok_or_else(|| format!("[verify] sites: {known} is not one of the sites of this program"))?;
             let rule = gone_rule(known).ok_or_else(|| format!("[verify] sites: no rule for {known}"))?;
+            if engine.is_disabled(index) {
+                log::info!("verify: {known} is in [search] disabled_sites, left out");
+                continue;
+            }
             sites.push((index, *known, rule));
         }
 

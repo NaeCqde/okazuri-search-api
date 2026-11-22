@@ -61,7 +61,7 @@ GET /okazuri/search?q=快楽天 2026 7
 - `is_new` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
   再び見つかった作品は新しくなく、行もそのままです(タイトルが変わったときだけ書き直します)。
 - `sites` は、各サイトの結果を表します。`searched`(いま尋ねた)、`cached`(`live=diff` で、`ttl_hours` 以内に尋ねたので
-  データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
+  データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト。この2つは尋ねていませんが、保存済みの作品は応答に入ります)、`unavailable`(Hitomi.La の一覧が全件保存される
   までの間。その間は検索しません)のいずれかです。サイトに尋ねた `queries` も付きます。`q` に日本語があり、
   日本語のタイトルで作品が見つかるサイトでは `["快楽天", "kairakuten"]`、それ以外(日本語を含まない `q`、または日本語のタイトルで
   見つからないサイトの EHentai と HentaiEra)では `["kairakuten"]` です。`count` は、クエリを合わせて一覧に出た作品の数です。
@@ -113,7 +113,7 @@ GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fprodu
 
 `support` は `ready`、`cloudflare`(ブラウザが要るチャレンジ)、`javascript`、`closed` のどれかです。`japanese` は、そのサイトが
 日本語のタイトルで作品を見つけられるかどうかで、`true` なら、日本語を含むクエリを、書かれたとおりの形とローマ字の両方で尋ねます。
-`active` は、現在の `[search]` の設定(`disabled_sites`、`try_unsupported`)で、このサーバーがそのサイトを検索するかどうかです。
+`active` は、現在の `[search]` の設定(`disabled_sites`、`try_unsupported`)で、このサーバーがそのサイトに尋ねるかどうかです。`false` のサイトの保存済みの作品も、応答には入ります(尋ねたサイトの作品の後ろです)。
 
 ## カタログの検索(`[magazine]`)
 

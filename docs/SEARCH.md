@@ -68,7 +68,7 @@
 | `limit=n` | 応答に入れる作品の最大数(最大 `[search] max_results`)。 |
 | (設定) | 語が数字だけでなく、1〜2 文字の語が英数字だけ(`ai`)のとき、答えは**データベースの索引から**出します。サイトごとの件数と先頭の `limit` 件だけを読むので、70 万件の語でも数百ミリ秒です(候補を読むのではなく、`[search] max_candidates` の上限もありません)。ほかの語(数字、1〜2 文字の日本語や記号)の検索は、データベースから候補を読んで 1 件ずつ照合します。候補は `[search] max_candidates`(既定 800000)まで、新しい作品から残します。メモリには残さず、検索のたびにデータベースを読みます。 |
 | `offset=n` | 応答の先頭から飛ばす作品の数(0 から 10000)。`limit` と合わせて、長い答えを何回かに分けて読めます。 |
-| `exclude=A,B` | 除外するサイト(`GET /okazuri/sites` に出る名前。大文字小文字は区別せず、カンマで区切ります)。そのサイトには尋ねず、保存済みの作品も応答に入れず、`sites` にも出ません。サイトにない名前は 422 です。翻訳には影響しません(出どころは `translator` が決めます)。 |
+| `exclude=A,B` | 除外するサイト(`GET /okazuri/sites` に出る名前。大文字小文字は区別せず、カンマで区切ります)。そのサイトには尋ねません。`sites` には `status: "excluded"` で出ます(ほかの状態と区別できます)。保存済みの作品は応答に入ります。サイトにない名前は 422 です。翻訳には影響しません(出どころは `translator` が決めます)。 |
 | `translator=auto`(既定) | 日本語を含むクエリは、英語でも検索します。英語のタイトルは Hitomi.La(`/hitomila/translate`)から取り、Hitomi.La が失敗するか何も返さないときは Google 翻訳(`/google/translate`)から取ります。両方の検索の作品が `results` に入り、`translation` がそのタイトルを示します(`{"text", "source"}`)。 |
 | `translator=hitomi` | Hitomi.La だけを使います。失敗するか何も返さないときは英語の検索をしません(`translation` は `null`)。 |
 | `translator=google` | Google 翻訳だけを使います。 |
@@ -100,7 +100,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
 }
 ```
 
-`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`unavailable`(Hitomi.La の一覧が全件保存される
+`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト。この2つは尋ねていませんが、保存済みの作品は応答に入ります)、`unavailable`(Hitomi.La の一覧が全件保存される
 までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
 失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数(`total_legal` と `total_illegal` は、その合法なサイトと違法なサイトの内訳)で、`results` はそれより短いことがあります。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。

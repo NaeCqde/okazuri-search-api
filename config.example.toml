@@ -62,7 +62,9 @@ max_results = 100
 # The most saved works a search reads from the database when the indexes cannot answer it (a word that is a number, a short piece that is not
 # letters and digits; the newest are kept). The other searches are answered by the indexes, with no limit.
 max_candidates = 800000
-# Sites to leave out (the names of GET /okazuri/sites). The demo server leaves out these three.
+# Sites that are left out (the names of GET /okazuri/sites): not asked by a search or the prefetch, not walked by [crawl], not checked by [verify]. What
+# is saved of them is still in the answer, after the works of the other sites. (A request leaves a site out of what it asks with `exclude`.) The demo
+# server leaves out these three.
 disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 # A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The
 # other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`); a site
