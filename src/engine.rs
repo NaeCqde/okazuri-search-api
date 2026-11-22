@@ -264,7 +264,7 @@ pub struct Fetched {
 pub struct SiteReport {
     pub website: String,
     /// `searched` (asked now), `cached` (asked less than `ttl_hours` ago, so the database answers), `failed` (a query
-    /// failed), `not searched` (the request said not to ask the sites) or `unavailable` (Hitomi.La, while its whole list is not saved).
+    /// failed), `not searched` (the request said not to ask the sites), `excluded` (the request left the site out of what is asked: its saved works are still in the answer) or `unavailable` (Hitomi.La, while its whole list is not saved).
     pub status: &'static str,
     /// The queries the site is asked: the query as it was written and its romaji for a site that finds Japanese
     /// titles (when the query has Japanese in it), the romaji alone otherwise.
@@ -954,7 +954,7 @@ impl Engine {
 
         let total = counts.map_or(items.len(), |counts| counts.total);
 
-        let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
+        let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude, request.exclude).await?;
         laps.lap("site reports");
         log::info!("timing of the search of {:?} ({rows} candidates, {total} works): {laps}", request.query);
 
@@ -1152,11 +1152,24 @@ impl Engine {
         Ok(())
     }
 
-    async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool, exclude: &[usize]) -> Result<Vec<SiteReport>> {
+    async fn reports(&self, plan: &Plan, asked: &HashSet<usize>, may_ask: bool, exclude: &[usize], excluded: &[usize]) -> Result<Vec<SiteReport>> {
         let mut states: HashMap<String, HashMap<String, SiteState>> = HashMap::new();
         let mut reports = Vec::new();
 
         for &index in &self.active {
+            // a site the request leaves out is told apart (it was not asked); one that is left out for another reason (Hitomi.La, while its list
+            // is not whole) has a report of its own
+            if excluded.contains(&index) {
+                reports.push(SiteReport {
+                    website: self.sites[index].def.name.to_string(),
+                    status: "excluded",
+                    queries: Vec::new(),
+                    count: 0,
+                    error: None,
+                    searched_at: None,
+                });
+                continue;
+            }
             if exclude.contains(&index) {
                 continue;
             }
@@ -1964,7 +1977,7 @@ pub(crate) mod tests {
         // the other two sites are asked, the good one is not
         let outcome = engine.search(&Request { exclude: &leave_out, ..Request::new("q") }).await.unwrap();
         assert_eq!(requests(&hits), (0, 1, 1));
-        assert_eq!(outcome.sites.iter().map(|s| s.website.as_str()).collect::<Vec<_>>(), ["Failing", "Blocked"]);
+        assert_eq!(outcome.sites.iter().map(|s| (s.website.as_str(), s.status)).collect::<Vec<_>>(), [("Good", "excluded"), ("Failing", "failed"), ("Blocked", "failed")]);
         assert!(outcome.results.is_empty());
 
         // asked later without the exclusion, the site is asked (nothing was saved for it), and it answers
