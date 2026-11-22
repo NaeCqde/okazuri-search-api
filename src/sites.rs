@@ -352,7 +352,7 @@ pub const SITES: &[SiteDef] = &[
         "",
     ),
     SiteDef {
-        delay_ms: 20_000,
+        delay_ms: 29_000,
         ..site(
             "177Picyy",
             false,
@@ -360,7 +360,7 @@ pub const SITES: &[SiteDef] = &[
             r"^http://www\.177picyy\.com/[a-z]+/\d+.*",
             Some("http://www.177picyy.com/?s={q}"),
             Support::Ready,
-            "answers 429 (Retry-After 10-20 s) to requests less than about 20 seconds apart, so it is asked that slowly",
+            "answers 429 (Retry-After a few seconds) to requests less than 29 seconds apart (measured 2026-11-22: 28 s fails on the third request, 29 s passes), so it is asked that slowly",
         )
     },
     site("BatoTo", false, "https://bato.to", r"^https://bato\.to/[a-z]+/\d+.*", None, Support::Closed, "the site is closed"),
