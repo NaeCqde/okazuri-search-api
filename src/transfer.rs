@@ -64,6 +64,7 @@ pub async fn export(store: &SearchStore, out: &Path, sites: &[String], since: i6
     let wanted: HashSet<String> = sites.iter().map(|site| site.to_lowercase()).collect();
     let mut moved = Moved::default();
     let mut after = None;
+    let mut allowed: Option<(String, bool)> = None;
 
     loop {
         let page = store.works_after(after.as_ref(), PAGE).await?;
@@ -71,10 +72,16 @@ pub async fn export(store: &SearchStore, out: &Path, sites: &[String], since: i6
         after = Some((last.website.clone(), last.path.clone()));
 
         for row in page {
-            if (!wanted.is_empty() && !wanted.contains(&row.website.to_lowercase())) || row.updated_at < since {
+            // the rows come site by site: the name is looked up when the site changes, not for every row
+            if allowed.as_ref().map_or(true, |(site, _)| *site != row.website) {
+                allowed = Some((row.website.clone(), wanted.is_empty() || wanted.contains(&row.website.to_lowercase())));
+            }
+            if !allowed.as_ref().is_some_and(|(_, yes)| *yes) || row.updated_at < since {
                 continue;
             }
-            moved.sites.insert(row.website.clone());
+            if !moved.sites.contains(&row.website) {
+                moved.sites.insert(row.website.clone());
+            }
             moved.works += 1;
             serde_json::to_writer(&mut writer, &Line::from(row))?;
             writer.write_all(b"\n")?;
@@ -103,7 +110,9 @@ pub async fn import(store: &SearchStore, file: &Path, romanizer: &Arc<Romanizer>
         let line: Line = serde_json::from_str(&text).map_err(|e| format!("{}: line {}: {e}", file.display(), number + 1))?;
 
         moved.works += 1;
-        moved.sites.insert(line.website.clone());
+        if !moved.sites.contains(&line.website) {
+            moved.sites.insert(line.website.clone());
+        }
         batch.push(line);
 
         if batch.len() >= BATCH {
@@ -123,7 +132,7 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
             .into_iter()
             .map(|line| {
                 // the language is read from the title with its flags; the title is kept without them
-                let language = crate::language::detect(&line.title).or(line.language.clone());
+                let language = crate::language::detect(&line.title).or(line.language);
                 let title = crate::language::strip_flags(&line.title);
                 let converted = romaji(&title, &romanizer).unwrap_or_else(|_| title.clone());
 
