@@ -17,7 +17,7 @@ use crate::config::SearchConfig;
 use crate::query::{has_japanese, normalize, restore_times, romaji, tidy, Terms};
 use crate::romanizer::Romanizer;
 use crate::sites::{self, is_challenge, Format, Link, Site, Support};
-use crate::store::{NewWork, SearchStore, SiteState};
+use crate::store::{Candidate, Candidates, NewWork, SearchStore, SiteState};
 use crate::utils::{unix_now, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -59,6 +59,33 @@ pub struct Hit {
     pub language: Vec<String>,
     /// This request found the work on a site and saved it: it was not in the database before.
     pub is_new: bool,
+}
+
+/// A work that matched, as a place in a list of candidates: nothing of it is copied until it is in the answer.
+#[derive(Debug, Clone, Copy)]
+struct Item {
+    /// Which list of candidates (0: the query, 1: the other title of it).
+    set: u8,
+    /// The place in the list.
+    index: u32,
+    /// The index of its site (`Engine::sites`).
+    site: u16,
+    is_new: bool,
+}
+
+/// The matching works of one search: the candidates they stand in, in the order of the answer.
+struct Lite {
+    set: Arc<Candidates>,
+    items: Vec<Item>,
+    /// The answer but its works (`results` is empty).
+    meta: Outcome,
+}
+
+/// The matching works of a request: the lists of candidates (the query, and its other title) and the places in them.
+struct Merged {
+    sets: Vec<Arc<Candidates>>,
+    items: Vec<Item>,
+    meta: Outcome,
 }
 
 /// The title of a work from the address of its page (`Engine::title_of`).
@@ -676,101 +703,146 @@ impl Engine {
 
     /// The answer to a request: the sites are asked (unless the request says not to), and then the saved works
     /// whose title has every word of the query are the result.
+    ///
+    /// The works that match are places in the lists of candidates until the end: only the works of the answer (`limit`) are copied into a `Hit`
+    /// (a word that 700,000 works have costs a few million copies otherwise).
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let mut laps = crate::utils::Laps::new();
-        let mut outcome = self.search_all(request).await?;
+        let Merged { sets, items, mut meta } = self.search_all(request).await?;
         laps.lap("search_all");
 
         // `total` is how many works there are, whatever the limit cuts
-        outcome.total = outcome.results.len();
-        outcome.total_legal = outcome.results.iter().filter(|hit| hit.is_legal).count();
-        outcome.total_illegal = outcome.total - outcome.total_legal;
-        outcome.results.truncate(request.limit.max(1));
+        meta.total = items.len();
+        meta.total_legal = items.iter().filter(|item| self.sites[item.site as usize].def.legal).count();
+        meta.total_illegal = meta.total - meta.total_legal;
+        meta.results = items.iter().take(request.limit.max(1)).map(|item| self.hit_of(&sets[item.set as usize], item)).collect();
         laps.lap("count");
-        self.fill_english(&mut outcome.results).await?;
+        self.fill_english(&mut meta.results).await?;
         laps.lap("fill_english");
 
-        log::info!("timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, outcome.total);
+        log::info!("timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, meta.total);
 
-        Ok(outcome)
+        Ok(meta)
     }
 
-    /// `search` with every work in `results`: the works of the English (or Japanese) title are in it, once.
-    async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
+    /// The work of a place of a list of candidates, copied.
+    fn hit_of(&self, set: &Candidates, item: &Item) -> Hit {
+        let work = &set.works[item.index as usize];
+        let site = &self.sites[item.site as usize];
+
+        Hit {
+            website: set.websites[work.site as usize].clone(),
+            is_legal: site.def.legal,
+            url: site.address(&work.path),
+            path: work.path.clone(),
+            title: work.title.clone(),
+            title_romaji: work.title_romaji.clone(),
+            title_english: None,
+            language: work.language.as_deref().map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
+            is_new: item.is_new,
+        }
+    }
+
+    /// `search` with every work in `items`: the works of the English (or Japanese) title are in it, once.
+    async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Merged> {
         let mut laps = crate::utils::Laps::new();
-        let outcome = self.search_one(request).await?;
+        let first = self.search_one(request).await?;
         laps.lap("first search");
-        let outcome = self.search_all_more(request, outcome, &mut laps).await;
+        let merged = Merged { sets: vec![first.set], items: first.items, meta: first.meta };
+        let merged = self.search_all_more(request, merged, &mut laps).await;
         log::info!("timing of the two searches of {:?}: {laps}", request.query);
 
-        outcome
+        merged
+    }
+
+    /// The search of the other title of a request (`search_all` does it for a query that is not in Japanese, and for one that is): the
+    /// works that the answer does not have yet are put after it.
+    async fn search_title(self: &Arc<Self>, request: &Request<'_>, text: &str, merged: &mut Merged) -> bool {
+        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }).await {
+            Ok(more) => {
+                // a work that is in the answer already (the same address) is not in it twice
+                let known: HashSet<(&str, &str)> = merged.items.iter().map(|item| self.address_of(&merged.sets, item)).collect();
+                let set = merged.sets.len() as u8;
+                let added: Vec<Item> = more
+                    .items
+                    .into_iter()
+                    .filter(|item| !known.contains(&self.address_of(std::slice::from_ref(&more.set), &Item { set: 0, ..*item })))
+                    .map(|item| Item { set, ..item })
+                    .collect();
+
+                merged.items.extend(added);
+                merged.sets.push(more.set);
+
+                true
+            }
+            Err(e) => {
+                log::warn!("cannot search the title {text:?} of {:?}: {e}", request.query);
+
+                false
+            }
+        }
+    }
+
+    /// The origin of the site and the path of a work: its address in two pieces, with no copy.
+    fn address_of<'a>(&self, sets: &'a [Arc<Candidates>], item: &Item) -> (&'a str, &'a str)
+    where
+        Self: 'a,
+    {
+        (self.sites[item.site as usize].def.origin, sets[item.set as usize].works[item.index as usize].path.as_str())
     }
 
     /// The rest of `search_all`: the other title is looked for, and searched.
-    async fn search_all_more(self: &Arc<Self>, request: &Request<'_>, mut outcome: Outcome, laps: &mut crate::utils::Laps) -> Result<Outcome> {
+    async fn search_all_more(self: &Arc<Self>, request: &Request<'_>, mut merged: Merged, laps: &mut crate::utils::Laps) -> Result<Merged> {
         if request.translator == Translator::None {
-            return Ok(outcome);
+            return Ok(merged);
         }
 
         // a query without Japanese: its Japanese title is searched too (the same as the English title of a query in Japanese)
         if !crate::query::has_japanese(request.query) {
             if !request.query.chars().any(|c| c.is_ascii_alphabetic()) {
-                return Ok(outcome);
+                return Ok(merged);
             }
 
             let found = self.japanese_of(request.query, request.translator, request.live).await;
             laps.lap("japanese title");
-            let Some(found) = found else { return Ok(outcome) };
+            let Some(found) = found else { return Ok(merged) };
             let text = found.japanese.trim().to_string();
 
             if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
-                return Ok(outcome);
+                return Ok(merged);
             }
 
-            let more = self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await;
+            let searched = self.search_title(request, &text, &mut merged).await;
             laps.lap("search of the Japanese title");
-            match more {
-                Ok(more) => {
-                    let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
-                    let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
-
-                    outcome.results.extend(added);
-                    outcome.translation_ja = Some(Translated { text, source: found.source });
-                }
-                Err(e) => log::warn!("cannot search the Japanese title {text:?} of {:?}: {e}", request.query),
+            if searched {
+                merged.meta.translation_ja = Some(Translated { text, source: found.source });
             }
 
-            return Ok(outcome);
+            return Ok(merged);
         }
 
         // the English title: its works are in the answer too. A failure leaves the English search out, not the search
         let english = self.english_of(request.query, request.translator, request.live).await;
         laps.lap("english title");
-        let Some(english) = english else { return Ok(outcome) };
+        let Some(english) = english else { return Ok(merged) };
         let text = english.english.trim().to_string();
 
         if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
-            return Ok(outcome);
+            return Ok(merged);
         }
 
-        let more = self.search_one(&Request { query: &text, translator: Translator::None, ..*request }).await;
+        let searched = self.search_title(request, &text, &mut merged).await;
         laps.lap("search of the English title");
-        match more {
-            Ok(more) => {
-                let known: HashSet<String> = outcome.results.iter().map(|hit| hit.url.clone()).collect();
-                let added: Vec<Hit> = more.results.into_iter().filter(|hit| !known.contains(&hit.url)).collect();
-
-                outcome.results.extend(added);
-                outcome.translation = Some(Translated { text, source: english.source });
-            }
-            Err(e) => log::warn!("cannot search the English title {text:?} of {:?}: {e}", request.query),
+        if searched {
+            merged.meta.translation = Some(Translated { text, source: english.source });
         }
 
-        Ok(outcome)
+        Ok(merged)
     }
 
-    /// The search of one query (`search` does it for the English title too). Every work is in `results`, with no English titles yet.
-    async fn search_one(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
+    /// The search of one query (`search` does it for the English title too). The works are places in the candidates (`items`); `meta.results`
+    /// is empty.
+    async fn search_one(self: &Arc<Self>, request: &Request<'_>) -> Result<Lite> {
         let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.query);
@@ -797,52 +869,46 @@ impl Engine {
 
         laps.lap("sites asked");
 
-        let mut hits: Vec<Hit> = Vec::new();
         let candidates = self.store.candidates(&terms.prefilters()).await?;
         let rows = candidates.len();
         laps.lap("candidates");
 
-        // the searched site of a name: found once, not by walking the sites for each of the rows (a site that is left out does not answer,
+        // the searched site of each name the candidates have: found once, not for each of the rows (a site that is left out does not answer,
         // whatever was saved of it)
-        let site_of: HashMap<&str, usize> = self.active.iter().filter(|index| !exclude.contains(index)).map(|&index| (self.sites[index].def.name, index)).collect();
+        let site_of: Vec<Option<usize>> = candidates
+            .websites
+            .iter()
+            .map(|name| self.active.iter().copied().find(|index| !exclude.contains(index) && self.sites[*index].def.name == name))
+            .collect();
         let nothing_is_new = fetched.new.is_empty();
+        let mut items: Vec<Item> = Vec::new();
 
-        for work in candidates.iter() {
-            let Some(&index) = site_of.get(work.website.as_str()) else { continue };
+        for (index, work) in candidates.works.iter().enumerate() {
+            let Some(site) = site_of[work.site as usize] else { continue };
 
-            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue); only the
-            // works that have it are copied
-            if terms.matches_romaji(&work.title_romaji, &work.title_key) {
-                let site = &self.sites[index];
-                let is_new = !nothing_is_new && fetched.new.contains(&(work.website.clone(), work.path.clone()));
+            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
+            if terms.matches_key(&work.title_romaji, work.outside_key.as_deref().unwrap_or(&work.title_key)) {
+                let is_new = !nothing_is_new && fetched.new.contains(&(candidates.websites[work.site as usize].clone(), work.path.clone()));
 
-                hits.push(Hit {
-                    website: work.website.clone(),
-                    is_legal: site.def.legal,
-                    url: site.address(&work.path),
-                    path: work.path.clone(),
-                    title: work.title.clone(),
-                    title_romaji: work.title_romaji.clone(),
-                    title_english: None,
-                    language: work.language.as_deref().map(|codes| codes.split(',').map(str::to_string).collect()).unwrap_or_default(),
-                    is_new,
-                });
+                items.push(Item { set: 0, index: index as u32, site: site as u16, is_new });
             }
         }
 
         laps.lap("match");
 
         // the sites in their order; in a site, the works seen last come first (the order of the database)
-        hits.sort_by_key(|hit| self.order.get(hit.website.as_str()).copied().unwrap_or(usize::MAX));
+        let rank: Vec<usize> = self.sites.iter().map(|site| self.order.get(site.def.name).copied().unwrap_or(usize::MAX)).collect();
+        items.sort_by_key(|item| rank[item.site as usize]);
 
-        let hits = dedupe_by_url(hits);
-        let total = hits.len();
+        let origins: Vec<String> = self.sites.iter().map(|site| site.def.origin.to_lowercase()).collect();
+        let items = dedupe_items(&candidates.works, &origins, items);
+        let total = items.len();
         laps.lap("sort");
         let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
         laps.lap("site reports");
         log::info!("timing of the search of {:?} ({rows} candidates, {total} works): {laps}", request.query);
 
-        Ok(Outcome {
+        let meta = Outcome {
             sites: {
                 let mut sites = reports;
                 if let Some(index) = unlisted.filter(|index| !request.exclude.contains(index)) {
@@ -862,11 +928,13 @@ impl Engine {
             total,
             total_legal: 0,
             total_illegal: 0,
-            results: hits,
+            results: Vec::new(),
             query: plan.query,
             translation: None,
             translation_ja: None,
-        })
+        };
+
+        Ok(Lite { set: candidates, items, meta })
     }
 
     /// Whether Hitomi.La is one of the sites and its whole list is not saved yet (its crawl has not reached the end): its search and its
@@ -1515,6 +1583,34 @@ impl crate::hitomi::Fetch for HitomiFetch<'_> {
 
 /// One hit for each address: the same page saved twice (`/g/1/` and `/g/1`, two sites that answer with the same address) is
 /// one result. The first one (the order of the answer) stays, and is new when any of them is.
+fn dedupe_items<'a>(candidates: &'a [Candidate], origins: &'a [String], items: Vec<Item>) -> Vec<Item> {
+    // the key is the address in two pieces (the origin of the site, and the path without its `#` and its last `/`), folded to lower case:
+    // the same as the address as one text, and no copy for a path that is already in lower case
+    let key = |item: &Item| -> (&'a str, std::borrow::Cow<'a, str>) {
+        let path = candidates[item.index as usize].path.as_str();
+        let path = path.split('#').next().unwrap_or(path).trim_end_matches('/');
+        let path = if path.is_ascii() && !path.bytes().any(|b| b.is_ascii_uppercase()) { std::borrow::Cow::Borrowed(path) } else { std::borrow::Cow::Owned(path.to_lowercase()) };
+
+        (origins[item.site as usize].as_str(), path)
+    };
+    let mut places: HashMap<(&str, std::borrow::Cow<str>), usize> = HashMap::with_capacity(items.len());
+    let mut kept: Vec<Item> = Vec::with_capacity(items.len());
+
+    for item in items {
+        match places.entry(key(&item)) {
+            std::collections::hash_map::Entry::Occupied(place) => kept[*place.get()].is_new |= item.is_new,
+            std::collections::hash_map::Entry::Vacant(place) => {
+                place.insert(kept.len());
+                kept.push(item);
+            }
+        }
+    }
+
+    kept
+}
+
+/// The same as `dedupe_items` for the hits themselves: what the answer was before it was made of places (for the tests).
+#[cfg(test)]
 fn dedupe_by_url(hits: Vec<Hit>) -> Vec<Hit> {
     let mut places: HashMap<String, usize> = HashMap::new();
     let mut kept: Vec<Hit> = Vec::new();
@@ -1878,6 +1974,73 @@ pub(crate) mod tests {
         assert_eq!(titles.len(), 0, "the paths are the same for every query, so a page keeps the last title the site gave");
         assert_eq!(outcome.sites[0].status, "not searched");
         assert_eq!(requests(&hits), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn a_page_of_the_answer_is_a_part_of_the_whole_answer() {
+        let (engine, _, _) = setup(&config()).await;
+        let works: Vec<NewWork> = (1..=7).map(|n| NewWork { path: format!("/work/{n}"), title: format!("Alpha {n}"), romaji: format!("alpha {n}"), language: None }).collect();
+        engine.store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
+
+        let whole = engine.search(&Request { live: Live::Off, limit: 100, ..Request::new("alpha") }).await.unwrap();
+        assert_eq!(whole.total, 7);
+        assert_eq!(whole.results.len(), 7);
+
+        // the first works of a short answer are the first works of the whole one, and the totals are those of the whole answer
+        let few = engine.search(&Request { live: Live::Off, limit: 3, ..Request::new("alpha") }).await.unwrap();
+        assert_eq!(few.results, whole.results[..3]);
+        assert_eq!((few.total, few.total_legal, few.total_illegal), (whole.total, whole.total_legal, whole.total_illegal));
+
+        // the page 2 of 3 works (the api asks for offset + limit and drops the offset)
+        let upto = engine.search(&Request { live: Live::Off, limit: 6, ..Request::new("alpha") }).await.unwrap();
+        assert_eq!(upto.results[3..], whole.results[3..6]);
+    }
+
+    #[test]
+    fn the_places_of_the_works_are_deduplicated_like_the_works_themselves() {
+        let work = |website: &str, path: &str| (website.to_string(), Candidate { site: 0, outside_key: None, path: path.into(), title: "t".into(), title_romaji: "t".into(), title_key: "t".into(), language: None });
+        let pairs = vec![
+            work("A", "/g/1/"),
+            work("A", "/g/1"),
+            work("A", "/G/1#frag"),
+            work("B", "/g/1"),
+            work("A", "/g/2"),
+            work("B", "/g/2/"),
+            work("B", "/"),
+            work("B", ""),
+            work("A", "/ü/1"),
+            work("A", "/Ü/1/"),
+        ];
+        let candidates: Vec<Candidate> = pairs.iter().map(|(_, work)| work.clone()).collect();
+        let origins = vec!["https://a.example".to_string(), "https://a.example".to_string()];
+        let new = [false, true, false, false, false, false, false, true, false, false];
+        let sites = [0u16, 0, 0, 1, 0, 1, 1, 1, 0, 0];
+        let items: Vec<Item> = (0..candidates.len()).map(|n| Item { set: 0, index: n as u32, site: sites[n], is_new: new[n] }).collect();
+
+        let hits: Vec<Hit> = items
+            .iter()
+            .map(|item| {
+                let work = &candidates[item.index as usize];
+
+                Hit {
+                    website: pairs[item.index as usize].0.clone(),
+                    is_legal: false,
+                    url: format!("{}{}", origins[item.site as usize], work.path),
+                    path: work.path.clone(),
+                    title: work.title.clone(),
+                    title_romaji: work.title_romaji.clone(),
+                    title_english: None,
+                    language: Vec::new(),
+                    is_new: item.is_new,
+                }
+            })
+            .collect();
+
+        let by_hits: Vec<(String, bool)> = dedupe_by_url(hits).into_iter().map(|hit| (hit.url, hit.is_new)).collect();
+        let by_items: Vec<(String, bool)> = dedupe_items(&candidates, &origins, items).into_iter().map(|item| (format!("{}{}", origins[item.site as usize], candidates[item.index as usize].path), item.is_new)).collect();
+
+        assert_eq!(by_items, by_hits);
+        assert!(by_hits.len() < candidates.len());
     }
 
     #[tokio::test]

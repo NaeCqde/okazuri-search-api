@@ -65,20 +65,51 @@ const CACHE_MIN_MS: u64 = 5000;
 const CANDIDATES_LIFETIME: Duration = Duration::from_secs(300);
 
 /// The candidates of the words asked lately (`SearchStore::candidates`), the oldest first.
-/// A work a search reads: only what the search needs (the dates, the mark of a page that is gone and the time of its last look stay in the
-/// database; a search reads hundreds of thousands of these rows, and every column is a cost).
-#[derive(Debug, Clone, PartialEq, Eq, sea_orm::FromQueryResult)]
+/// A work a search reads, as the database has it: only what the search needs (the dates, the mark of a page that is gone and the time of its
+/// last look stay in the database; a search reads hundreds of thousands of these rows, and every column is a cost).
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct CandidateRow {
+    website: String,
+    path: String,
+    title: String,
+    title_romaji: String,
+    title_key: String,
+    language: Option<String>,
+}
+
+/// A work a search reads, as it is kept: the site is a number (a search of 700,000 works does not hash 700,000 names), and the one thing that
+/// every row is asked is kept beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
-    pub website: String,
+    /// The place of the name of its site in `Candidates::websites`.
+    pub site: u16,
+    /// The key of what is outside the parentheses of the title, when the title has a parenthesis (`query::outside_key`): found once, when the
+    /// rows are read, not for each search that matches them. None: the title is its own outside, and `title_key` is that key.
+    pub outside_key: Option<String>,
     pub path: String,
     pub title: String,
     pub title_romaji: String,
-    /// `title_key` of the romaji: what the search narrows with, and matches an ASCII title with.
+    /// `title_key` of the romaji: what the search narrows with, and matches a title that has no parenthesis with.
     pub title_key: String,
     pub language: Option<String>,
 }
 
-type CandidateSets = Vec<(String, Instant, Arc<Vec<Candidate>>)>;
+/// The candidates of a word, newest first, and the names of their sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidates {
+    pub works: Vec<Candidate>,
+    pub websites: Vec<String>,
+}
+
+impl std::ops::Deref for Candidates {
+    type Target = Vec<Candidate>;
+
+    fn deref(&self) -> &Vec<Candidate> {
+        &self.works
+    }
+}
+
+type CandidateSets = Vec<(String, Instant, Arc<Candidates>)>;
 
 pub struct SearchStore {
     db: DatabaseConnection,
@@ -921,7 +952,7 @@ impl SearchStore {
     ///
     /// The rows of a word are kept for `CANDIDATES_LIFETIME` (reading up to 50,000 rows of a table of gigabytes takes seconds for a word that many works
     /// have), and forgotten when this process writes a work.
-    pub async fn candidates(&self, parts: &[&str]) -> Result<Arc<Vec<Candidate>>> {
+    pub async fn candidates(&self, parts: &[&str]) -> Result<Arc<Candidates>> {
         let key = parts.join("\u{1}");
 
         let started = Instant::now();
@@ -964,7 +995,7 @@ impl SearchStore {
         self.forget_candidates();
     }
 
-    fn kept_candidates(&self, key: &str) -> Option<Arc<Vec<Candidate>>> {
+    fn kept_candidates(&self, key: &str) -> Option<Arc<Candidates>> {
         let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
         sets.retain(|(_, at, _)| at.elapsed() < CANDIDATES_LIFETIME);
 
@@ -1023,12 +1054,36 @@ impl SearchStore {
         statement
     }
 
-    async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Vec<Candidate>> {
+    async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Candidates> {
         use sea_orm::FromQueryResult;
 
         let statement = self.candidates_statement(parts, most, "w.website, w.path, w.title, w.title_romaji, w.title_key, w.language");
+        let rows = CandidateRow::find_by_statement(statement).all(&self.db).await?;
+        let mut websites: Vec<String> = Vec::new();
+        let mut works = Vec::with_capacity(rows.len());
 
-        Ok(Candidate::find_by_statement(statement).all(&self.db).await?)
+        for row in rows {
+            // a few sites: the name is looked for in the names so far
+            let site = match websites.iter().position(|name| *name == row.website) {
+                Some(place) => place,
+                None => {
+                    websites.push(row.website);
+                    websites.len() - 1
+                }
+            };
+
+            works.push(Candidate {
+                site: site as u16,
+                outside_key: (!crate::query::is_plain(&row.title_romaji)).then(|| crate::query::outside_key(&row.title_romaji)),
+                path: row.path,
+                title: row.title,
+                title_romaji: row.title_romaji,
+                title_key: row.title_key,
+                language: row.language,
+            });
+        }
+
+        Ok(Candidates { works, websites })
     }
 
     /// The candidates with every column of the works, read from the database every time (for the tests).
@@ -1454,8 +1509,8 @@ mod tests {
         works.into_iter().map(|w| w.path).collect()
     }
 
-    async fn paths_of_candidates(works: Vec<Candidate>) -> Vec<String> {
-        works.into_iter().map(|w| w.path).collect()
+    async fn paths_of_candidates(found: Candidates) -> Vec<String> {
+        found.works.into_iter().map(|w| w.path).collect()
     }
 
     async fn some_works() -> SearchStore {
