@@ -171,21 +171,25 @@ fn split_parentheses(title: &str) -> (String, Vec<String>) {
     (outside, groups)
 }
 
-/// The runs of digits of a title, without the zeros in front (`2026年07月号` has 2026 and 7).
-fn numbers(title: &str) -> Vec<String> {
-    let folded: String = title.nfkc().collect();
+/// The title as the numbers are read in it: NFKC-folded (full-width digits are digits). ASCII is its own fold.
+fn fold(title: &str) -> std::borrow::Cow<'_, str> {
+    if title.is_ascii() { std::borrow::Cow::Borrowed(title) } else { std::borrow::Cow::Owned(title.nfkc().collect()) }
+}
 
-    folded
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|run| !run.is_empty())
-        .map(strip_zeros)
-        .collect()
+/// Is `number` (without the zeros in front) one of the runs of digits of the folded title, without the zeros in front (`2026年07月号` has 2026
+/// and 7)? No run is copied.
+fn has_number(folded: &str, number: &str) -> bool {
+    folded.split(|c: char| !c.is_ascii_digit()).any(|run| !run.is_empty() && stripped(run) == number)
+}
+
+fn stripped(digits: &str) -> &str {
+    let stripped = digits.trim_start_matches('0');
+
+    if stripped.is_empty() { "0" } else { stripped }
 }
 
 fn strip_zeros(digits: &str) -> String {
-    let stripped = digits.trim_start_matches('0');
-
-    if stripped.is_empty() { "0".to_string() } else { stripped.to_string() }
+    stripped(digits).to_string()
 }
 
 /// The words that the indexes of the database answer: a work matches when its key has every piece of `long`, and every piece of `short` is a
@@ -292,11 +296,12 @@ impl Terms {
             return false;
         }
 
-        let mut in_title: Option<Vec<String>> = None;
+        // the title folded once, for the numbers (an ASCII title is its own fold: nothing is copied)
+        let mut folded: Option<std::borrow::Cow<str>> = None;
 
         self.0.iter().all(|term| match &term.number {
             // a number is a number of the title, not a few digits of a longer one (6 is not in 2026)
-            Some(number) => in_title.get_or_insert_with(|| numbers(title)).contains(number),
+            Some(number) => has_number(folded.get_or_insert_with(|| fold(title)), number),
             None => key.contains(&term.key),
         })
     }
