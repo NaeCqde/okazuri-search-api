@@ -19,7 +19,7 @@ use sea_orm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What is known of one search (a query on a site).
@@ -55,17 +55,8 @@ pub type Work = work::Model;
 /// The most rows `find` reads: a word that is in nearly every title would read the whole table.
 const MAX_CANDIDATES: u64 = 50_000;
 
-/// How many words keep their candidates in memory (a set of them is up to `MAX_CANDIDATES` rows).
-const CACHED_CANDIDATE_SETS: usize = 8;
-
 /// The version of the keys and the indexes (`PRAGMA user_version`).
 const INDEX_VERSION: i64 = 1;
-
-/// A word is kept in memory only when reading its rows from the database took this long (milliseconds).
-const CACHE_MIN_MS: u64 = 5000;
-
-/// How long the candidates of a word are kept: the crawlers and the other processes write the same file, and this process cannot see it.
-const CANDIDATES_LIFETIME: Duration = Duration::from_secs(300);
 
 /// The candidates of the words asked lately (`SearchStore::candidates`), the oldest first.
 /// A work a search reads, as the database has it: only what the search needs (the dates, the mark of a page that is gone and the time of its
@@ -109,15 +100,10 @@ impl std::ops::Deref for Candidates {
     }
 }
 
-type CandidateSets = Vec<(String, Instant, Arc<Candidates>)>;
-
 pub struct SearchStore {
     db: DatabaseConnection,
-    candidate_sets: Mutex<CandidateSets>,
     /// The most rows one search of the database reads (`[search] max_candidates`).
     max_candidates: std::sync::atomic::AtomicU64,
-    /// The milliseconds the read of a word has to take for its rows to be kept (`[search] candidate_cache_min_ms`).
-    cache_min_ms: std::sync::atomic::AtomicU64,
 }
 
 impl SearchStore {
@@ -153,7 +139,7 @@ impl SearchStore {
 
         Self::create_tables(&db).await?;
 
-        Ok(Self { db, candidate_sets: Mutex::new(Vec::new()), max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), cache_min_ms: std::sync::atomic::AtomicU64::new(CACHE_MIN_MS) })
+        Ok(Self { db, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
     }
 
     async fn create_tables(db: &DatabaseConnection) -> Result<()> {
@@ -399,7 +385,6 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
-        self.forget_candidates();
 
         Ok(new)
     }
@@ -621,7 +606,6 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
-        self.forget_candidates();
 
         Ok(())
     }
@@ -744,7 +728,6 @@ impl SearchStore {
                 }
             }
             transaction.commit().await?;
-            self.forget_candidates();
         }
 
         Ok((looked, changed))
@@ -764,7 +747,6 @@ impl SearchStore {
             .exec_without_returning(&transaction)
             .await?;
         transaction.commit().await?;
-        self.forget_candidates();
 
         Ok(new as usize)
     }
@@ -848,7 +830,6 @@ impl SearchStore {
             .await?;
 
         transaction.commit().await?;
-        self.forget_candidates();
 
         Ok(new)
     }
@@ -991,7 +972,6 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
-        self.forget_candidates();
 
         Ok(forgotten)
     }
@@ -1059,64 +1039,19 @@ impl SearchStore {
             .collect())
     }
 
-    /// The works whose title key has every one of `parts` in it (all works for none), the most recently saved first, at most
-    /// `MAX_CANDIDATES`. This only narrows the rows; the caller still matches every word of its query.
-    ///
-    /// The rows of a word are kept for `CANDIDATES_LIFETIME` (reading up to 50,000 rows of a table of gigabytes takes seconds for a word that many works
-    /// have), and forgotten when this process writes a work.
+    /// The works whose title key has every one of `parts` in it (all works for none), the last added first, at most `max_candidates`. This only
+    /// narrows the rows; the caller still matches every word of its query. Nothing is kept: every call reads the database.
     pub async fn candidates(&self, parts: &[&str]) -> Result<Arc<Candidates>> {
-        let key = parts.join("\u{1}");
-
         let started = Instant::now();
-
-        // the saved rows are shared, not copied: a word of 700,000 works is hundreds of megabytes
-        if let Some(kept) = self.kept_candidates(&key) {
-            log::info!("candidates of {parts:?}: {} saved, shared in {} ms", kept.len(), started.elapsed().as_millis());
-
-            return Ok(kept);
-        }
-
         let found = Arc::new(self.candidates_up_to(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed)).await?);
         log::info!("candidates of {parts:?}: {} read from the database in {} ms", found.len(), started.elapsed().as_millis());
-
-        // only a word that was slow to read is kept: the others cost less to read again than the memory they hold
-        if started.elapsed().as_millis() < u128::from(self.cache_min_ms.load(std::sync::atomic::Ordering::Relaxed)) {
-            return Ok(found);
-        }
-
-        let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
-        sets.retain(|(kept, ..)| *kept != key);
-        if sets.len() >= CACHED_CANDIDATE_SETS {
-            sets.remove(0);
-        }
-        sets.push((key, Instant::now(), found.clone()));
 
         Ok(found)
     }
 
-    /// The most rows a search of the database reads, for every word and every condition (the newest ones are kept). It also forgets the
-    /// saved candidates: they were cut by the old number.
-    /// The milliseconds the read of a word has to take for its rows to be kept (`[search] candidate_cache_min_ms`); the kept ones are forgotten.
-    pub fn set_candidate_cache_min_ms(&self, milliseconds: u64) {
-        self.cache_min_ms.store(milliseconds, std::sync::atomic::Ordering::Relaxed);
-        self.forget_candidates();
-    }
-
+    /// The most rows a search of the database reads when the indexes cannot answer it (the newest ones are kept).
     pub fn set_max_candidates(&self, most: usize) {
         self.max_candidates.store(most as u64, std::sync::atomic::Ordering::Relaxed);
-        self.forget_candidates();
-    }
-
-    fn kept_candidates(&self, key: &str) -> Option<Arc<Candidates>> {
-        let mut sets = self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner());
-        sets.retain(|(_, at, _)| at.elapsed() < CANDIDATES_LIFETIME);
-
-        sets.iter().find(|(kept, ..)| kept == key).map(|(_, _, works)| works.clone())
-    }
-
-    /// The saved candidates are not the works of the database any more: a write of this process changed them.
-    fn forget_candidates(&self) {
-        self.candidate_sets.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// The SQL of the candidates with the columns that are read (`w.*` is every column of a work).
@@ -1275,49 +1210,6 @@ mod tests {
         assert_eq!((one.title.as_str(), one.updated_at), ("New title", 200), "the title is the last one the site gave");
         assert_eq!(one.first_seen, 100);
         assert_eq!(store.counts().await.unwrap(), (2, 2));
-    }
-
-    #[tokio::test]
-    async fn only_a_word_that_was_slow_to_read_is_kept() {
-        let store = SearchStore::in_memory().await.unwrap();
-        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "Comic One")]), false).await.unwrap();
-
-        // read in a few milliseconds: not worth the memory
-        store.candidates(&["comic"]).await.unwrap();
-        assert!(store.kept_candidates("comic").is_none());
-
-        // every read counts as slow
-        store.set_candidate_cache_min_ms(0);
-        store.candidates(&["comic"]).await.unwrap();
-        assert!(store.kept_candidates("comic").is_some());
-
-        // no read is slow enough: nothing is kept, and what was kept is forgotten
-        store.set_candidate_cache_min_ms(u64::MAX);
-        assert!(store.kept_candidates("comic").is_none());
-        store.candidates(&["comic"]).await.unwrap();
-        assert!(store.kept_candidates("comic").is_none());
-    }
-
-    #[tokio::test]
-    async fn the_candidates_of_a_word_are_kept_until_this_process_writes_a_work() {
-        let store = SearchStore::in_memory().await.unwrap();
-        store.set_candidate_cache_min_ms(0);
-        store.save("q", "A", 100, &Ok(vec![link("/g/1/", "Comic One")]), false).await.unwrap();
-
-        assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 1);
-
-        // a row that another process wrote is not seen while the candidates are kept
-        store
-            .db
-            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/2/', 'Comic Two', 'comic two', 'comictwo', 2, 2, NULL, 0, NULL)")
-            .await
-            .unwrap();
-        assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 1, "kept");
-        assert_eq!(store.candidates(&["comic", "two"]).await.unwrap().len(), 1, "another word is read from the database");
-
-        // a write of this process makes the next read go to the database
-        store.save("q", "A", 200, &Ok(vec![link("/g/3/", "Comic Three")]), false).await.unwrap();
-        assert_eq!(store.candidates(&["comic"]).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -1713,8 +1605,6 @@ mod tests {
 
         // a removed work
         store.db.execute_unprepared("DELETE FROM works WHERE path = '/g/1/'").await.unwrap();
-        // (another process wrote it: the kept candidates are old when their time is over)
-        store.forget_candidates();
         assert_eq!(paths(store.candidates_owned(&["kyoudai"]).await.unwrap()).await, ["/g/6/"]);
         assert_eq!(paths(store.candidates_owned(&["shitara"]).await.unwrap()).await, ["/g/4/"]);
     }
