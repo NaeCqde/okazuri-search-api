@@ -52,21 +52,32 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Says how long a cache (Cloudflare in front of this server, a browser) may keep an answer. Only a `200` is kept;
 /// a search that asks every site again (`live=force`) and the health check are never kept.
-async fn cache_control(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let path = request.uri().path().to_string();
-    // Read the query the way the handlers do (percent-decoded, case-insensitive), so `live=ON` or `live=%6Fn` is not kept either.
-    let forced = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(request.uri()).map_or(true, |query| query.0.iter().any(|(key, value)| key == "live" && Live::parse(value) == Some(Live::Force)));
-    let mut response = next.run(request).await;
-    let seconds = match path.as_str() {
-        "/okazuri/search" if !forced => 300,
+/// How long a shared cache may keep the answer to a request, by its path (0: not at all). The path is only compared, not copied.
+fn seconds_of(request: &axum::extract::Request) -> u32 {
+    let path = request.uri().path();
+    // Read the query the way the handlers do (percent-decoded, case-insensitive), so `live=ON` or `live=%6Fn` is not kept either. Only the search
+    // is asked (the other paths do not look at it).
+    let forced = || axum::extract::Query::<Vec<(String, String)>>::try_from_uri(request.uri()).map_or(true, |query| query.0.iter().any(|(key, value)| key == "live" && Live::parse(value) == Some(Live::Force)));
+
+    match path {
+        "/okazuri/search" if !forced() => 300,
         "/hitomila/translate" | "/google/translate" | "/auto/translate" | "/romaji" => 86_400,
         "/okazuri/sites" => 3_600,
         "/okazuri/title" => 3_600,
         "/okazuri/magazine" | "/okazuri/magazines" | "/okazuri/works" => 300,
         _ => 0,
+    }
+}
+
+async fn cache_control(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let seconds = seconds_of(&request);
+    let mut response = next.run(request).await;
+    let value = if seconds > 0 && response.status() == StatusCode::OK {
+        header::HeaderValue::from_str(&format!("public, max-age=60, s-maxage={seconds}")).expect("a valid header value")
+    } else {
+        header::HeaderValue::from_static("no-store")
     };
-    let value = if seconds > 0 && response.status() == StatusCode::OK { format!("public, max-age=60, s-maxage={seconds}") } else { "no-store".to_string() };
-    response.headers_mut().insert(header::CACHE_CONTROL, value.parse().expect("a valid header value"));
+    response.headers_mut().insert(header::CACHE_CONTROL, value);
     response
 }
 
