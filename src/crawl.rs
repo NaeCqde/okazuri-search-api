@@ -83,10 +83,11 @@ fn ban_wait(error: &str) -> Option<Duration> {
             word if word.starts_with("second") => 1,
             _ => continue,
         };
-        seconds += number * unit;
+        seconds = seconds.saturating_add(number.saturating_mul(unit));
     }
 
-    (seconds > 0).then(|| Duration::from_secs(seconds + 30))
+    // a page of a site must not park the walk for good: at most a week
+    (seconds > 0).then(|| Duration::from_secs(seconds.min(7 * 86_400) + 30))
 }
 
 /// The waits, in seconds, before a page that failed is asked again (then the walk gives up until `retry_minutes` have passed).
