@@ -79,9 +79,6 @@ pub struct SearchConfig {
     pub max_results: usize,
     /// The most saved works one search reads from the database, whatever the words are (the newest ones are kept). A word that is in more works than this is cut.
     pub max_candidates: usize,
-    /// The rows a search reads for a word are kept in memory for 5 minutes (the next search of the word skips the database) only when reading them took at
-    /// least this many milliseconds: a word that is read quickly costs less than the memory it would hold. 0 keeps every word.
-    pub candidate_cache_min_ms: u64,
     /// Names of the sites (`GET /okazuri/sites`) that are left out.
     pub disabled_sites: Vec<String>,
     /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
@@ -115,7 +112,6 @@ impl Default for SearchConfig {
             max_results_per_site: 50,
             max_results: 100,
             max_candidates: 800_000,
-            candidate_cache_min_ms: 5000,
             disabled_sites: Vec::new(),
             skip_crawled: false,
             try_unsupported: false,

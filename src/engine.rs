@@ -73,10 +73,24 @@ struct Item {
     is_new: bool,
 }
 
+/// What the search before this one asked: the indexes (and which words), or the rows one by one.
+struct Searched<'a> {
+    indexed: bool,
+    matcher: Option<&'a crate::query::Matcher>,
+    /// How many works the answer has so far, and how many of them are in `Merged::items`.
+    total: usize,
+    items: usize,
+}
+
 /// The matching works of one search: the candidates they stand in, in the order of the answer.
 struct Lite {
     set: Arc<Candidates>,
     items: Vec<Item>,
+    /// How many works each site has in the answer (by `Engine::sites`), when the indexes of the database were asked: `set` is then only the
+    /// head of the answer. None: `items` is all of it.
+    counts: Option<Vec<usize>>,
+    /// What the indexes were asked (to leave it out of the other title's search).
+    matcher: Option<crate::query::Matcher>,
     /// The answer but its works (`results` is empty).
     meta: Outcome,
 }
@@ -85,6 +99,9 @@ struct Lite {
 struct Merged {
     sets: Vec<Arc<Candidates>>,
     items: Vec<Item>,
+    /// As `Lite::counts`, of all the searches together.
+    counts: Option<Vec<usize>>,
+    matcher: Option<crate::query::Matcher>,
     meta: Outcome,
 }
 
@@ -708,12 +725,20 @@ impl Engine {
     /// (a word that 700,000 works have costs a few million copies otherwise).
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let mut laps = crate::utils::Laps::new();
-        let Merged { sets, items, mut meta } = self.search_all(request).await?;
+        let Merged { sets, items, mut meta, counts, .. } = self.search_all(request).await?;
         laps.lap("search_all");
 
         // `total` is how many works there are, whatever the limit cuts
-        meta.total = items.len();
-        meta.total_legal = items.iter().filter(|item| self.sites[item.site as usize].def.legal).count();
+        match counts {
+            Some(counts) => {
+                meta.total = counts.iter().sum();
+                meta.total_legal = counts.iter().enumerate().filter(|(site, _)| self.sites[*site].def.legal).map(|(_, n)| n).sum();
+            }
+            None => {
+                meta.total = items.len();
+                meta.total_legal = items.iter().filter(|item| self.sites[item.site as usize].def.legal).count();
+            }
+        }
         meta.total_illegal = meta.total - meta.total_legal;
         meta.results = items.iter().take(request.limit.max(1)).map(|item| self.hit_of(&sets[item.set as usize], item)).collect();
         laps.lap("count");
@@ -746,9 +771,9 @@ impl Engine {
     /// `search` with every work in `items`: the works of the English (or Japanese) title are in it, once.
     async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Merged> {
         let mut laps = crate::utils::Laps::new();
-        let first = self.search_one(request).await?;
+        let first = self.search_one(request, None).await?;
         laps.lap("first search");
-        let merged = Merged { sets: vec![first.set], items: first.items, meta: first.meta };
+        let merged = Merged { sets: vec![first.set], items: first.items, counts: first.counts, matcher: first.matcher, meta: first.meta };
         let merged = self.search_all_more(request, merged, &mut laps).await;
         log::info!("timing of the two searches of {:?}: {laps}", request.query);
 
@@ -758,8 +783,21 @@ impl Engine {
     /// The search of the other title of a request (`search_all` does it for a query that is not in Japanese, and for one that is): the
     /// works that the answer does not have yet are put after it.
     async fn search_title(self: &Arc<Self>, request: &Request<'_>, text: &str, merged: &mut Merged) -> bool {
-        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }).await {
+        // the indexes answer the other title too when they answered the first one: what the first found is left out, by the indexes
+        let after = Searched {
+            indexed: merged.counts.is_some(),
+            matcher: merged.matcher.as_ref(),
+            total: merged.counts.as_ref().map_or(0, |counts| counts.iter().sum()),
+            items: merged.items.len(),
+        };
+        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after)).await {
             Ok(more) => {
+                if let (Some(counts), Some(more_counts)) = (merged.counts.as_mut(), more.counts.as_ref()) {
+                    for (site, n) in more_counts.iter().enumerate() {
+                        counts[site] += n;
+                    }
+                }
+
                 // a work that is in the answer already (the same address) is not in it twice
                 let known: HashSet<(&str, &str)> = merged.items.iter().map(|item| self.address_of(&merged.sets, item)).collect();
                 let set = merged.sets.len() as u8;
@@ -842,7 +880,7 @@ impl Engine {
 
     /// The search of one query (`search` does it for the English title too). The works are places in the candidates (`items`); `meta.results`
     /// is empty.
-    async fn search_one(self: &Arc<Self>, request: &Request<'_>) -> Result<Lite> {
+    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched<'_>>) -> Result<Lite> {
         let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.query);
@@ -869,41 +907,32 @@ impl Engine {
 
         laps.lap("sites asked");
 
-        let candidates = self.store.candidates(&terms.prefilters()).await?;
-        let rows = candidates.len();
-        laps.lap("candidates");
-
-        // the searched site of each name the candidates have: found once, not for each of the rows (a site that is left out does not answer,
-        // whatever was saved of it)
-        let site_of: Vec<Option<usize>> = candidates
-            .websites
-            .iter()
-            .map(|name| self.active.iter().copied().find(|index| !exclude.contains(index) && self.sites[*index].def.name == name))
-            .collect();
-        let nothing_is_new = fetched.new.is_empty();
-        let mut items: Vec<Item> = Vec::new();
-
-        for (index, work) in candidates.works.iter().enumerate() {
-            let Some(site) = site_of[work.site as usize] else { continue };
-
-            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
-            if terms.matches_key(&work.title_romaji, work.outside_key.as_deref().unwrap_or(&work.title_key)) {
-                let is_new = !nothing_is_new && fetched.new.contains(&(candidates.websites[work.site as usize].clone(), work.path.clone()));
-
-                items.push(Item { set: 0, index: index as u32, site: site as u16, is_new });
-            }
+        // the indexes answer a search whose words they know (counts and the head of the answer in milliseconds); any other is read row by row.
+        // The other title of a search that the indexes answered is asked of them too (what the first search found is left out)
+        // (the trigram index has no key for a name of less than 3 characters: the sites of the tests have such names)
+        let matcher = match &after {
+            Some(after) if !after.indexed => None,
+            _ if self.active.iter().any(|index| self.sites[*index].def.name.chars().count() < 3) => None,
+            _ => terms.matcher(),
+        };
+        if matcher.is_none() && after.as_ref().is_some_and(|after| after.indexed) {
+            return Err("the indexes cannot answer the other title".into());
         }
 
-        laps.lap("match");
+        let (candidates, items, counts, rows) = match &matcher {
+            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched, exclude).await?,
+            None => {
+                let (candidates, items) = self.scanned_items(&terms, &fetched, exclude).await?;
+                laps.lap("candidates and match");
+                let rows = candidates.len();
 
-        // the sites in their order; in a site, the works seen last come first (the order of the database)
-        let rank: Vec<usize> = self.sites.iter().map(|site| self.order.get(site.def.name).copied().unwrap_or(usize::MAX)).collect();
-        items.sort_by_key(|item| rank[item.site as usize]);
+                (candidates, items, None, rows)
+            }
+        };
+        laps.lap("found");
 
-        let origins: Vec<String> = self.sites.iter().map(|site| site.def.origin.to_lowercase()).collect();
-        let items = dedupe_items(&candidates.works, &origins, items);
-        let total = items.len();
-        laps.lap("sort");
+        let total = counts.as_ref().map_or(items.len(), |counts| counts.iter().sum());
+
         let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude).await?;
         laps.lap("site reports");
         log::info!("timing of the search of {:?} ({rows} candidates, {total} works): {laps}", request.query);
@@ -934,7 +963,106 @@ impl Engine {
             translation_ja: None,
         };
 
-        Ok(Lite { set: candidates, items, meta })
+        Ok(Lite { set: candidates, items, counts, matcher, meta })
+    }
+
+    /// The searched sites that are not left out, in the order of the answer.
+    fn sites_in_order(&self, exclude: &[usize]) -> Vec<usize> {
+        let mut sites: Vec<usize> = self.active.iter().copied().filter(|index| !exclude.contains(index)).collect();
+        sites.sort_by_key(|index| self.order.get(self.sites[*index].def.name).copied().unwrap_or(usize::MAX));
+
+        sites
+    }
+
+    /// The works of the answer by reading the saved rows that have the words one by one (a word that is a number, a short piece that is not
+    /// letters): the matching works as places in their candidates, in the order of the answer, once each address.
+    async fn scanned_items(&self, terms: &Terms, fetched: &Fetched, exclude: &[usize]) -> Result<(Arc<Candidates>, Vec<Item>)> {
+        let candidates = self.store.candidates(&terms.prefilters()).await?;
+
+        // the searched site of each name the candidates have: found once, not for each of the rows (a site that is left out does not answer,
+        // whatever was saved of it)
+        let site_of: Vec<Option<usize>> = candidates
+            .websites
+            .iter()
+            .map(|name| self.active.iter().copied().find(|index| !exclude.contains(index) && self.sites[*index].def.name == name))
+            .collect();
+        let nothing_is_new = fetched.new.is_empty();
+        let mut items: Vec<Item> = Vec::new();
+
+        for (index, work) in candidates.works.iter().enumerate() {
+            let Some(site) = site_of[work.site as usize] else { continue };
+
+            // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
+            if terms.matches_key(&work.title_romaji, &work.title_key) {
+                let is_new = !nothing_is_new && fetched.new.contains(&(candidates.websites[work.site as usize].clone(), work.path.clone()));
+
+                items.push(Item { set: 0, index: index as u32, site: site as u16, is_new });
+            }
+        }
+
+        // the sites in their order; in a site, the works seen last come first (the order of the database)
+        let rank: Vec<usize> = self.sites.iter().map(|site| self.order.get(site.def.name).copied().unwrap_or(usize::MAX)).collect();
+        items.sort_by_key(|item| rank[item.site as usize]);
+
+        let origins: Vec<String> = self.sites.iter().map(|site| site.def.origin.to_lowercase()).collect();
+        let items = dedupe_items(&candidates.works, &origins, items);
+
+        Ok((candidates, items))
+    }
+
+    /// The works of the answer from the indexes of the database: how many works each site has (no work is read for that), and the head of the
+    /// answer (the last added first in a site, the sites in their order), `request.limit` works. `after` is an earlier search of the same
+    /// request: its works are not counted again, and its place in the answer is not filled again. Returns the head as candidates and places,
+    /// the counts by site, and how many rows were read.
+    async fn indexed_items(
+        &self,
+        request: &Request<'_>,
+        matcher: &crate::query::Matcher,
+        after: Option<&Searched<'_>>,
+        fetched: &Fetched,
+        exclude: &[usize],
+    ) -> Result<(Arc<Candidates>, Vec<Item>, Option<Vec<usize>>, usize)> {
+        let mut counts = vec![0_usize; self.sites.len()];
+        let mut websites: Vec<String> = Vec::new();
+        let mut works: Vec<Candidate> = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
+        // the places of the answer that the earlier search left; it has every one of its works in `Merged::items` when it did not fill the answer,
+        // and those that this search also finds are filtered out of what it reads, so that many more are read
+        let mut left = request.limit.max(1).saturating_sub(after.map_or(0, |after| after.items));
+        let spare = after.map_or(0, |after| after.total);
+        let both = after.and_then(|after| after.matcher).map(|earlier| matcher.and(earlier));
+
+        for index in self.sites_in_order(exclude) {
+            let name = self.sites[index].def.name;
+            let found = self.store.count_found(matcher, name).await?;
+            // the works that the earlier search has are not counted again: what both find is counted once
+            let count = match &both {
+                Some(both) => found - self.store.count_found(both, name).await?.min(found),
+                None => found,
+            };
+            counts[index] = count;
+
+            if found == 0 || left == 0 {
+                continue;
+            }
+
+            let rows = self.store.top_found(matcher, name, (left + spare).min(found)).await?;
+            websites.push(name.to_string());
+
+            for mut row in rows {
+                row.site = (websites.len() - 1) as u16;
+                let is_new = !fetched.new.is_empty() && fetched.new.contains(&(name.to_string(), row.path.clone()));
+
+                items.push(Item { set: 0, index: works.len() as u32, site: index as u16, is_new });
+                works.push(row);
+            }
+
+            left = left.saturating_sub(count.min(left));
+        }
+
+        let rows = works.len();
+
+        Ok((Arc::new(Candidates { works, websites }), items, Some(counts), rows))
     }
 
     /// Whether Hitomi.La is one of the sites and its whole list is not saved yet (its crawl has not reached the end): its search and its
@@ -1998,7 +2126,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_places_of_the_works_are_deduplicated_like_the_works_themselves() {
-        let work = |website: &str, path: &str| (website.to_string(), Candidate { site: 0, outside_key: None, path: path.into(), title: "t".into(), title_romaji: "t".into(), title_key: "t".into(), language: None });
+        let work = |website: &str, path: &str| (website.to_string(), Candidate { site: 0, path: path.into(), title: "t".into(), title_romaji: "t".into(), title_key: "t".into(), language: None });
         let pairs = vec![
             work("A", "/g/1/"),
             work("A", "/g/1"),
@@ -2176,6 +2304,104 @@ pub(crate) mod tests {
         // no translator: no Japanese title
         let outcome = engine.search(&Request { live: Live::Off, translator: Translator::None, ..Request::new("Nine Lives") }).await.unwrap();
         assert!(outcome.translation_ja.is_none());
+    }
+
+    /// The saved works the way the words are defined, row by row: the sites in their order, the last added first in a site. A word of 3
+    /// characters or more is in the key of what is outside the parentheses of the title; a shorter one is a word of the whole romaji.
+    async fn expected_titles(engine: &Arc<Engine>, query: &str) -> Vec<String> {
+        let words: Vec<String> = Terms::new(&engine.plan(query).unwrap().query).keys().into_iter().map(str::to_string).collect();
+        let works = engine.store.candidates_owned(&[]).await.unwrap();
+        let mut titles = Vec::new();
+
+        for index in engine.sites_in_order(&[]) {
+            titles.extend(
+                works
+                    .iter()
+                    .filter(|w| w.website == engine.sites[index].def.name)
+                    .filter(|w| {
+                        words.iter().all(|word| {
+                            if word.chars().count() >= 3 {
+                                w.title_key.contains(word.as_str())
+                            } else {
+                                w.title_romaji.split(|c: char| !c.is_ascii_alphanumeric()).any(|piece| piece == word)
+                            }
+                        })
+                    })
+                    .map(|w| w.title.clone()),
+            );
+        }
+
+        titles
+    }
+
+    #[tokio::test]
+    async fn the_indexes_answer_as_the_words_are_defined() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let titles = ["Maid ai", "work (COMIC kairakuten 2018 8)", "COMIC kairakuten 2026 11", "ai no uta", "main maid", "kairakuten (ai)", "tokyo kairakuten", "Maid kairakuten ai", "ai"];
+
+        // the same titles on two sites
+        for (site, shift) in [("Good", 0), ("Failing", 100)] {
+            let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(shift + n, title)).collect();
+            store.save("q", site, 1, &Ok(works), false).await.unwrap();
+        }
+
+        for query in ["ai", "maid", "kairakuten", "maid ai", "kairakuten ai", "kairakuten maid ai", "comic kairakuten", "nothing"] {
+            assert!(Terms::new(query).matcher().is_some(), "{query}: the indexes can answer it");
+
+            let outcome = engine.search(&Request { live: Live::Off, ..Request::new(query) }).await.unwrap();
+            let found: Vec<String> = outcome.results.iter().map(|hit| hit.title.clone()).collect();
+            let expected = expected_titles(&engine, query).await;
+
+            assert_eq!(found, expected, "{query}");
+            assert_eq!(outcome.total, expected.len(), "{query}");
+
+            // a page that is cut: the totals are those of the whole answer, and the page is the head of it
+            let head = engine.search(&Request { live: Live::Off, limit: 3, ..Request::new(query) }).await.unwrap();
+            assert_eq!(head.total, expected.len(), "{query}");
+            assert_eq!(head.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>(), expected[..expected.len().min(3)], "{query}");
+        }
+
+        // the last added work of a site is its first
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
+        assert_eq!(outcome.results[0].path, "/work/2", "the first of the list of the page is the last added");
+    }
+
+    #[tokio::test]
+    async fn the_works_of_the_other_title_are_counted_once_by_the_indexes() {
+        let (engine, _, store) = setup(&config()).await;
+        let row = crate::entity::translation::Model {
+            key: String::new(),
+            gallery_id: 9,
+            position: 0,
+            url: "https://hitomi.la/galleries/9.html".into(),
+            english: "Nine Lives".into(),
+            japanese: "九つの命".into(),
+            english_key: "ninelives".into(),
+            japanese_key: "九つの命".into(),
+            exact: true,
+            source: "hitomi".into(),
+        };
+        store.save_translations("九つの命", "hitomi", "九つの命", "ja", unix_now(), &[row]).await.unwrap();
+
+        // the romaji of the Japanese title is what is searched; one work has the English words, one the Japanese ones, one both
+        let japanese = engine.plan("九つの命").unwrap().query;
+        assert!(Terms::new(&japanese).matcher().is_some() && Terms::new("Nine Lives").matcher().is_some());
+        let work = |n: usize, romaji: String| NewWork { path: format!("/work/{n}"), title: romaji.clone(), romaji, language: None };
+        let works = vec![work(1, "nine lives one".into()), work(2, format!("{japanese} two")), work(3, format!("nine lives {japanese} three")), work(4, "other".into())];
+        store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
+
+        let titles = |outcome: &Outcome| outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
+        let whole = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
+        // the English title's works (the first of the list of the page is the last added), and then the works of the Japanese title that are not in the answer yet
+        assert_eq!(titles(&whole), ["/work/1", "/work/3", "/work/2"]);
+        assert_eq!(whole.total, 3, "the work of both titles is counted once");
+
+        // a page that is cut inside the first title, and one that is cut at its end: the total stays the total of the whole answer
+        for (limit, expected) in [(1, vec!["/work/1"]), (2, vec!["/work/1", "/work/3"])] {
+            let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
+            assert_eq!((titles(&page), page.total), (expected.into_iter().map(String::from).collect::<Vec<_>>(), 3), "limit {limit}");
+        }
     }
 
     #[tokio::test]

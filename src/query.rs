@@ -188,6 +188,27 @@ fn strip_zeros(digits: &str) -> String {
     if stripped.is_empty() { "0".to_string() } else { stripped.to_string() }
 }
 
+/// The words that the indexes of the database answer: a work matches when its key has every piece of `long`, and every piece of `short` is a
+/// word of its romaji.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matcher {
+    pub long: Vec<String>,
+    pub short: Vec<String>,
+}
+
+impl Matcher {
+    /// The works that both find: every word of the two.
+    pub fn and(&self, other: &Matcher) -> Matcher {
+        let join = |a: &[String], b: &[String]| {
+            let mut all = a.to_vec();
+            all.extend(b.iter().filter(|word| !a.contains(word)).cloned());
+            all
+        };
+
+        Matcher { long: join(&self.long, &other.long), short: join(&self.short, &other.short) }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Term {
     key: String,
@@ -242,6 +263,29 @@ impl Terms {
         words
     }
 
+    /// The words as the indexes can answer them (`Matcher`): the pieces of 3 characters or more (the trigram index), and the shorter ones that
+    /// are letters and digits (the index of words). None when a word is a number (it is also matched by value, in the whole title), a short
+    /// piece is anything else, or there is no other word: the saved works are then read and matched one by one.
+    pub fn matcher(&self) -> Option<Matcher> {
+        if self.0.iter().any(|term| term.number.is_some()) {
+            return None;
+        }
+
+        let (mut long, mut short) = (Vec::new(), Vec::new());
+
+        for word in self.prefilters() {
+            if word.chars().count() >= 3 {
+                long.push(word.to_string());
+            } else if word.chars().all(|c| c.is_ascii_alphanumeric()) {
+                short.push(word.to_string());
+            } else {
+                return None;
+            }
+        }
+
+        (!long.is_empty() || !short.is_empty()).then_some(Matcher { long, short })
+    }
+
     /// Does the title have every word? `key` is `title_key(title)`.
     pub fn matches(&self, title: &str, key: &str) -> bool {
         if self.0.is_empty() {
@@ -274,11 +318,6 @@ impl Terms {
     pub fn matches_key(&self, title: &str, key: &str) -> bool {
         self.matches(title, key)
     }
-}
-
-/// A title in ASCII with no parenthesis: what is outside its parentheses is all of it, and its key is the key of the title.
-pub fn is_plain(title: &str) -> bool {
-    title.is_ascii() && !title.contains('(')
 }
 
 /// The key of what is outside the parentheses of a title (`Terms::matches_title` matches with it).
