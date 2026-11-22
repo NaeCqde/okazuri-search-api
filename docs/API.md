@@ -61,8 +61,8 @@ GET /okazuri/search?q=快楽天 2026 7
 - `is_new` は、このリクエストがサイトで見つけて保存した作品(それまでデータベースになかった作品)で true になります。
   再び見つかった作品は新しくなく、行もそのままです(タイトルが変わったときだけ書き直します)。
 - `sites` は、各サイトの結果を表します。`searched`(いま尋ねた)、`cached`(`live=diff` で、`ttl_hours` 以内に尋ねたので
-  データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト。この2つは尋ねていませんが、保存済みの作品は応答に入ります)、`unavailable`(Hitomi.La の一覧が全件保存される
-  までの間。その間は検索しません)のいずれかです。サイトに尋ねた `queries` も付きます。`q` に日本語があり、
+  データベースが答えた)、`failed`(`error` 付き)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト、または一覧が全件保存される前の Hitomi.La。理由は `error` です。`excluded` と `disabled` は尋ねていませんが、保存済みの作品は応答に入ります。Hitomi.La は、一覧が全件保存される
+  までの間は検索しません)のいずれかです。サイトに尋ねた `queries` も付きます。`q` に日本語があり、
   日本語のタイトルで作品が見つかるサイトでは `["快楽天", "kairakuten"]`、それ以外(日本語を含まない `q`、または日本語のタイトルで
   見つからないサイトの EHentai と HentaiEra)では `["kairakuten"]` です。`count` は、クエリを合わせて一覧に出た作品の数です。
   一部のサイトが失敗しても、リクエストは `200` です。

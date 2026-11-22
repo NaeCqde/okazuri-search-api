@@ -100,8 +100,8 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
 }
 ```
 
-`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト。この2つは尋ねていませんが、保存済みの作品は応答に入ります)、`unavailable`(Hitomi.La の一覧が全件保存される
-までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
+`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト、または一覧が全件保存される前の Hitomi.La。理由は `error` です。`excluded` と `disabled` は尋ねていませんが、保存済みの作品は応答に入ります。Hitomi.La は、一覧が全件保存される
+までの間は検索しません)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
 失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数(`total_legal` と `total_illegal` は、その合法なサイトと違法なサイトの内訳)で、`results` はそれより短いことがあります。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
 スラッシュ付きで保存したページを、サイトが後からスラッシュなしで挙げたときは、スラッシュなしの path に**名前が変わります**(同じ行なので `first_seen` は残り、
@@ -115,7 +115,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
 
 Hitomi.La は、**一覧が全件保存されているとき**だけ(`import --mark-done Hitomi.La`、または最後まで届いたクロールのあと)、ここでも
 `/auto/translate` でも検索でも使います。その場で尋ねると、検索も翻訳も時間がかかりすぎるからです。それまでは、`/hitomila/translate` は `503` で、
-`/auto/translate` は Google に回り、検索は Hitomi.La を外します(`unavailable`)。一覧が保存されると、`import --mark-done Hitomi.La`
+`/auto/translate` は Google に回り、検索は Hitomi.La を外します(`disabled`)。一覧が保存されると、`import --mark-done Hitomi.La`
 (または `okazuri-search-api translations`)が、両方の言語を持つタイトル(`English | 日本語`)から翻訳も作るので、`live=off` でも答えられます。
 
 作品のタイトルの翻訳を、Hitomi.La のタイトルから作ります。ギャラリーには英語と日本語のタイトルがあり、サイトは両方の語を 1 つのインデックスに

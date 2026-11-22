@@ -264,7 +264,7 @@ pub struct Fetched {
 pub struct SiteReport {
     pub website: String,
     /// `searched` (asked now), `cached` (asked less than `ttl_hours` ago, so the database answers), `failed` (a query
-    /// failed), `not searched` (the request said not to ask the sites), `excluded` (the request left the site out of what is asked), `disabled` (`[search] disabled_sites` names it; the saved works of both are still in the answer) or `unavailable` (Hitomi.La, while its whole list is not saved).
+    /// failed), `not searched` (the request said not to ask the sites), `excluded` (the request left the site out of what is asked), or `disabled` (`[search] disabled_sites` names it, or it is Hitomi.La while its whole list is not saved: `error` says why; the saved works of the excluded and the disabled are still in the answer).
     pub status: &'static str,
     /// The queries the site is asked: the query as it was written and its romaji for a site that finds Japanese
     /// titles (when the query has Japanese in it), the romaji alone otherwise.
@@ -964,7 +964,7 @@ impl Engine {
                 if let Some(index) = unlisted.filter(|index| !request.exclude.contains(index)) {
                     sites.push(SiteReport {
                         website: self.sites[index].def.name.to_string(),
-                        status: "unavailable",
+                        status: "disabled",
                         queries: Vec::new(),
                         count: 0,
                         error: Some("the whole list of the site is not saved yet".to_string()),
