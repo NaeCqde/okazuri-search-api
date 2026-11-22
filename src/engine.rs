@@ -264,7 +264,7 @@ pub struct Fetched {
 pub struct SiteReport {
     pub website: String,
     /// `searched` (asked now), `cached` (asked less than `ttl_hours` ago, so the database answers), `failed` (a query
-    /// failed), `not searched` (the request said not to ask the sites), `excluded` (the request left the site out of what is asked: its saved works are still in the answer) or `unavailable` (Hitomi.La, while its whole list is not saved).
+    /// failed), `not searched` (the request said not to ask the sites), `excluded` (the request left the site out of what is asked), `disabled` (`[search] disabled_sites` names it; the saved works of both are still in the answer) or `unavailable` (Hitomi.La, while its whole list is not saved).
     pub status: &'static str,
     /// The queries the site is asked: the query as it was written and its romaji for a site that finds Japanese
     /// titles (when the query has Japanese in it), the romaji alone otherwise.
@@ -1200,6 +1200,18 @@ impl Engine {
                 count: known.iter().map(|s| s.count).sum(),
                 error: failed.and_then(|s| s.error.clone()),
                 searched_at: known.iter().map(|s| s.searched_at).max(),
+            });
+        }
+
+        // the sites that `disabled_sites` names are not asked either, and are told apart (their saved works are in the answer)
+        for index in (0..self.sites.len()).filter(|index| self.off[*index]) {
+            reports.push(SiteReport {
+                website: self.sites[index].def.name.to_string(),
+                status: "disabled",
+                queries: Vec::new(),
+                count: 0,
+                error: None,
+                searched_at: None,
             });
         }
 
@@ -2662,7 +2674,8 @@ pub(crate) mod tests {
         let outcome = engine.search(&Request::new("q")).await.unwrap();
 
         assert_eq!(requests(&hits), (1, 0, 0), "the names match whatever the case");
-        assert_eq!(outcome.sites.len(), 1);
+        // the site that is asked, and the two that are off (told apart)
+        assert_eq!(outcome.sites.iter().map(|s| (s.website.as_str(), s.status)).collect::<Vec<_>>(), [("Good", "searched"), ("Failing", "disabled"), ("Blocked", "disabled")]);
 
         // the real list: only the sites that can be searched are active, and a site with no search never is
         let real = Engine::new(&config(), Arc::new(SearchStore::in_memory().await.unwrap()), crate::testing::romanizer_arc());
@@ -2745,6 +2758,7 @@ pub(crate) mod tests {
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("saved") }).await.unwrap();
         assert_eq!((outcome.total, outcome.total_legal), (2, 1));
         assert_eq!(outcome.results.iter().map(|hit| hit.website.as_str()).collect::<Vec<_>>(), ["Failing", "Good"]);
+        assert!(outcome.sites.iter().any(|site| (site.website.as_str(), site.status) == ("Good", "disabled")), "{:?}", outcome.sites);
 
         // the request excludes it: it is not asked, and what is saved of it is still in the answer
         let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();

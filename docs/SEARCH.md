@@ -100,7 +100,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
 }
 ```
 
-`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト。尋ねていませんが、保存済みの作品は応答に入ります)、`unavailable`(Hitomi.La の一覧が全件保存される
+`status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト。この2つは尋ねていませんが、保存済みの作品は応答に入ります)、`unavailable`(Hitomi.La の一覧が全件保存される
 までの間)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
 失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数(`total_legal` と `total_illegal` は、その合法なサイトと違法なサイトの内訳)で、`results` はそれより短いことがあります。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
