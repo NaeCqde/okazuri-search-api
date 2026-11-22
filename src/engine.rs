@@ -399,6 +399,8 @@ pub struct Engine {
     sites: Vec<Site>,
     /// Indexes into `sites` of the ones that are searched.
     active: Vec<usize>,
+    /// How the indexes of the database are asked for the works of each site (`sites` order).
+    keys: Vec<crate::store::SiteKey>,
     /// The place of a searched site in the list, to put the works in the order of the sites.
     order: HashMap<&'static str, usize>,
     /// When the site was asked last, to keep `min_delay_ms` between two requests.
@@ -445,7 +447,10 @@ impl Engine {
 
         let delays = sites.iter().map(|site| Self::delay_of(site, config)).collect();
 
+        let keys = crate::store::SiteKey::of(&sites.iter().map(|site| site.def.name).collect::<Vec<_>>());
+
         Arc::new(Self {
+            keys,
             delays,
             gates: sites.iter().map(|_| Mutex::new(None)).collect(),
             sites,
@@ -1019,7 +1024,7 @@ impl Engine {
     /// How many works `matcher` finds in the sites that are searched, and how many of them are of the legal sites. A count with a site in it is
     /// slow (the index walks the long list of the works of the site), so the whole table is counted and the works of the sites that are left out
     /// are taken off, and only the few legal sites are named.
-    async fn count_answer(&self, matcher: &crate::query::Matcher, left_out: &[&str], legal: &[&str]) -> Result<Counts> {
+    async fn count_answer(&self, matcher: &crate::query::Matcher, left_out: &[crate::store::SiteKey], legal: &[crate::store::SiteKey]) -> Result<Counts> {
         let mut total = self.store.count_found(matcher, None).await?;
         if !left_out.is_empty() {
             total = total.saturating_sub(self.store.count_found(matcher, Some(left_out)).await?);
@@ -1042,8 +1047,8 @@ impl Engine {
         exclude: &[usize],
     ) -> Result<(Arc<Candidates>, Vec<Item>, Option<Counts>, usize)> {
         let order = self.sites_in_order(exclude);
-        let left_out: Vec<&str> = (0..self.sites.len()).filter(|index| !order.contains(index)).map(|index| self.sites[index].def.name).collect();
-        let legal: Vec<&str> = order.iter().filter(|index| self.sites[**index].def.legal).map(|index| self.sites[*index].def.name).collect();
+        let left_out: Vec<crate::store::SiteKey> = (0..self.sites.len()).filter(|index| !order.contains(index)).map(|index| self.keys[index].clone()).collect();
+        let legal: Vec<crate::store::SiteKey> = order.iter().filter(|index| self.sites[**index].def.legal).map(|index| self.keys[*index].clone()).collect();
 
         let mut counts = self.count_answer(matcher, &left_out, &legal).await?;
         // the works that the earlier search has are not counted again: what both find is counted once
@@ -1067,7 +1072,7 @@ impl Engine {
             }
 
             let name = self.sites[index].def.name;
-            let rows = self.store.top_found(matcher, name, left + spare).await?;
+            let rows = self.store.top_found(matcher, &self.keys[index], left + spare).await?;
             if rows.is_empty() {
                 continue;
             }
