@@ -12,6 +12,7 @@ mod language;
 mod entity;
 mod gtranslate;
 mod mirror;
+mod pin;
 mod prefetch;
 mod query;
 mod romaji;

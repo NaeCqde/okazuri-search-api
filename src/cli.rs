@@ -609,6 +609,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     if let Some(cron) = scheduler {
         tasks.push(cron.spawn());
     }
+    if config.search.enabled && config.search.pin_db {
+        tasks.push(tokio::spawn(crate::pin::run(config.search.db_path.clone())));
+    }
     if let Some(d1) = background.d1 {
         let interval = Duration::from_secs(config.magazine.check_interval_minutes.max(1) * 60);
 
