@@ -123,7 +123,7 @@ impl Romanizer {
         if text.is_empty() {
             return Ok(String::new());
         }
-        let text = issue_date(&text);
+        let text = counter_tsu(&issue_date(&text));
 
         let words = self.tokenizer.words(&text)?;
         let tokens = self.tokens(&words, loanwords)?;
@@ -367,6 +367,57 @@ fn issue_date(text: &str) -> String {
     issue.replace_all(text, |c: &regex::Captures| format!("{}-{:0>2}", &c[1], &c[2])).into_owned()
 }
 
+/// The number of things counted with つ (1 to 9) is written as its reading, however it was written (`4つ`, `４つ`, `四つ` are all `yottsu`).
+/// The sites that use the Latin alphabet write `Yottsu`, but the digits stay `4tsu` and UniDic reads `四つ` as `yontsu`, `六つ` as `muitsu` and
+/// `八つ` as `youtsu`, so the same title was spelled three ways and a search for one did not find the others. Only the counter is changed:
+/// `4人`, `Vol.4`, `2026 07` and `10つ` are not, and neither is a number inside a longer one (`14つ`, `A4つ`). A kanji numeral is changed only when
+/// it stands alone (`四つの方法`, `四つ目`), not in a word (`三つ巴`, `二つ名`, `四つ葉`).
+fn counter_tsu(text: &str) -> String {
+    const READINGS: [&str; 9] = ["hitotsu", "futatsu", "mittsu", "yottsu", "itsutsu", "muttsu", "nanatsu", "yattsu", "kokonotsu"];
+    fn is_kanji(c: char) -> bool {
+        ('\u{4E00}'..='\u{9FFF}').contains(&c)
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let before = if i > 0 { Some(chars[i - 1]) } else { None };
+        let number = match chars[i] {
+            c @ '1'..='9' if !before.is_some_and(|b| b.is_ascii_alphanumeric() || b == '.') => Some(c as usize - '1' as usize),
+            c @ ('一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九') if !before.is_some_and(is_kanji) => {
+                Some("一二三四五六七八九".chars().position(|k| k == c).unwrap_or(0))
+            }
+            _ => None,
+        };
+
+        if let Some(number) = number.filter(|_| chars.get(i + 1) == Some(&'つ')) {
+            let after = chars.get(i + 2).copied();
+            let kanji_numeral = !chars[i].is_ascii_digit();
+
+            // 四つ目 / 四つめ: the ordinal stays joined (yottsume), as 四つ目 was (yontsume)
+            if matches!(after, Some('目' | 'め')) {
+                out.push_str(READINGS[number]);
+                out.push_str("me");
+                i += 3;
+                continue;
+            }
+            // a kanji numeral in a word (三つ巴, 二つ名, 四つ葉) is read by the dictionary
+            if !(kanji_numeral && after.is_some_and(is_kanji)) {
+                out.push_str(READINGS[number]);
+                i += 2;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
 /// The most kana a name that is joined can have (ひつじだ, くまでら, むーにゃん).
 const MOST_NAME_KANA: usize = 8;
 
@@ -546,6 +597,49 @@ mod tests {
         assert_eq!(romaji("ふらすとれーしょんの話"), "furasutore-shon no hanashi");
         assert_eq!(romaji("ふれーずの世界"), "fure-zu no sekai");
         assert_eq!(romaji("ふぁみこん（5）"), "famikon (5)");
+    }
+
+    #[test]
+    fn a_number_counted_with_tsu_is_its_reading_however_it_is_written() {
+        assert_eq!(romaji("人生を台無しにする４つの方法"), "jinsei o dainashi ni suru yottsu no houhou");
+        assert_eq!(romaji("人生を台無しにする四つの方法"), "jinsei o dainashi ni suru yottsu no houhou");
+        for (digit, kanji, reading) in [
+            ("1", "一", "hitotsu"),
+            ("2", "二", "futatsu"),
+            ("3", "三", "mittsu"),
+            ("4", "四", "yottsu"),
+            ("5", "五", "itsutsu"),
+            ("6", "六", "muttsu"),
+            ("7", "七", "nanatsu"),
+            ("8", "八", "yattsu"),
+            ("9", "九", "kokonotsu"),
+        ] {
+            assert_eq!(romaji(&format!("{digit}つ")), reading);
+            assert_eq!(romaji(&format!("{kanji}つ")), reading);
+            assert_eq!(romaji(&format!("{digit}つの約束")), format!("{reading} no yakusoku"));
+        }
+        assert_eq!(romaji("4つ、5つ"), "yottsu, itsutsu");
+        assert_eq!(romaji("(4つ)"), "(yottsu)");
+        assert_eq!(romaji("4つ目"), "yottsume");
+        assert_eq!(romaji("4つめ"), "yottsume");
+    }
+
+    #[test]
+    fn only_the_counter_tsu_with_one_to_nine_is_changed() {
+        // the other counters and numbers keep their digits
+        assert_eq!(romaji("4人"), "4nin");
+        assert_eq!(romaji("100回"), "100 kai");
+        assert_eq!(romaji("Vol.4"), "vol.4");
+        assert_eq!(romaji("2026 07"), "2026 07");
+        assert_eq!(romaji("COMIC快楽天 2026年07月号"), "comic kairakuten 2026-07");
+        // a number inside a longer one, or a word with a letter before it
+        assert_eq!(romaji("10つ"), "10 tsu");
+        assert_eq!(romaji("14つ"), "14tsu");
+        assert_eq!(romaji("A4つ"), "a4tsu");
+        // a kanji numeral in a word is read by the dictionary
+        assert_eq!(romaji("三つ巴"), "mitsudomoe");
+        assert_eq!(romaji("三つ編み"), "mitsuami");
+        assert_eq!(romaji("二つ名"), "futatsu mei");
     }
 
     #[test]
