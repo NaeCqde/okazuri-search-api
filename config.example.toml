@@ -70,6 +70,11 @@ disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 # other sites are asked as before. Turn it on when the database has the sites you want (after the crawl, or its `import --mark-done`); a site
 # that is not crawled yet is asked as before, so it does no harm to leave it on.
 skip_crawled = true
+# Keep the pages of the database file (db_path, not its WAL) in memory: the file is mapped and locked (mlock), so the system never takes its
+# pages out of the page cache and a search never waits for the disk (it is what `vmtouch -l search.db` does). The file is locked again when
+# it grows. It needs the right to lock that much memory: in Docker, `cap_add: [IPC_LOCK]` and `ulimits: memlock: {soft: -1, hard: -1}`;
+# without it the server only warns and goes on. Unix only.
+pin_db = false
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
 try_unsupported = false
 # A copy of the magazine tables (magazines, numbers, authors and works) of the Worker's D1 database. The server asks D1 whether

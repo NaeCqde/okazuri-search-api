@@ -1370,6 +1370,7 @@ dependencies = [
  "http-body-util",
  "lindera",
  "log",
+ "memmap2",
  "regex",
  "reqwest",
  "sea-orm",

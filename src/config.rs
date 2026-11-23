@@ -84,6 +84,10 @@ pub struct SearchConfig {
     /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
     /// still asks it. The sites that have no list, or whose list is not read yet, are asked as before.
     pub skip_crawled: bool,
+    /// Keep the pages of the database file (`db_path`, not its WAL) in memory: the file is mapped and locked (`mlock`), so the system never takes
+    /// its pages out of the page cache, and a search never waits for the disk. Needs the right to lock that much memory (in Docker:
+    /// `cap_add: IPC_LOCK` and `ulimits: memlock: -1`); without it the server only warns and goes on. The file is locked again when it grows.
+    pub pin_db: bool,
     /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
     pub try_unsupported: bool,
     /// The bridge of Google Translate: not a key of `[search]`, it is `[translation]` (`open_engine` copies it here).
@@ -114,6 +118,7 @@ impl Default for SearchConfig {
             max_candidates: 800_000,
             disabled_sites: Vec::new(),
             skip_crawled: false,
+            pin_db: false,
             try_unsupported: false,
             google_bridge_url: String::new(),
             google_bridge_token: String::new(),
