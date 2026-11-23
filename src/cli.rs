@@ -66,6 +66,11 @@ relanguage                             Read the language of every saved title ag
 translations                           Make the translations of Hitomi.La from the saved works (the titles `English | 日本語`), so
                                        `/hitomila/translate` can answer from the database (`import --mark-done Hitomi.La` does it too)
     --config <path>      Config file
+retranslate --source <hitomi|google>    Make the translations of a source again. `hitomi`: build the Hitomi.La pairs again, then drop the Google
+                                       translations of the titles that Hitomi.La translates now, and the lookups that found nothing. `google`:
+                                       drop every Google translation and lookup, so `[translation.fill]` asks Google again (Hitomi.La's stay).
+                                       Safe while the server runs
+    --config <path>      Config file
 export <file>                          Write the saved works to a file (JSON Lines, compressed with brotli), to put the works
                                        that a machine crawled into the database of another (`import`)
     --site <name>        Only the works of this site (more than once for more sites)
@@ -103,6 +108,7 @@ pub enum Command {
     Reromanize { config: Option<PathBuf> },
     Relanguage { config: Option<PathBuf> },
     Translations { config: Option<PathBuf> },
+    Retranslate { source: String, config: Option<PathBuf> },
     Export { file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf> },
     Import { files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf> },
     Dataset { dir: PathBuf, config: Option<PathBuf> },
@@ -129,6 +135,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "reromanize" => parse_reromanize(rest),
         "relanguage" => parse_relanguage(rest),
         "translations" => parse_translations(rest),
+        "retranslate" => parse_retranslate(rest),
         "export" => parse_export(rest),
         "import" => parse_import(rest),
         "dataset" => parse_dataset(rest),
@@ -334,6 +341,28 @@ fn parse_translations(args: &[String]) -> Result<Command> {
     }
 }
 
+fn parse_retranslate(args: &[String]) -> Result<Command> {
+    let (mut source, mut config) = (None, None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--source" => source = Some(value(&mut iter, arg)?),
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+        }
+    }
+
+    match source.as_deref() {
+        Some(name @ ("hitomi" | "google")) => Ok(Command::Retranslate {
+            source: name.to_string(),
+            config,
+        }),
+        Some(other) => Err(format!("--source is hitomi or google, not {other}\n\n{USAGE}").into()),
+        None => Err(format!("retranslate needs --source <hitomi|google>\n\n{USAGE}").into()),
+    }
+}
+
 fn parse_relanguage(args: &[String]) -> Result<Command> {
     match parse_reromanize(args)? {
         Command::Reromanize { config } => Ok(Command::Relanguage { config }),
@@ -427,6 +456,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Reromanize { config } => reromanize(config).await,
         Command::Relanguage { config } => relanguage(config).await,
         Command::Translations { config } => translations(config).await,
+        Command::Retranslate { source, config } => retranslate(&source, config).await,
         Command::Export { file, sites, since, config } => export(file, sites, since, config).await,
         Command::Import { files, mark_done, config } => import(files, mark_done, config).await,
         Command::Dataset { dir, config } => dataset(dir, config).await,
@@ -799,6 +829,26 @@ async fn translations(config: Option<PathBuf>) -> Result<()> {
     let store = SearchStore::open(&config.search.db_path).await?;
 
     println!("{} translations made", store.build_hitomi_translations().await?);
+
+    Ok(())
+}
+
+/// Makes the translations of a source again: `hitomi` builds the pairs of Hitomi.La again and drops what they replace (the Google
+/// rows of the same titles, and the lookups that said "nothing found"), `google` drops the Google translations so that the fill asks again.
+async fn retranslate(source: &str, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+
+    if source == "hitomi" {
+        let new = store.build_hitomi_translations().await?;
+        let (rows, lookups) = store.drop_google_for_hitomi().await?;
+
+        println!("Hitomi.La: {new} new pairs, {rows} Google translations dropped, {lookups} lookups dropped");
+    } else {
+        let (rows, lookups) = store.drop_source("google").await?;
+
+        println!("Google: {rows} translations dropped, {lookups} lookups dropped (the fill asks for them again)");
+    }
 
     Ok(())
 }
