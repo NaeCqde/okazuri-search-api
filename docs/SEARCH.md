@@ -91,7 +91,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
   "input": "COMIC快楽天 2026 11",
   "query": "comic kairakuten 2026 11",
   "terms": ["comic快楽天", "2026", "11"],
-  "total": 28, "total_legal": 20, "total_illegal": 8,
+  "has_more": true,
   "results": [
     { "website": "FANZA", "is_legal": true, "path": "/product/25199/b915awnmg04607/",
       "url": "https://book.dmm.co.jp/product/25199/b915awnmg04607/", "title": "COMIC快楽天 2026年11月号",
@@ -105,7 +105,7 @@ Hitomi.La が失敗するか何も返さないときは Google 翻訳から取�
 
 `status` は、`searched`(いま尋ねた)、`failed`(`error` が理由)、`not searched`(`live=off`)、`excluded`(`exclude` で除外したサイト)、`disabled`(`disabled_sites` のサイト、または一覧が全件保存される前の Hitomi.La。理由は `error` です。`excluded` と `disabled` は尋ねていませんが、保存済みの作品は応答に入ります。Hitomi.La は、一覧が全件保存される
 までの間は検索しません)のどれかです。`queries` は、そのサイトに尋ねたクエリ(上で説明したとおり 1 つか 2 つ)で、`count` はそれらを合わせて一覧に出た作品の数です。
-失敗したサイトがあっても、ほかのサイトは止まりません。`total` はすべての語を含む作品の数(`total_legal` と `total_illegal` は、その合法なサイトと違法なサイトの内訳)で、`results` はそれより短いことがあります。
+失敗したサイトがあっても、ほかのサイトは止まりません。`has_more` は、`offset` と `limit` の先にまだ作品があるか(次のページがあるか)だけを返します。作品の数は数えません(語が多くの作品にあると、数えるだけで数秒かかるため)。数が知りたいときは `okazuri-search-api count <語>...` を使います。
 ページは、データベースでは 1 作品、結果でも 1 件です。サイトが末尾のスラッシュ付きとなしの両方で書くページ(`/g/1/` と `/g/1`)は、1 つだけ保存されます。
 スラッシュ付きで保存したページを、サイトが後からスラッシュなしで挙げたときは、スラッシュなしの path に**名前が変わります**(同じ行なので `first_seen` は残り、
 そのページを指す一覧も追従します)。両方の形が同時に挙がったページは、スラッシュなしで保存します(そう書くサイトに、スラッシュは要りません)。

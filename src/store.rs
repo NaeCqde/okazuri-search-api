@@ -58,9 +58,6 @@ const MAX_CANDIDATES: u64 = 50_000;
 /// How many connections read the database for the searches.
 const READERS: u32 = 4;
 
-/// How long the count of a search is kept, and how many counts.
-const COUNT_KEPT: Duration = Duration::from_secs(300);
-const COUNTS_KEPT: usize = 512;
 
 /// The version of the keys and the indexes (`PRAGMA user_version`).
 const INDEX_VERSION: i64 = 1;
@@ -149,8 +146,6 @@ pub struct SearchStore {
     /// Read-only connections, several: a search does not wait for a write (or for the long read of the verification) of the one connection
     /// of `db` (the database is in WAL mode, so a read does not block a write either). The same connection as `db` for a database in memory.
     reader: DatabaseConnection,
-    /// How many works a search found (its SQL and values -> when, how many): the next page of the same search does not count again.
-    counted: std::sync::Mutex<HashMap<String, (Instant, usize)>>,
     /// The most rows one search of the database reads (`[search] max_candidates`).
     max_candidates: std::sync::atomic::AtomicU64,
 }
@@ -199,7 +194,7 @@ impl SearchStore {
             None => db.clone(),
         };
 
-        Ok(Self { db, reader, counted: Default::default(), max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
+        Ok(Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
     }
 
     async fn create_tables(db: &DatabaseConnection) -> Result<()> {
@@ -445,7 +440,6 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
-        self.forget_counts();
 
         Ok(new)
     }
@@ -620,13 +614,6 @@ impl SearchStore {
         Ok(new)
     }
 
-    /// The counts of the searches are forgotten: works were written.
-    fn forget_counts(&self) {
-        if let Ok(mut counted) = self.counted.lock() {
-            counted.clear();
-        }
-    }
-
     /// How many works of `website` are saved (the ones whose page is gone are not counted).
     pub async fn counts_of(&self, website: &str) -> Result<u64> {
         Ok(work::Entity::find().filter(work::Column::Website.eq(website)).filter(work::Column::Deleted.eq(false)).count(&self.reader).await?)
@@ -675,7 +662,6 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
-        self.forget_counts();
 
         Ok(())
     }
@@ -699,7 +685,8 @@ impl SearchStore {
 
     /// Makes the translations of Hitomi.La (`translations`, source `hitomi`) from the saved works: the title of a gallery that has both
     /// (`English | 日本語`, `hitomi::title_pair`) is its translation in both directions. It is what `/hitomila/translate` answers
-    /// with `live=off`, with no request to the site. A pair that is saved already stays. Returns how many pairs were new.
+    /// with `live=off`, with no request to the site. A pair whose English side is only the romaji of the Japanese side is left out. A pair that is
+    /// saved already stays. Returns how many pairs were new.
     pub async fn build_hitomi_translations(&self) -> Result<usize> {
         let mut new = 0;
         let mut after: Option<String> = None;
@@ -719,6 +706,11 @@ impl SearchStore {
                     let (english, japanese) = crate::hitomi::title_pair(&row.title)?;
                     let id: i64 = row.path.strip_prefix("/galleries/")?.split('.').next()?.parse().ok()?;
                     let (english_key, japanese_key) = (crate::hitomi::squash(&english), crate::hitomi::squash(&japanese));
+                    // the English side that is only the romaji of the Japanese one (the romaji of the title says the English side twice) is no
+                    // translation: it is not saved, and the Google translation is asked for the title instead
+                    if crate::hitomi::squash(&row.title_romaji) == format!("{english_key}{english_key}") {
+                        return None;
+                    }
 
                     (!english_key.is_empty() && !japanese_key.is_empty()).then(|| {
                         translation::Model {
@@ -1008,7 +1000,6 @@ impl SearchStore {
             .exec_without_returning(&transaction)
             .await?;
         transaction.commit().await?;
-        self.forget_counts();
 
         Ok(new as usize)
     }
@@ -1092,7 +1083,6 @@ impl SearchStore {
             .await?;
 
         transaction.commit().await?;
-        self.forget_counts();
 
         Ok(new)
     }
@@ -1235,7 +1225,6 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
-        self.forget_counts();
 
         Ok(forgotten)
     }
@@ -1278,34 +1267,44 @@ impl SearchStore {
         }
     }
 
-    /// How many works of the sites (all the works for None) `matcher` finds in the indexes. The works are not read: without a site this takes
-    /// tens of milliseconds for a word that 700,000 works have.
+    /// How many works of the sites (all the works for None) `matcher` finds in the indexes (the `count` command: a search does not count).
     pub async fn count_found(&self, matcher: &crate::query::Matcher, websites: Option<&[SiteKey]>) -> Result<usize> {
         let (sql, values) = Self::rowids(matcher, websites);
-        let key = format!("{sql}\u{0}{values:?}");
-        let kept = self.counted.lock().ok().and_then(|counted| counted.get(&key).filter(|(when, _)| when.elapsed() < COUNT_KEPT).map(|(_, n)| *n));
-        if let Some(n) = kept {
-            return Ok(n);
-        }
-
         let row = self
             .reader
             .query_one(Statement::from_sql_and_values(self.reader.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
             .await?
             .ok_or("no count")?;
-        let n = row.try_get::<i64>("", "n")?.max(0) as usize;
 
-        if let Ok(mut counted) = self.counted.lock() {
-            if counted.len() >= COUNTS_KEPT {
-                counted.retain(|_, (when, _)| when.elapsed() < COUNT_KEPT);
-            }
-            if counted.len() >= COUNTS_KEPT {
-                counted.clear();
-            }
-            counted.insert(key, (Instant::now(), n));
-        }
+        Ok(row.try_get::<i64>("", "n")?.max(0) as usize)
+    }
 
-        Ok(n)
+    /// For every site: (name, works, works whose page is gone, works never looked at by the verification).
+    pub async fn site_stats(&self) -> Result<Vec<(String, i64, i64, i64)>> {
+        let rows = self
+            .reader
+            .query_all(Statement::from_string(
+                self.reader.get_database_backend(),
+                "SELECT website, count(*) AS n, sum(deleted) AS gone, sum(checked_at IS NULL AND deleted = 0) AS unchecked FROM works GROUP BY website ORDER BY n DESC",
+            ))
+            .await?;
+
+        rows.iter().map(|row| Ok((row.try_get("", "website")?, row.try_get("", "n")?, row.try_get("", "gone")?, row.try_get("", "unchecked")?))).collect()
+    }
+
+    /// The translations by source: (source, rows).
+    pub async fn translation_stats(&self) -> Result<Vec<(String, i64)>> {
+        let rows = self
+            .reader
+            .query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT source, count(*) AS n FROM translations GROUP BY source ORDER BY n DESC"))
+            .await?;
+
+        rows.iter().map(|row| Ok((row.try_get("", "source")?, row.try_get("", "n")?))).collect()
+    }
+
+    /// The crawl states of the sites, by name.
+    pub async fn crawl_states(&self) -> Result<Vec<crawl_state::Model>> {
+        Ok(crawl_state::Entity::find().order_by_asc(crawl_state::Column::Website).all(&self.reader).await?)
     }
 
     /// The `limit` works of a site that `matcher` finds, the last added first (the order of the rows).
@@ -2174,16 +2173,28 @@ mod tests {
     async fn the_translations_of_hitomi_are_made_from_the_titles_that_have_both() {
         let store = SearchStore::in_memory().await.unwrap();
         let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None };
+        let romanized = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None };
 
         store
-            .save_crawled("Hitomi.La", 1, &[work("/galleries/10.html", "Kyoudai | きょうだい"), work("/galleries/11.html", "Only English"), work("/galleries/12.html", "Chinese | 雖然來了")], None)
+            .save_crawled(
+                "Hitomi.La",
+                1,
+                &[
+                    romanized("/galleries/10.html", "Brothers | きょうだい", "Brothers | kyoudai"),
+                    work("/galleries/11.html", "Only English"),
+                    work("/galleries/12.html", "Chinese | 雖然來了"),
+                    // the English side is the romaji of the Japanese side: no translation
+                    romanized("/galleries/14.html", "Kyoudai | きょうだい", "Kyoudai | kyoudai"),
+                ],
+                None,
+            )
             .await
             .unwrap();
         store.save_crawled("Other", 1, &[work("/galleries/13.html", "Other | 別のサイト")], None).await.unwrap();
 
         assert_eq!(store.build_hitomi_translations().await.unwrap(), 1);
         assert_eq!(store.build_hitomi_translations().await.unwrap(), 0, "the same pair is not made twice");
-        let by_english = store.translations("kyoudai", "hitomi").await.unwrap();
+        let by_english = store.translations("brothers", "hitomi").await.unwrap();
         assert_eq!((by_english.len(), by_english[0].japanese.as_str(), by_english[0].gallery_id), (1, "きょうだい", 10));
         assert_eq!(store.translations_with("hitomi", false, "きょうだい", false, 5).await.unwrap().len(), 1, "and from the Japanese side");
     }

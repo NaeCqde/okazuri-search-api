@@ -50,6 +50,12 @@ search <words>...                      Search the sites for the words (in romaji
                          site\n\
     --limit <n>          The most works to print (default: [search] max_results)\n\
     --config <path>      Config file\n\
+count <words>...                       Count the saved works whose title has all the words (the search itself only tells whether
+                                       there is a next page), and how many each site has
+    --config <path>      Config file
+stats                                  Print what the database holds: the works of each site (gone, not yet looked at by the
+                                       verification), the crawl of each site, the translations by source. Safe while the server runs
+    --config <path>      Config file
 sync                                   Copy the magazine tables of the D1 database now ([magazine])\n\
     --config <path>      Config file\n\
 prefetch                               Search for the issues of the copy once through ([magazine.prefetch])\n\
@@ -103,6 +109,8 @@ pub enum Command {
     Magazines { config: Option<PathBuf> },
     Magazine { title: String, limit: u64, config: Option<PathBuf> },
     Works { issue: String, config: Option<PathBuf> },
+    Count { query: String, config: Option<PathBuf> },
+    Stats { config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
@@ -130,6 +138,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "magazines" => parse_config_only(rest, "magazines").map(|config| Command::Magazines { config }),
         "magazine" => parse_magazine(rest),
         "works" => parse_works(rest),
+        "count" => parse_count(rest),
+        "stats" => parse_config_only(rest, "stats").map(|config| Command::Stats { config }),
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
@@ -208,6 +218,25 @@ fn parse_search(args: &[String]) -> Result<Command> {
     }
 
     Ok(Command::Search { query: words.join(" "), live, limit, config })
+}
+
+fn parse_count(args: &[String]) -> Result<Command> {
+    let (mut words, mut config) = (Vec::new(), None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            other => words.push(other.to_string()),
+        }
+    }
+
+    if words.is_empty() {
+        return Err(format!("count needs the words to count the works of\n\n{USAGE}").into());
+    }
+
+    Ok(Command::Count { query: words.join(" "), config })
 }
 
 fn parse_title(args: &[String]) -> Result<Command> {
@@ -451,6 +480,8 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Magazines { config } => magazines(config).await,
         Command::Magazine { title, limit, config } => magazine(title, limit, config).await,
         Command::Works { issue, config } => works(issue, config).await,
+        Command::Count { query, config } => count(query, config).await,
+        Command::Stats { config } => stats(config).await,
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
@@ -692,7 +723,7 @@ async fn search(
         );
     }
 
-    println!("\n{} works have all of {:?} ({} shown)", outcome.total, outcome.terms, outcome.results.len());
+    println!("\n{} works have all of {:?}{}", outcome.results.len(), outcome.terms, if outcome.has_more { " (and more)" } else { "" });
     for hit in &outcome.results {
         println!("{:<12} {}\n{:<12} {}", hit.website, hit.title, "", hit.url);
     }
@@ -856,6 +887,47 @@ async fn retranslate(source: &str, config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Counts the works that have all the words of the query, and the works of each site.
+async fn count(query: String, config: Option<PathBuf>) -> Result<()> {
+    let mut config = load(config).await?;
+    config.search.enabled = true;
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
+    let (total, sites) = engine.count(&query).await?;
+    let legal: usize = sites.iter().filter(|(_, legal, _)| *legal).map(|(_, _, n)| n).sum();
+
+    for (name, is_legal, n) in &sites {
+        println!("{name:<14} {n:>9}{}", if *is_legal { "  (legal)" } else { "" });
+    }
+    println!("\n{total} works have all of {query:?} ({legal} on legal sites, {} on the others)", total.saturating_sub(legal));
+
+    Ok(())
+}
+
+/// Prints what the database holds.
+async fn stats(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let crawls = store.crawl_states().await?;
+
+    println!("{:<14} {:>10} {:>9} {:>10}  crawl", "site", "works", "gone", "unchecked");
+    for (site, works, gone, unchecked) in store.site_stats().await? {
+        let crawl = crawls
+            .iter()
+            .find(|state| state.website == site)
+            .map(|state| format!("{} ({} saved)", if state.done { "done" } else { "walking" }, state.saved))
+            .unwrap_or_default();
+
+        println!("{site:<14} {works:>10} {gone:>9} {unchecked:>10}  {crawl}");
+    }
+
+    println!();
+    for (source, rows) in store.translation_stats().await? {
+        println!("translations {source:<8} {rows:>9}");
+    }
+
+    Ok(())
+}
+
 /// Reads the language of every saved title again.
 async fn relanguage(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
@@ -985,6 +1057,14 @@ mod tests {
             parse(&args(&["--port", "1"])).unwrap(),
             Command::Serve { config: None, host: None, port: Some(1) }
         );
+    }
+
+    #[test]
+    fn count_takes_the_words_and_stats_only_the_config() {
+        assert_eq!(parse(&args(&["count", "maid", "ai", "--config", "a.toml"])).unwrap(), Command::Count { query: "maid ai".into(), config: Some(PathBuf::from("a.toml")) });
+        assert!(parse(&args(&["count"])).is_err());
+        assert_eq!(parse(&args(&["stats"])).unwrap(), Command::Stats { config: None });
+        assert!(parse(&args(&["stats", "--limit", "1"])).is_err());
     }
 
     #[test]

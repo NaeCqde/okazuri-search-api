@@ -775,7 +775,8 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(json["results"][0]["path"], "/work/1");
         assert_eq!(json["results"][0]["url"], "http://127.0.0.1/work/1");
         assert_eq!(json["terms"], serde_json::json!(["comic", "exe"]));
-        assert_eq!(json["total"], 2);
+        assert_eq!((json["results"].as_array().unwrap().len(), &json["has_more"]), (2, &serde_json::json!(false)));
+        assert!(json.get("total").is_none(), "a search does not count");
         assert_eq!(json["results"][0]["is_new"], true, "this request saved it");
         assert_eq!(json["sites"].as_array().unwrap().len(), 3);
         assert_eq!(json["sites"][1]["status"], "failed");
@@ -785,7 +786,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(json["sites"][0]["status"], "cached");
-        assert_eq!((json["total"].as_u64().unwrap(), &json["results"][0]["is_new"]), (2, &serde_json::json!(false)));
+        assert_eq!((json["results"].as_array().unwrap().len(), &json["results"][0]["is_new"]), (2, &serde_json::json!(false)));
 
         // live=force asks every site, cached or not; the works are found again and are not new
         let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}&live=force", encode("COMIC ExE"))).await;
@@ -832,14 +833,14 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         // live=off: the sites are not asked, and nothing is saved yet
         let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={q}&live=off")).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["total"], 0);
+        assert_eq!(json["results"].as_array().unwrap().len(), 0);
         assert_eq!(json["sites"][0]["status"], "not searched");
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        // limit=1 cuts the answer, and the total says how many there are
+        // limit=1 cuts the answer, and has_more says that there is a next page
         let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1")).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!((json["results"].as_array().unwrap().len(), json["total"].as_u64().unwrap()), (1, 2));
+        assert_eq!((json["results"].as_array().unwrap().len(), json["has_more"].as_bool().unwrap()), (1, true));
 
         // offset skips the head of the answer: the second page is the other work, and a page past the end is empty
         let (_, _, first) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1")).await;
@@ -848,7 +849,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         let (first, second, past): (serde_json::Value, serde_json::Value, serde_json::Value) =
             (serde_json::from_str(&first).unwrap(), serde_json::from_str(&second).unwrap(), serde_json::from_str(&past).unwrap());
         assert_ne!(first["results"][0]["url"], second["results"][0]["url"]);
-        assert_eq!((second["total"].as_u64(), past["results"].as_array().unwrap().len()), (Some(2), 0));
+        assert_eq!((second["has_more"].as_bool(), past["results"].as_array().unwrap().len()), (Some(false), 0));
         assert_eq!(get_from(state, &format!("/okazuri/search?q={q}&offset=10001")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 

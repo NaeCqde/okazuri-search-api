@@ -200,19 +200,6 @@ pub struct Matcher {
     pub short: Vec<String>,
 }
 
-impl Matcher {
-    /// The works that both find: every word of the two.
-    pub fn and(&self, other: &Matcher) -> Matcher {
-        let join = |a: &[String], b: &[String]| {
-            let mut all = a.to_vec();
-            all.extend(b.iter().filter(|word| !a.contains(word)).cloned());
-            all
-        };
-
-        Matcher { long: join(&self.long, &other.long), short: join(&self.short, &other.short) }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Term {
     key: String,
