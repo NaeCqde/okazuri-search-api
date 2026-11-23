@@ -74,30 +74,19 @@ struct Item {
 }
 
 /// What the search before this one asked: the indexes (and which words), or the rows one by one.
-struct Searched<'a> {
+struct Searched {
     indexed: bool,
-    matcher: Option<&'a crate::query::Matcher>,
-    /// How many works the answer has so far, and how many of them are in `Merged::items`.
-    total: usize,
+    /// How many works of the answer are in `Merged::items` so far.
     items: usize,
-}
-
-/// How many works an answer has, and how many of them are of the legal sites.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Counts {
-    total: usize,
-    legal: usize,
 }
 
 /// The matching works of one search: the candidates they stand in, in the order of the answer.
 struct Lite {
     set: Arc<Candidates>,
     items: Vec<Item>,
-    /// How many works each site has in the answer (by `Engine::sites`), when the indexes of the database were asked: `set` is then only the
-    /// head of the answer. None: `items` is all of it.
-    counts: Option<Counts>,
-    /// What the indexes were asked (to leave it out of the other title's search).
-    matcher: Option<crate::query::Matcher>,
+    /// Whether the indexes of the database were asked: `set` is then only the head of the answer (one work more than the limit). Otherwise
+    /// `items` is all of it.
+    indexed: bool,
     /// The answer but its works (`results` is empty).
     meta: Outcome,
 }
@@ -106,9 +95,8 @@ struct Lite {
 struct Merged {
     sets: Vec<Arc<Candidates>>,
     items: Vec<Item>,
-    /// As `Lite::counts`, of all the searches together.
-    counts: Option<Counts>,
-    matcher: Option<crate::query::Matcher>,
+    /// As `Lite::indexed`.
+    indexed: bool,
     meta: Outcome,
 }
 
@@ -284,11 +272,8 @@ pub struct Outcome {
     pub query: String,
     /// The words every title has to have.
     pub terms: Vec<String>,
-    /// How many works have all the words (`results` may be cut short of it).
-    pub total: usize,
-    /// How many of `total` are on a legal site, and how many on an illegal one (`is_legal`).
-    pub total_legal: usize,
-    pub total_illegal: usize,
+    /// Whether the answer has more works than `results` (and the offset before it): there is a next page. The number of works is not counted.
+    pub has_more: bool,
     pub results: Vec<Hit>,
     pub sites: Vec<SiteReport>,
     /// The English title of the query that was searched too (the works of both are in `results`). None when the query has no
@@ -741,27 +726,17 @@ impl Engine {
     /// (a word that 700,000 works have costs a few million copies otherwise).
     pub async fn search(self: &Arc<Self>, request: &Request<'_>) -> Result<Outcome> {
         let mut laps = crate::utils::Laps::new();
-        let Merged { sets, items, mut meta, counts, .. } = self.search_all(request).await?;
+        let Merged { sets, items, mut meta, .. } = self.search_all(request).await?;
         laps.lap("search_all");
 
-        // `total` is how many works there are, whatever the limit cuts
-        match counts {
-            Some(counts) => {
-                meta.total = counts.total;
-                meta.total_legal = counts.legal;
-            }
-            None => {
-                meta.total = items.len();
-                meta.total_legal = items.iter().filter(|item| self.sites[item.site as usize].def.legal).count();
-            }
-        }
-        meta.total_illegal = meta.total - meta.total_legal;
+        // the search took one work more than the limit: when it is there, the answer goes on
+        meta.has_more = items.len() > request.limit.max(1);
         meta.results = items.iter().take(request.limit.max(1)).map(|item| self.hit_of(&sets[item.set as usize], item)).collect();
         laps.lap("count");
         self.fill_english(&mut meta.results).await?;
         laps.lap("fill_english");
 
-        log::info!("timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, meta.total);
+        log::info!("timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, meta.results.len());
 
         Ok(meta)
     }
@@ -789,7 +764,7 @@ impl Engine {
         let mut laps = crate::utils::Laps::new();
         let first = self.search_one(request, None).await?;
         laps.lap("first search");
-        let merged = Merged { sets: vec![first.set], items: first.items, counts: first.counts, matcher: first.matcher, meta: first.meta };
+        let merged = Merged { sets: vec![first.set], items: first.items, indexed: first.indexed, meta: first.meta };
         let merged = self.search_all_more(request, merged, &mut laps).await;
         log::info!("timing of the two searches of {:?}: {laps}", request.query);
 
@@ -801,18 +776,11 @@ impl Engine {
     async fn search_title(self: &Arc<Self>, request: &Request<'_>, text: &str, merged: &mut Merged) -> bool {
         // the indexes answer the other title too when they answered the first one: what the first found is left out, by the indexes
         let after = Searched {
-            indexed: merged.counts.is_some(),
-            matcher: merged.matcher.as_ref(),
-            total: merged.counts.map_or(0, |counts| counts.total),
+            indexed: merged.indexed,
             items: merged.items.len(),
         };
         match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after)).await {
             Ok(more) => {
-                if let (Some(counts), Some(more_counts)) = (merged.counts.as_mut(), more.counts) {
-                    counts.total += more_counts.total;
-                    counts.legal += more_counts.legal;
-                }
-
                 // a work that is in the answer already (the same address) is not in it twice
                 let known: HashSet<(&str, &str)> = merged.items.iter().map(|item| self.address_of(&merged.sets, item)).collect();
                 let set = merged.sets.len() as u8;
@@ -895,7 +863,7 @@ impl Engine {
 
     /// The search of one query (`search` does it for the English title too). The works are places in the candidates (`items`); `meta.results`
     /// is empty.
-    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched<'_>>) -> Result<Lite> {
+    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched>) -> Result<Lite> {
         let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.query);
@@ -934,23 +902,21 @@ impl Engine {
             return Err("the indexes cannot answer the other title".into());
         }
 
-        let (candidates, items, counts, rows) = match &matcher {
+        let (candidates, items, indexed, rows) = match &matcher {
             Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched).await?,
             None => {
                 let (candidates, items) = self.scanned_items(&terms, &fetched).await?;
                 laps.lap("candidates and match");
                 let rows = candidates.len();
 
-                (candidates, items, None, rows)
+                (candidates, items, false, rows)
             }
         };
         laps.lap("found");
 
-        let total = counts.map_or(items.len(), |counts| counts.total);
-
         let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude, request.exclude).await?;
         laps.lap("site reports");
-        log::info!("timing of the search of {:?} ({rows} candidates, {total} works): {laps}", request.query);
+        log::info!("timing of the search of {:?} ({rows} candidates): {laps}", request.query);
 
         let meta = Outcome {
             sites: {
@@ -969,16 +935,14 @@ impl Engine {
             },
             input: plan.input,
             terms: terms.keys().into_iter().map(str::to_string).collect(),
-            total,
-            total_legal: 0,
-            total_illegal: 0,
+            has_more: false,
             results: Vec::new(),
             query: plan.query,
             translation: None,
             translation_ja: None,
         };
 
-        Ok(Lite { set: candidates, items, counts, matcher, meta })
+        Ok(Lite { set: candidates, items, indexed, meta })
     }
 
     /// All the sites, in the order of the answer (the searched sites first).
@@ -1027,13 +991,23 @@ impl Engine {
         Ok((candidates, items))
     }
 
-    /// How many works `matcher` finds, and how many of them are of the legal sites. A count with a site in it is slow (the index walks the long
-    /// list of the works of the site), so the whole table is counted and only the few legal sites are named.
-    async fn count_answer(&self, matcher: &crate::query::Matcher, legal: &[crate::store::SiteKey]) -> Result<Counts> {
-        let total = self.store.count_found(matcher, None).await?;
-        let legal = if legal.is_empty() { 0 } else { self.store.count_found(matcher, Some(legal)).await? };
+    /// How many works have all the words of `query`, and how many of them each site has (the sites with none are left out). A search does not
+    /// count (it only tells whether there is a next page): this is the `count` command. Returns (all, sites in the order of the answer).
+    pub async fn count(&self, query: &str) -> Result<(usize, Vec<(&'static str, bool, usize)>)> {
+        let plan = self.plan(query)?;
+        let terms = Terms::new(&plan.query);
+        let matcher = terms.matcher().ok_or("the indexes cannot count this query (no word of 3 letters or more)")?;
+        let total = self.store.count_found(&matcher, None).await?;
+        let mut sites = Vec::new();
 
-        Ok(Counts { total, legal })
+        for index in self.sites_in_order() {
+            let found = self.store.count_found(&matcher, Some(std::slice::from_ref(&self.keys[index]))).await?;
+            if found > 0 {
+                sites.push((self.sites[index].def.name, self.sites[index].def.legal, found));
+            }
+        }
+
+        Ok((total, sites))
     }
 
     /// The works of the answer from the indexes of the database: how many works there are (no work is read for that), and the head of the
@@ -1044,30 +1018,23 @@ impl Engine {
         &self,
         request: &Request<'_>,
         matcher: &crate::query::Matcher,
-        after: Option<&Searched<'_>>,
+        after: Option<&Searched>,
         fetched: &Fetched,
-    ) -> Result<(Arc<Candidates>, Vec<Item>, Option<Counts>, usize)> {
+    ) -> Result<(Arc<Candidates>, Vec<Item>, bool, usize)> {
         let order = self.sites_in_order();
-        let legal: Vec<crate::store::SiteKey> = order.iter().filter(|index| self.sites[**index].def.legal).map(|index| self.keys[*index].clone()).collect();
-
-        let mut counts = self.count_answer(matcher, &legal).await?;
-        // the works that the earlier search has are not counted again: what both find is counted once
-        let both = after.and_then(|after| after.matcher).map(|earlier| matcher.and(earlier));
-        if let Some(both) = &both {
-            let twice = self.count_answer(both, &legal).await?;
-            counts = Counts { total: counts.total.saturating_sub(twice.total), legal: counts.legal.saturating_sub(twice.legal) };
-        }
 
         let mut websites: Vec<String> = Vec::new();
         let mut works: Vec<Candidate> = Vec::new();
         let mut items: Vec<Item> = Vec::new();
         // the places of the answer that the earlier search left; it has every one of its works in `Merged::items` when it did not fill the answer,
         // and those that this search also finds are filtered out of what it reads, so that many more are read
-        let mut left = request.limit.max(1).saturating_sub(after.map_or(0, |after| after.items));
-        let spare = after.map_or(0, |after| after.total);
+        // (one work more than the limit: it tells whether the answer goes on; nothing is counted)
+        let mut left = (request.limit.max(1) + 1).saturating_sub(after.map_or(0, |after| after.items));
+        // the works of the earlier search that this one finds again are among its works of the answer, so that many more are read
+        let spare = after.map_or(0, |after| after.items);
 
         for index in order {
-            if counts.total == 0 || left == 0 {
+            if left == 0 {
                 break;
             }
 
@@ -1091,7 +1058,7 @@ impl Engine {
 
         let rows = works.len();
 
-        Ok((Arc::new(Candidates { works, websites }), items, Some(counts), rows))
+        Ok((Arc::new(Candidates { works, websites }), items, true, rows))
     }
 
     /// Whether Hitomi.La is one of the sites and its whole list is not saved yet (its crawl has not reached the end): its search and its
@@ -2016,7 +1983,7 @@ pub(crate) mod tests {
         let asked: Vec<_> = outcome.sites.iter().map(|site| (site.website.as_str(), site.queries.clone())).collect();
         assert_eq!(asked, [("Plain", vec!["COMIC ExE 11".to_string()]), ("Times", vec!["COMIC E×E 11".to_string()])]);
         // both sites answer (the same two addresses: they are 2 results, not 4), and the sign does not matter to the match
-        assert_eq!(outcome.total, 2);
+        assert_eq!(outcome.results.len(), 2);
 
         // the bot writes the sign as x already: between capitals it is put back for the site
         let outcome = engine.search(&Request { query: "COMIC ExE 12", live: Live::Diff, limit: 10, translator: Translator::None, exclude: &[] }).await.unwrap();
@@ -2038,7 +2005,7 @@ pub(crate) mod tests {
         let found: Vec<_> = outcome.results.iter().map(|h| (h.website.as_str(), h.is_legal, h.path.as_str(), h.title.as_str())).collect();
         assert_eq!(found, [("Good", true, "/work/1", "COMIC ExE one"), ("Good", true, "/work/2", "COMIC ExE two")]);
         assert_eq!(outcome.results[0].url, "http://127.0.0.1/work/1", "the address is the origin and the path");
-        assert_eq!(outcome.total, 2);
+        assert_eq!((outcome.results.len(), outcome.has_more), (2, false));
 
         let report = |name: &str| outcome.sites.iter().find(|s| s.website == name).unwrap().clone();
         assert_eq!((report("Good").status, report("Good").count), ("searched", 2));
@@ -2120,7 +2087,7 @@ pub(crate) mod tests {
         let outcome = engine.search(&Request::new("q")).await.unwrap();
         let by_path = |path: &str| outcome.results.iter().find(|h| h.path == path).map(|h| h.is_new);
 
-        assert_eq!(outcome.total, 3);
+        assert_eq!(outcome.results.len(), 3);
         assert_eq!(by_path("/work/1"), Some(true), "found now");
         assert_eq!(by_path("/work/2"), Some(true));
         assert_eq!(by_path("/work/77"), Some(false), "from the database");
@@ -2167,13 +2134,16 @@ pub(crate) mod tests {
         engine.store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
 
         let whole = engine.search(&Request { live: Live::Off, limit: 100, ..Request::new("alpha") }).await.unwrap();
-        assert_eq!(whole.total, 7);
+        assert!(!whole.has_more);
         assert_eq!(whole.results.len(), 7);
 
-        // the first works of a short answer are the first works of the whole one, and the totals are those of the whole answer
+        // the first works of a short answer are the first works of the whole one, and it says that there is more
         let few = engine.search(&Request { live: Live::Off, limit: 3, ..Request::new("alpha") }).await.unwrap();
         assert_eq!(few.results, whole.results[..3]);
-        assert_eq!((few.total, few.total_legal, few.total_illegal), (whole.total, whole.total_legal, whole.total_illegal));
+        assert!(few.has_more);
+        // a page that ends exactly at the end of the answer has no next page
+        let exact = engine.search(&Request { live: Live::Off, limit: 7, ..Request::new("alpha") }).await.unwrap();
+        assert!(!exact.has_more);
 
         // the page 2 of 3 works (the api asks for offset + limit and drops the offset)
         let upto = engine.search(&Request { live: Live::Off, limit: 6, ..Request::new("alpha") }).await.unwrap();
@@ -2410,18 +2380,20 @@ pub(crate) mod tests {
             let expected = expected_titles(&engine, query).await;
 
             assert_eq!(found, expected, "{query}");
-            assert_eq!(outcome.total, expected.len(), "{query}");
-            // Good is the legal site, and it has half of the works
-            assert_eq!((outcome.total_legal, outcome.total_illegal), (expected.len() / 2, expected.len() - expected.len() / 2), "{query}");
+            assert!(!outcome.has_more, "{query}");
+            // `count` counts the works, and Good (the legal site) has half of them
+            let (total, sites) = engine.count(query).await.unwrap();
+            assert_eq!(total, expected.len(), "{query}");
+            assert_eq!(sites.iter().filter(|(_, legal, _)| *legal).map(|(_, _, n)| n).sum::<usize>(), expected.len() / 2, "{query}");
 
             // a site that is excluded is only not asked: it is counted
             let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();
             let without = engine.search(&Request { live: Live::Off, exclude: &leave_out, ..Request::new(query) }).await.unwrap();
-            assert_eq!((without.total, without.total_legal), (expected.len(), expected.len() / 2), "{query}");
+            assert_eq!(without.results.len(), expected.len(), "{query}");
 
-            // a page that is cut: the totals are those of the whole answer, and the page is the head of it
+            // a page that is cut: it says whether there is a next page, and the page is the head of the answer
             let head = engine.search(&Request { live: Live::Off, limit: 3, ..Request::new(query) }).await.unwrap();
-            assert_eq!(head.total, expected.len(), "{query}");
+            assert_eq!(head.has_more, expected.len() > 3, "{query}");
             assert_eq!(head.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>(), expected[..expected.len().min(3)], "{query}");
         }
 
@@ -2458,12 +2430,12 @@ pub(crate) mod tests {
         let whole = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
         // the English title's works (the first of the list of the page is the last added), and then the works of the Japanese title that are not in the answer yet
         assert_eq!(titles(&whole), ["/work/1", "/work/3", "/work/2"]);
-        assert_eq!(whole.total, 3, "the work of both titles is counted once");
+        assert_eq!(whole.results.len(), 3, "the work of both titles is in the answer once");
 
-        // a page that is cut inside the first title, and one that is cut at its end: the total stays the total of the whole answer
+        // a page that is cut inside the first title, and one that is cut at its end: the page says that the answer goes on
         for (limit, expected) in [(1, vec!["/work/1"]), (2, vec!["/work/1", "/work/3"])] {
             let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
-            assert_eq!((titles(&page), page.total), (expected.into_iter().map(String::from).collect::<Vec<_>>(), 3), "limit {limit}");
+            assert_eq!((titles(&page), page.has_more), (expected.into_iter().map(String::from).collect::<Vec<_>>(), true), "limit {limit}");
         }
     }
 
@@ -2478,7 +2450,7 @@ pub(crate) mod tests {
 
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("alpha") }).await.unwrap();
 
-        assert_eq!(outcome.total, 2, "the total counts a page once");
+        assert!(!outcome.has_more);
         assert_eq!(outcome.results.len(), 2);
         assert_eq!(outcome.results.iter().filter(|hit| hit.title == "alpha one").count(), 1);
     }
@@ -2496,7 +2468,7 @@ pub(crate) mod tests {
 
         // AND: a word that is in none of the titles finds nothing
         let none = engine.search(&Request { live: Live::Off, ..Request::new("alpha gamma") }).await.unwrap();
-        assert_eq!((none.total, none.results.len()), (0, 0));
+        assert_eq!((none.has_more, none.results.len()), (false, 0));
 
         // a word alone finds the titles of any query, the last seen first
         let one = engine.search(&Request { live: Live::Off, ..Request::new("ONE") }).await.unwrap();
@@ -2650,17 +2622,16 @@ pub(crate) mod tests {
         paths.sort();
 
         assert_eq!(paths, ["/work/20", "/work/21", "/work/24"], "the works of the issue are left out, the number in parentheses is not");
-        assert_eq!(outcome.total, 3);
+        assert_eq!(outcome.results.len(), 3);
     }
 
     #[tokio::test]
-    async fn the_limit_cuts_the_answer_but_not_the_total() {
+    async fn the_limit_cuts_the_answer_and_it_says_there_is_more() {
         let (engine, _, _) = setup(&config()).await;
 
         let outcome = engine.search(&Request { limit: 1, ..Request::new("q") }).await.unwrap();
 
-        assert_eq!((outcome.results.len(), outcome.total), (1, 2));
-        assert_eq!(outcome.total_legal + outcome.total_illegal, 2);
+        assert_eq!((outcome.results.len(), outcome.has_more), (1, true));
     }
 
     #[tokio::test]
@@ -2752,14 +2723,14 @@ pub(crate) mod tests {
 
         // the site is off in the config (it is not asked), and what is saved of it is in the answer, after the works of the sites that are asked
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("saved") }).await.unwrap();
-        assert_eq!((outcome.total, outcome.total_legal), (2, 1));
+        assert_eq!(outcome.results.len(), 2);
         assert_eq!(outcome.results.iter().map(|hit| hit.website.as_str()).collect::<Vec<_>>(), ["Failing", "Good"]);
         assert!(outcome.sites.iter().any(|site| (site.website.as_str(), site.status) == ("Good", "disabled")), "{:?}", outcome.sites);
 
         // the request excludes it: it is not asked, and what is saved of it is still in the answer
         let leave_out = engine.site_indexes(&["good".to_string()]).unwrap();
         let outcome = engine.search(&Request { live: Live::Off, exclude: &leave_out, ..Request::new("saved") }).await.unwrap();
-        assert_eq!((outcome.total, outcome.total_legal), (2, 1));
+        assert_eq!(outcome.results.len(), 2);
     }
 
     #[tokio::test]
