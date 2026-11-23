@@ -718,6 +718,197 @@ impl SearchStore {
         Ok(new)
     }
 
+    /// Drops the Google translations (and the lookups of them) of the titles that Hitomi.La translates now, so the Hitomi.La
+    /// title wins, and the lookups of Hitomi.La that found nothing for a text that has a Hitomi.La translation now (`diff` would
+    /// ask the site again for them). Small transactions, a page at a time, so it is safe while the server runs. Returns how many
+    /// Google rows and how many lookups were dropped.
+    pub async fn drop_google_for_hitomi(&self) -> Result<(usize, usize)> {
+        const PAGE: u64 = 500;
+        let (mut rows, mut lookups) = (0, 0);
+        let mut after: Option<(String, i64)> = None;
+
+        // the Google rows whose Japanese title has a Hitomi.La translation
+        loop {
+            let mut query =
+                translation::Entity::find().filter(translation::Column::Source.eq("google"));
+            if let Some((key, id)) = &after {
+                query = query.filter(Expr::cust_with_values(
+                    "(key, gallery_id) > (?, ?)",
+                    [
+                        sea_orm::Value::from(key.as_str()),
+                        sea_orm::Value::from(*id),
+                    ],
+                ));
+            }
+            let page = query
+                .order_by_asc(translation::Column::Key)
+                .order_by_asc(translation::Column::GalleryId)
+                .limit(PAGE)
+                .all(&self.db)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.key.clone(), last.gallery_id));
+
+            let japanese: Vec<String> = page
+                .iter()
+                .map(|row| row.japanese_key.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let have: HashSet<String> = translation::Entity::find()
+                .filter(translation::Column::Source.eq("hitomi"))
+                .filter(translation::Column::JapaneseKey.is_in(japanese))
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|row| row.japanese_key)
+                .collect();
+            let dropped: Vec<&translation::Model> = page
+                .iter()
+                .filter(|row| have.contains(&row.japanese_key))
+                .collect();
+
+            if dropped.is_empty() {
+                continue;
+            }
+
+            let keys: Vec<String> = dropped
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let transaction = self.db.begin().await?;
+
+            rows += translation::Entity::delete_many()
+                .filter(translation::Column::Source.eq("google"))
+                .filter(translation::Column::Key.is_in(keys.clone()))
+                .filter(
+                    translation::Column::JapaneseKey
+                        .is_in(have.iter().cloned().collect::<Vec<_>>()),
+                )
+                .exec(&transaction)
+                .await?
+                .rows_affected as usize;
+            lookups += translation_lookup::Entity::delete_many()
+                .filter(translation_lookup::Column::Source.eq("google"))
+                .filter(translation_lookup::Column::Key.is_in(keys))
+                .exec(&transaction)
+                .await?
+                .rows_affected as usize;
+            transaction.commit().await?;
+        }
+
+        // the lookups of a text that has a Hitomi.La translation now: the ones of Google (also the ones that had no row) and the
+        // ones of Hitomi.La that found nothing
+        let mut after: Option<(String, String)> = None;
+
+        loop {
+            let mut query = translation_lookup::Entity::find().filter(
+                sea_orm::Condition::any()
+                    .add(translation_lookup::Column::Source.eq("google"))
+                    .add(
+                        sea_orm::Condition::all()
+                            .add(translation_lookup::Column::Source.eq("hitomi"))
+                            .add(translation_lookup::Column::Count.eq(0)),
+                    ),
+            );
+            if let Some((key, source)) = &after {
+                query = query.filter(Expr::cust_with_values(
+                    "(key, source) > (?, ?)",
+                    [key.as_str(), source.as_str()],
+                ));
+            }
+            let page = query
+                .order_by_asc(translation_lookup::Column::Key)
+                .order_by_asc(translation_lookup::Column::Source)
+                .limit(PAGE)
+                .all(&self.db)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.key.clone(), last.source.clone()));
+
+            let keys: Vec<String> = page.iter().map(|row| row.key.clone()).collect();
+            let mut have: HashSet<String> = HashSet::new();
+            for row in translation::Entity::find()
+                .filter(translation::Column::Source.eq("hitomi"))
+                .filter(translation::Column::JapaneseKey.is_in(keys.clone()))
+                .all(&self.db)
+                .await?
+            {
+                have.insert(row.japanese_key);
+            }
+            for row in translation::Entity::find()
+                .filter(translation::Column::Source.eq("hitomi"))
+                .filter(translation::Column::EnglishKey.is_in(keys))
+                .all(&self.db)
+                .await?
+            {
+                have.insert(row.english_key);
+            }
+
+            for row in page.iter().filter(|row| have.contains(&row.key)) {
+                lookups += translation_lookup::Entity::delete_many()
+                    .filter(translation_lookup::Column::Key.eq(row.key.as_str()))
+                    .filter(translation_lookup::Column::Source.eq(row.source.as_str()))
+                    .exec(&self.db)
+                    .await?
+                    .rows_affected as usize;
+            }
+        }
+
+        Ok((rows, lookups))
+    }
+
+    /// Drops every translation of `source` and every lookup of it, so that whoever asked for them asks again (the fill asks Google for
+    /// the titles that have no translation). Returns how many translations and how many lookups were dropped.
+    pub async fn drop_source(&self, source: &str) -> Result<(usize, usize)> {
+        let (mut rows, mut lookups) = (0, 0);
+
+        // a page of keys at a time, each in a transaction of its own: the server is not blocked for long
+        loop {
+            let keys: Vec<String> = translation::Entity::find()
+                .filter(translation::Column::Source.eq(source))
+                .limit(1000)
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|row| row.key)
+                .collect();
+            if keys.is_empty() {
+                break;
+            }
+            rows += translation::Entity::delete_many()
+                .filter(translation::Column::Source.eq(source))
+                .filter(translation::Column::Key.is_in(keys))
+                .exec(&self.db)
+                .await?
+                .rows_affected as usize;
+        }
+
+        loop {
+            let keys: Vec<String> = translation_lookup::Entity::find()
+                .filter(translation_lookup::Column::Source.eq(source))
+                .limit(1000)
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|row| row.key)
+                .collect();
+            if keys.is_empty() {
+                break;
+            }
+            lookups += translation_lookup::Entity::delete_many()
+                .filter(translation_lookup::Column::Source.eq(source))
+                .filter(translation_lookup::Column::Key.is_in(keys))
+                .exec(&self.db)
+                .await?
+                .rows_affected as usize;
+        }
+
+        Ok((rows, lookups))
+    }
+
     /// Where the crawl of a site stands (None: it never ran).
     pub async fn crawl_state(&self, website: &str) -> Result<Option<crawl_state::Model>> {
         Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?)
@@ -1349,6 +1540,147 @@ mod tests {
         found.sort();
         assert_eq!(found, ["/b", "/c", "/d"]);
         assert_eq!(store.due_checks("Site", 400, 10).await.unwrap(), ["/c", "/d", "/b"], "the works never looked at first, then the oldest look");
+    }
+
+    fn tr(source: &str, id: i64, english: &str, japanese: &str) -> translation::Model {
+        use crate::hitomi::squash;
+
+        translation::Model {
+            key: if source == "hitomi" {
+                squash(english)
+            } else {
+                squash(japanese)
+            },
+            gallery_id: id,
+            position: 0,
+            url: String::new(),
+            english: english.into(),
+            japanese: japanese.into(),
+            english_key: squash(english),
+            japanese_key: squash(japanese),
+            exact: source == "hitomi",
+            source: source.into(),
+        }
+    }
+
+    async fn counts(store: &SearchStore) -> (usize, usize) {
+        let rows = translation::Entity::find()
+            .all(&store.db)
+            .await
+            .unwrap()
+            .len();
+        let lookups = translation_lookup::Entity::find()
+            .all(&store.db)
+            .await
+            .unwrap()
+            .len();
+
+        (rows, lookups)
+    }
+
+    #[tokio::test]
+    async fn a_google_row_is_dropped_when_hitomi_translates_the_same_title() {
+        use crate::hitomi::squash;
+        let store = SearchStore::in_memory().await.unwrap();
+        let (a, b) = (
+            tr("google", 0, "Machine A", "題名A"),
+            tr("google", 0, "Machine B", "題名B"),
+        );
+        store
+            .save_translations(&a.key.clone(), "google", "題名A", "ja", 1, &[a])
+            .await
+            .unwrap();
+        store
+            .save_translations(&b.key.clone(), "google", "題名B", "ja", 1, &[b])
+            .await
+            .unwrap();
+        // Google found nothing for C, and Hitomi.La found nothing for it before
+        store
+            .save_translations(&squash("題名C"), "google", "題名C", "ja", 1, &[])
+            .await
+            .unwrap();
+        store
+            .save_translations(&squash("題名C"), "hitomi", "題名C", "ja", 1, &[])
+            .await
+            .unwrap();
+        store
+            .save_translations(&squash("題名D"), "hitomi", "題名D", "ja", 1, &[])
+            .await
+            .unwrap();
+        let h = tr("hitomi", 5, "Real A", "題名A");
+        let c = tr("hitomi", 6, "Real C", "題名C");
+        store
+            .save_translations(&h.key.clone(), "hitomi", "Real A", "en", 1, &[h])
+            .await
+            .unwrap();
+        store
+            .save_translations(&c.key.clone(), "hitomi", "Real C", "en", 1, &[c])
+            .await
+            .unwrap();
+
+        // A: the google row and its lookup; C: the google lookup and the hitomi lookup that found nothing; the lookup of "Real C" stays
+        let (rows, lookups) = store.drop_google_for_hitomi().await.unwrap();
+        assert_eq!((rows, lookups), (1, 3));
+        assert_eq!(
+            store
+                .translations(&squash("題名A"), "google")
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .translations(&squash("題名B"), "google")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "no Hitomi.La translation: stays"
+        );
+        assert_eq!(
+            store
+                .translations(&squash("Real A"), "hitomi")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let left: Vec<(String, String)> = translation_lookup::Entity::find()
+            .all(&store.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.key, l.source))
+            .collect();
+        assert!(
+            left.contains(&(squash("題名D"), "hitomi".into())),
+            "nothing found and still no translation: stays"
+        );
+        assert!(left.contains(&(squash("題名B"), "google".into())));
+
+        // again: nothing changes
+        assert_eq!(store.drop_google_for_hitomi().await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn dropping_google_leaves_the_hitomi_rows() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let g = tr("google", 0, "Machine", "題名");
+        let h = tr("hitomi", 5, "Real", "別題");
+        store
+            .save_translations(&g.key.clone(), "google", "題名", "ja", 1, &[g])
+            .await
+            .unwrap();
+        store
+            .save_translations(&h.key.clone(), "hitomi", "Real", "en", 1, &[h])
+            .await
+            .unwrap();
+
+        assert_eq!(store.drop_source("google").await.unwrap(), (1, 1));
+        assert_eq!(counts(&store).await, (1, 1));
+        assert_eq!(store.drop_source("google").await.unwrap(), (0, 0));
+        assert_eq!(counts(&store).await, (1, 1));
     }
 
     #[tokio::test]

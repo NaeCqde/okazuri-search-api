@@ -312,6 +312,12 @@ momon:GA と Nya:Hentai の WordPress API、DLsite、Wnacg、AsmHentai、HentaiE
 Google が 5 回続けて答えなかったときは、その回をやめ、`round_interval_minutes`(60)待ちます。答えがなかったタイトルは、プログラムを起動し直すまで尋ねません。
 検索のリクエストが使うブリッジと同じなので、`pause_ms` を短くしすぎないでください。
 
+翻訳を作り直すには `okazuri-search-api retranslate --source <hitomi|google>` を使います(サーバーを動かしたままで安全です。小さなトランザクションで少しずつ書き、何度実行しても同じです。`works` には触れません)。
+`--source hitomi` は、`translations` と同じように Hitomi.La の組を作り直し(新しい組の数を表示します)、Hitomi.La の翻訳を持つようになった日本語タイトルの `google` の行と、その `google` の記録
+(`translation_lookups`)、そして Hitomi.La に何もなかったと記録した(`count = 0`)記録を消します。Hitomi.La の作品の数が変わったあとに使うと、Hitomi.La のタイトルが Google の訳に勝ちます。
+`--source google` は、`source = 'google'` の `translations` と `translation_lookups` をすべて消します(Hitomi.La の行は残ります)。コマンドは Google に尋ねません。上の事前翻訳が、`pause_ms` おきに
+翻訳のないタイトルをもう一度尋ねます。
+
 ## ページがなくなった作品(`[verify]`)
 
 サイトによっては、ページがなくなった作品を一覧に出し続けます。`[verify] enabled = true` にすると、サーバーは、それが分かるサイト(RokuHentai、DLsite、HentaiEnvy、Nya:Hentai、
