@@ -885,6 +885,47 @@ impl SearchStore {
         Ok((rows, lookups))
     }
 
+    /// Drops the Hitomi.La translations whose English side is only the romaji of the Japanese side (what `build_hitomi_translations` leaves
+    /// out now), so that the fill asks Google for those titles. A page at a time, each in a transaction of its own. Returns how many rows
+    /// were dropped.
+    pub async fn drop_romaji_hitomi(&self) -> Result<usize> {
+        let mut dropped = 0;
+        let mut after: (i64, String) = (-1, String::new());
+
+        loop {
+            let rows = self
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    self.db.get_database_backend(),
+                    "SELECT t.key AS key, t.gallery_id AS gallery_id, t.english_key AS english_key, w.title_romaji AS romaji FROM translations t \
+                     JOIN works w ON w.website = 'Hitomi.La' AND w.path = '/galleries/' || t.gallery_id || '.html' \
+                     WHERE t.source = 'hitomi' AND (t.gallery_id, t.key) > (?, ?) ORDER BY t.gallery_id, t.key LIMIT 5000",
+                    [after.0.into(), after.1.clone().into()],
+                ))
+                .await?;
+            let Some(last) = rows.last() else { break };
+            after = (last.try_get("", "gallery_id")?, last.try_get("", "key")?);
+
+            let mut romaji: Vec<(String, i64)> = Vec::new();
+            for row in &rows {
+                let (english_key, title_romaji): (String, String) = (row.try_get("", "english_key")?, row.try_get("", "romaji")?);
+                if crate::hitomi::squash(&title_romaji) == format!("{english_key}{english_key}") {
+                    romaji.push((row.try_get("", "key")?, row.try_get("", "gallery_id")?));
+                }
+            }
+
+            if !romaji.is_empty() {
+                let transaction = self.db.begin().await?;
+                for (key, gallery_id) in romaji {
+                    dropped += translation::Entity::delete_by_id((key, gallery_id)).exec(&transaction).await?.rows_affected as usize;
+                }
+                transaction.commit().await?;
+            }
+        }
+
+        Ok(dropped)
+    }
+
     /// Drops every translation of `source` and every lookup of it, so that whoever asked for them asks again (the fill asks Google for
     /// the titles that have no translation). Returns how many translations and how many lookups were dropped.
     pub async fn drop_source(&self, source: &str) -> Result<(usize, usize)> {
@@ -2169,6 +2210,23 @@ mod tests {
         assert_eq!(store.relanguage().await.unwrap(), (3, 0), "the second time nothing changes, and the language stays");
     }
 
+    fn work_pair_row(id: i64, english: &str, japanese: &str) -> translation::Model {
+        use crate::hitomi::squash;
+
+        translation::Model {
+            key: squash(english),
+            gallery_id: id,
+            position: 0,
+            url: format!("https://hitomi.la/galleries/{id}.html"),
+            english: english.into(),
+            japanese: japanese.into(),
+            english_key: squash(english),
+            japanese_key: squash(japanese),
+            exact: true,
+            source: "hitomi".into(),
+        }
+    }
+
     #[tokio::test]
     async fn the_translations_of_hitomi_are_made_from_the_titles_that_have_both() {
         let store = SearchStore::in_memory().await.unwrap();
@@ -2197,6 +2255,13 @@ mod tests {
         let by_english = store.translations("brothers", "hitomi").await.unwrap();
         assert_eq!((by_english.len(), by_english[0].japanese.as_str(), by_english[0].gallery_id), (1, "きょうだい", 10));
         assert_eq!(store.translations_with("hitomi", false, "きょうだい", false, 5).await.unwrap().len(), 1, "and from the Japanese side");
+
+        // a pair that was saved before the rule is dropped by the clean-up, and only that one
+        let old = work_pair_row(14, "Kyoudai", "きょうだい");
+        store.save_translations("kyoudai", "hitomi", "kyoudai", "en", 1, &[old]).await.unwrap();
+        assert_eq!(store.drop_romaji_hitomi().await.unwrap(), 1);
+        assert_eq!(store.translations("kyoudai", "hitomi").await.unwrap().len(), 0);
+        assert_eq!(store.translations("brothers", "hitomi").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

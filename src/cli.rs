@@ -877,7 +877,9 @@ async fn retranslate(source: &str, config: Option<PathBuf>) -> Result<()> {
         let new = store.build_hitomi_translations().await?;
         let (rows, lookups) = store.drop_google_for_hitomi().await?;
 
-        println!("Hitomi.La: {new} new pairs, {rows} Google translations dropped, {lookups} lookups dropped");
+        let romaji = store.drop_romaji_hitomi().await?;
+
+        println!("Hitomi.La: {new} new pairs, {rows} Google translations dropped, {lookups} lookups dropped, {romaji} pairs dropped whose English side is only the romaji");
     } else {
         let (rows, lookups) = store.drop_source("google").await?;
 
