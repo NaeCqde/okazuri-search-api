@@ -55,6 +55,13 @@ pub type Work = work::Model;
 /// The most rows `find` reads: a word that is in nearly every title would read the whole table.
 const MAX_CANDIDATES: u64 = 50_000;
 
+/// How many connections read the database for the searches.
+const READERS: u32 = 4;
+
+/// How long the count of a search is kept, and how many counts.
+const COUNT_KEPT: Duration = Duration::from_secs(300);
+const COUNTS_KEPT: usize = 512;
+
 /// The version of the keys and the indexes (`PRAGMA user_version`).
 const INDEX_VERSION: i64 = 1;
 
@@ -139,6 +146,11 @@ impl SiteKey {
 
 pub struct SearchStore {
     db: DatabaseConnection,
+    /// Read-only connections, several: a search does not wait for a write (or for the long read of the verification) of the one connection
+    /// of `db` (the database is in WAL mode, so a read does not block a write either). The same connection as `db` for a database in memory.
+    reader: DatabaseConnection,
+    /// How many works a search found (its SQL and values -> when, how many): the next page of the same search does not count again.
+    counted: std::sync::Mutex<HashMap<String, (Instant, usize)>>,
     /// The most rows one search of the database reads (`[search] max_candidates`).
     max_candidates: std::sync::atomic::AtomicU64,
 }
@@ -156,15 +168,21 @@ impl SearchStore {
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(10));
 
-        Self::init(options).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
+        let readers = SqlitePoolOptions::new()
+            .max_connections(READERS)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_lazy_with(options.clone().create_if_missing(false).read_only(true));
+
+        Self::init(options, Some(readers)).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
     }
 
     #[cfg(test)]
     pub async fn in_memory() -> Result<Self> {
-        Self::init(SqliteConnectOptions::new().in_memory(true)).await
+        Self::init(SqliteConnectOptions::new().in_memory(true), None).await
     }
 
-    async fn init(options: SqliteConnectOptions) -> Result<Self> {
+    async fn init(options: SqliteConnectOptions, readers: Option<sea_orm::sqlx::SqlitePool>) -> Result<Self> {
         // one connection: the writes go one after the other, as the engine's tasks come
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -176,7 +194,12 @@ impl SearchStore {
 
         Self::create_tables(&db).await?;
 
-        Ok(Self { db, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
+        let reader = match readers {
+            Some(pool) => SqlxSqliteConnector::from_sqlx_sqlite_pool(pool),
+            None => db.clone(),
+        };
+
+        Ok(Self { db, reader, counted: Default::default(), max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
     }
 
     async fn create_tables(db: &DatabaseConnection) -> Result<()> {
@@ -337,7 +360,7 @@ impl SearchStore {
 
     /// The state of every site that has been asked the query.
     pub async fn states(&self, query: &str) -> Result<HashMap<String, SiteState>> {
-        let rows = search::Entity::find().filter(search::Column::Query.eq(query)).all(&self.db).await?;
+        let rows = search::Entity::find().filter(search::Column::Query.eq(query)).all(&self.reader).await?;
 
         Ok(rows.into_iter().map(|row| (row.website.clone(), row.into())).collect())
     }
@@ -422,6 +445,7 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
+        self.forget_counts();
 
         Ok(new)
     }
@@ -596,20 +620,28 @@ impl SearchStore {
         Ok(new)
     }
 
-    /// How many works of `website` are saved (the ones whose page is gone are not counted).
-    pub async fn counts_of(&self, website: &str) -> Result<u64> {
-        Ok(work::Entity::find().filter(work::Column::Website.eq(website)).filter(work::Column::Deleted.eq(false)).count(&self.db).await?)
+    /// The counts of the searches are forgotten: works were written.
+    fn forget_counts(&self) {
+        if let Ok(mut counted) = self.counted.lock() {
+            counted.clear();
+        }
     }
 
-    /// The paths of the works of `website` whose page was not looked at since `before` (never looked at first, then the oldest look), at most `limit`.
-    pub async fn due_checks(&self, website: &str, before: i64, limit: u64) -> Result<Vec<String>> {
+    /// How many works of `website` are saved (the ones whose page is gone are not counted).
+    pub async fn counts_of(&self, website: &str) -> Result<u64> {
+        Ok(work::Entity::find().filter(work::Column::Website.eq(website)).filter(work::Column::Deleted.eq(false)).count(&self.reader).await?)
+    }
+
+    /// The paths of the works of `website` after `after` (in the order of the paths) whose page was not looked at since `before`, at most
+    /// `limit`. Nothing is sorted: the rows come in the order of the index of the paths, and the caller goes on from the last path it got (from
+    /// "" again when fewer than `limit` came).
+    pub async fn due_checks(&self, website: &str, before: i64, after: &str, limit: u64) -> Result<Vec<String>> {
         let rows = self
-            .db
+            .reader
             .query_all(Statement::from_sql_and_values(
-                self.db.get_database_backend(),
-                "SELECT path FROM works WHERE website = ? AND deleted = 0 AND (checked_at IS NULL OR checked_at < ?) \
-                 ORDER BY checked_at IS NOT NULL, checked_at, path LIMIT ?",
-                [website.into(), before.into(), (limit as i64).into()],
+                self.reader.get_database_backend(),
+                "SELECT path FROM works WHERE website = ? AND path > ? AND deleted = 0 AND (checked_at IS NULL OR checked_at < ?) ORDER BY path LIMIT ?",
+                [website.into(), after.into(), before.into(), (limit as i64).into()],
             ))
             .await?;
 
@@ -643,6 +675,7 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
+        self.forget_counts();
 
         Ok(())
     }
@@ -650,7 +683,7 @@ impl SearchStore {
     /// The saved English titles of Japanese titles (`squash`ed): the English side of a translation that has the title as its Japanese
     /// side, as (English, source). Hitomi.La's is the one when both have it. Nothing is asked.
     pub async fn english_titles(&self, japanese_keys: &[String]) -> Result<HashMap<String, (String, String)>> {
-        let rows = translation::Entity::find().filter(translation::Column::JapaneseKey.is_in(japanese_keys.to_vec())).order_by_desc(translation::Column::GalleryId).all(&self.db).await?;
+        let rows = translation::Entity::find().filter(translation::Column::JapaneseKey.is_in(japanese_keys.to_vec())).order_by_desc(translation::Column::GalleryId).all(&self.reader).await?;
         let mut found: HashMap<String, (String, String)> = HashMap::new();
 
         for row in rows {
@@ -911,7 +944,7 @@ impl SearchStore {
 
     /// Where the crawl of a site stands (None: it never ran).
     pub async fn crawl_state(&self, website: &str) -> Result<Option<crawl_state::Model>> {
-        Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?)
+        Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.reader).await?)
     }
 
     /// Reads the language of every title again (`language.rs`), for when its rules changed, and takes the flags out of the titles
@@ -975,6 +1008,7 @@ impl SearchStore {
             .exec_without_returning(&transaction)
             .await?;
         transaction.commit().await?;
+        self.forget_counts();
 
         Ok(new as usize)
     }
@@ -1015,7 +1049,7 @@ impl SearchStore {
             .filter(work::Column::Path.is_in(paths.iter().map(String::as_str)))
             .filter(work::Column::Deleted.eq(false))
             .filter(work::Column::Title.ne(""))
-            .one(&self.db)
+            .one(&self.reader)
             .await?
             .map(|row| row.title))
     }
@@ -1025,7 +1059,7 @@ impl SearchStore {
         Ok(work::Entity::find()
             .filter(work::Column::Website.eq(website))
             .filter(work::Column::Path.is_in(paths.iter().map(String::as_str)))
-            .all(&self.db)
+            .all(&self.reader)
             .await?
             .into_iter()
             .map(|row| row.path)
@@ -1058,6 +1092,7 @@ impl SearchStore {
             .await?;
 
         transaction.commit().await?;
+        self.forget_counts();
 
         Ok(new)
     }
@@ -1068,7 +1103,7 @@ impl SearchStore {
             .filter(translation::Column::Key.eq(key))
             .filter(translation::Column::Source.eq(source))
             .order_by_asc(translation::Column::Position)
-            .all(&self.db)
+            .all(&self.reader)
             .await?)
     }
 
@@ -1105,7 +1140,7 @@ impl SearchStore {
             .filter(translation::Column::Source.eq(source))
             .order_by_desc(translation::Column::GalleryId)
             .limit(limit)
-            .all(&self.db)
+            .all(&self.reader)
             .await?)
     }
 
@@ -1200,6 +1235,7 @@ impl SearchStore {
         }
 
         transaction.commit().await?;
+        self.forget_counts();
 
         Ok(forgotten)
     }
@@ -1246,13 +1282,30 @@ impl SearchStore {
     /// tens of milliseconds for a word that 700,000 works have.
     pub async fn count_found(&self, matcher: &crate::query::Matcher, websites: Option<&[SiteKey]>) -> Result<usize> {
         let (sql, values) = Self::rowids(matcher, websites);
+        let key = format!("{sql}\u{0}{values:?}");
+        let kept = self.counted.lock().ok().and_then(|counted| counted.get(&key).filter(|(when, _)| when.elapsed() < COUNT_KEPT).map(|(_, n)| *n));
+        if let Some(n) = kept {
+            return Ok(n);
+        }
+
         let row = self
-            .db
-            .query_one(Statement::from_sql_and_values(self.db.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
+            .reader
+            .query_one(Statement::from_sql_and_values(self.reader.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
             .await?
             .ok_or("no count")?;
+        let n = row.try_get::<i64>("", "n")?.max(0) as usize;
 
-        Ok(row.try_get::<i64>("", "n")?.max(0) as usize)
+        if let Ok(mut counted) = self.counted.lock() {
+            if counted.len() >= COUNTS_KEPT {
+                counted.retain(|_, (when, _)| when.elapsed() < COUNT_KEPT);
+            }
+            if counted.len() >= COUNTS_KEPT {
+                counted.clear();
+            }
+            counted.insert(key, (Instant::now(), n));
+        }
+
+        Ok(n)
     }
 
     /// The `limit` works of a site that `matcher` finds, the last added first (the order of the rows).
@@ -1262,7 +1315,7 @@ impl SearchStore {
         let (sql, mut values) = Self::rowids(matcher, Some(std::slice::from_ref(website)));
         values.push((limit as i64).into());
         let statement = Statement::from_sql_and_values(
-            self.db.get_database_backend(),
+            self.reader.get_database_backend(),
             format!(
                 "SELECT w.website, w.path, w.title, w.title_romaji, w.title_key, w.language FROM works w \
                  JOIN (SELECT r FROM ({sql}) ORDER BY r DESC LIMIT ?) x ON w.rowid = x.r ORDER BY x.r DESC"
@@ -1271,7 +1324,7 @@ impl SearchStore {
         );
 
         Ok(CandidateRow::find_by_statement(statement)
-            .all(&self.db)
+            .all(&self.reader)
             .await?
             .into_iter()
             .map(|row| Candidate { site: 0, path: row.path, title: row.title, title_romaji: row.title_romaji, title_key: row.title_key, language: row.language })
@@ -1340,7 +1393,7 @@ impl SearchStore {
         use sea_orm::FromQueryResult;
 
         let statement = self.candidates_statement(parts, most, "w.website, w.path, w.title, w.title_romaji, w.title_key, w.language");
-        let rows = CandidateRow::find_by_statement(statement).all(&self.db).await?;
+        let rows = CandidateRow::find_by_statement(statement).all(&self.reader).await?;
         let mut websites: Vec<String> = Vec::new();
         let mut works = Vec::with_capacity(rows.len());
 
@@ -1372,7 +1425,7 @@ impl SearchStore {
     pub async fn candidates_owned(&self, parts: &[&str]) -> Result<Vec<Work>> {
         let statement = self.candidates_statement(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed), "w.*");
 
-        Ok(work::Entity::find().from_raw_sql(statement).all(&self.db).await?)
+        Ok(work::Entity::find().from_raw_sql(statement).all(&self.reader).await?)
     }
 
     /// How many queries and works are saved (for the tests).
@@ -1380,8 +1433,8 @@ impl SearchStore {
     pub async fn counts(&self) -> Result<(u64, u64)> {
         use sea_orm::PaginatorTrait;
 
-        let queries = search::Entity::find().select_only().column(search::Column::Query).distinct().count(&self.db).await?;
-        let works = work::Entity::find().count(&self.db).await?;
+        let queries = search::Entity::find().select_only().column(search::Column::Query).distinct().count(&self.reader).await?;
+        let works = work::Entity::find().count(&self.reader).await?;
 
         Ok((queries, works))
     }
@@ -1523,12 +1576,12 @@ mod tests {
         let work = |path: &str| NewWork { path: path.to_string(), title: format!("title {path}"), romaji: format!("title {path}"), language: None };
 
         store.save("q", "Site", 100, &Ok(vec![work("/a"), work("/b")]), false).await.unwrap();
-        assert_eq!(store.due_checks("Site", 0, 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
+        assert_eq!(store.due_checks("Site", 0, "", 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
 
         store.record_checks("Site", &[("/a".into(), true), ("/b".into(), false)], 200).await.unwrap();
         assert_eq!(paths(store.candidates_owned(&["title"]).await.unwrap()).await, ["/b"], "the work that is gone is not found: its title is blank");
-        assert!(store.due_checks("Site", 150, 10).await.unwrap().is_empty(), "looked at since 150");
-        assert_eq!(store.due_checks("Site", 300, 10).await.unwrap(), ["/b"], "a look that is old is made again; /a is not a work any more");
+        assert!(store.due_checks("Site", 150, "", 10).await.unwrap().is_empty(), "looked at since 150");
+        assert_eq!(store.due_checks("Site", 300, "", 10).await.unwrap(), ["/b"], "a look that is old is made again; /a is not a work any more");
         assert!(store.works_after(None, 10).await.unwrap().iter().all(|w| w.path != "/a"), "an export or a rewrite does not see it either");
 
         // the list, the crawl and an import all bring /a again: it is left out
@@ -1539,7 +1592,8 @@ mod tests {
         let mut found = paths(store.candidates_owned(&["title"]).await.unwrap()).await;
         found.sort();
         assert_eq!(found, ["/b", "/c", "/d"]);
-        assert_eq!(store.due_checks("Site", 400, 10).await.unwrap(), ["/c", "/d", "/b"], "the works never looked at first, then the oldest look");
+        assert_eq!(store.due_checks("Site", 400, "", 10).await.unwrap(), ["/b", "/c", "/d"], "in the order of the paths");
+        assert_eq!(store.due_checks("Site", 400, "/b", 1).await.unwrap(), ["/c"], "going on after a path, a page at a time");
     }
 
     fn tr(source: &str, id: i64, english: &str, japanese: &str) -> translation::Model {

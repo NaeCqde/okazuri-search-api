@@ -2,7 +2,7 @@
 //! page is gone (`[verify]`).
 //!
 //! Each site is asked on its own, one page every `interval / works` (900 000 works in 30 days are a page every 2.9 s), never closer than `min_pause_ms` (5 s: a site with more
-//! than 518 400 works is looked at over more than `interval_days`) and the delay of the site. The works that were never looked at come first, then the oldest look. A site still lists a work whose page is gone, so the
+//! than 518 400 works is looked at over more than `interval_days`) and the delay of the site. The works are taken in the order of their paths (no sort of the whole site), the ones looked at within the interval skipped. A site still lists a work whose page is gone, so the
 //! row stays with no title (`works.deleted`): a list, the crawl or an import does not save the work again, and no search finds it.
 
 use std::sync::Arc;
@@ -63,6 +63,8 @@ impl Verifier {
     async fn site(self: Arc<Self>, index: usize, name: &'static str, rule: GoneRule) {
         let mut works = 0u64;
         let mut batches = 0u64;
+        // where the walk over the paths of the site is (the due pages are taken in the order of the paths, no sort of the whole site)
+        let mut after = String::new();
 
         loop {
             // the number of works changes slowly (the crawl): it is counted again now and then
@@ -71,7 +73,7 @@ impl Verifier {
             }
             batches += 1;
 
-            match self.batch(index, name, rule, works).await {
+            match self.batch(index, name, rule, works, &mut after).await {
                 Ok(0) => tokio::time::sleep(Duration::from_secs(3600)).await,
                 Ok(_) => {}
                 Err(e) => {
@@ -83,9 +85,17 @@ impl Verifier {
     }
 
     /// Looks at the pages of `name` that are due, `BATCH` of them at the most. Returns how many were looked at.
-    async fn batch(&self, index: usize, name: &'static str, rule: GoneRule, works: u64) -> Result<usize> {
+    async fn batch(&self, index: usize, name: &'static str, rule: GoneRule, works: u64, after: &mut String) -> Result<usize> {
         let before = now() - self.config.interval_days.max(1) as i64 * 86_400;
-        let due = self.engine.store().due_checks(name, before, BATCH).await?;
+        let mut due = self.engine.store().due_checks(name, before, after, BATCH).await?;
+        if (due.len() as u64) < BATCH && !after.is_empty() {
+            // the end of the paths: go on from the first one again
+            let more = self.engine.store().due_checks(name, before, "", BATCH - due.len() as u64).await?;
+            *after = more.last().cloned().unwrap_or_default();
+            due.extend(more);
+        } else {
+            *after = due.last().cloned().unwrap_or_default();
+        }
         let spacing = Duration::from_millis((self.config.interval_days.max(1) * 86_400_000 / works).max(self.config.min_pause_ms));
         let mut results = Vec::new();
 
