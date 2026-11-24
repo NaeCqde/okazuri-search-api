@@ -104,43 +104,6 @@ impl std::ops::Deref for Candidates {
     }
 }
 
-/// How the indexes are asked for the works of a site. The name of a site is many trigrams (and several words), and the index walks the list
-/// of every one of them: a count of `maid` in `HentaiEra` takes 870 ms, and in `Era` (a piece that no other site has) 110 ms. So a site is
-/// asked for by one piece of 3 characters of its name that no other name has, and by one word of it that no other name has.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SiteKey {
-    pub name: String,
-    /// For the trigram index: 3 characters of the name (the name itself when every piece is in another name).
-    piece: String,
-    /// For the index of words: a word of the name (the name itself when every word is in another name).
-    word: String,
-}
-
-impl SiteKey {
-    /// The keys of the sites with these names (each is told apart from all the others).
-    pub fn of(names: &[&str]) -> Vec<SiteKey> {
-        let lower: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
-        let pieces = |text: &str| -> Vec<String> {
-            let chars: Vec<char> = text.chars().collect();
-
-            chars.windows(3).map(|window| window.iter().collect()).collect()
-        };
-        let words = |text: &str| -> Vec<String> { text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).map(str::to_string).collect() };
-
-        names
-            .iter()
-            .enumerate()
-            .map(|(place, name)| {
-                let others = |has: &dyn Fn(&str) -> bool| lower.iter().enumerate().any(|(other, text)| other != place && has(text));
-                let piece = pieces(&lower[place]).into_iter().find(|piece| !others(&|text| pieces(text).contains(piece)));
-                let word = words(&lower[place]).into_iter().find(|word| !others(&|text| words(text).contains(word)));
-
-                SiteKey { name: name.to_string(), piece: piece.unwrap_or_else(|| lower[place].clone()), word: word.unwrap_or_else(|| lower[place].clone()) }
-            })
-            .collect()
-    }
-}
-
 pub struct SearchStore {
     db: DatabaseConnection,
     /// Read-only connections, several: a search does not wait for a write (or for the long read of the verification) of the one connection
@@ -1270,28 +1233,19 @@ impl SearchStore {
         Ok(forgotten)
     }
 
-    /// The SQL of the row numbers of the works that a `Matcher` finds through the indexes, of the given sites (all the works for None). A site
-    /// in the query makes it slower (the index walks the long list of the works of the site), so it is asked for only when it is needed.
-    fn rowids(matcher: &crate::query::Matcher, websites: Option<&[SiteKey]>) -> (String, Vec<sea_orm::Value>) {
+    /// The SQL of the row numbers of the works that a `Matcher` finds through the indexes (every site: the works of a site are told apart
+    /// after the rows are read, a site in the query makes the index walk the long list of its works).
+    fn rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
         let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
-        let sites = |word: bool| match websites {
-            Some(keys) if !keys.is_empty() => {
-                format!(" AND website : ({})", keys.iter().map(|key| quote(if word { &key.word } else { &key.piece })).collect::<Vec<_>>().join(" OR "))
-            }
-            _ => String::new(),
-        };
-        if websites.is_some_and(|keys| keys.is_empty()) {
-            return ("SELECT rowid AS r FROM works WHERE 0".to_string(), Vec::new());
-        }
         let long = (!matcher.long.is_empty()).then(|| {
             let pieces = matcher.long.iter().map(|piece| quote(piece)).collect::<Vec<_>>().join(" AND ");
 
-            format!("title_key : ({pieces}){}", sites(false))
+            format!("title_key : ({pieces})")
         });
         let short = (!matcher.short.is_empty()).then(|| {
             let words = matcher.short.iter().map(|word| quote(word)).collect::<Vec<_>>().join(" AND ");
 
-            format!("title_romaji : ({words}){}", sites(true))
+            format!("title_romaji : ({words})")
         });
 
         match (long, short) {
@@ -1308,9 +1262,9 @@ impl SearchStore {
         }
     }
 
-    /// How many works of the sites (all the works for None) `matcher` finds in the indexes (the `count` command: a search does not count).
-    pub async fn count_found(&self, matcher: &crate::query::Matcher, websites: Option<&[SiteKey]>) -> Result<usize> {
-        let (sql, values) = Self::rowids(matcher, websites);
+    /// How many works `matcher` finds in the indexes (the `count` command: a search does not count).
+    pub async fn count_found(&self, matcher: &crate::query::Matcher) -> Result<usize> {
+        let (sql, values) = Self::rowids(matcher);
         let row = self
             .reader
             .query_one(Statement::from_sql_and_values(self.reader.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
@@ -1318,6 +1272,21 @@ impl SearchStore {
             .ok_or("no count")?;
 
         Ok(row.try_get::<i64>("", "n")?.max(0) as usize)
+    }
+
+    /// How many works of each site `matcher` finds in the indexes: (site, works), the sites with none left out (the `count` command).
+    pub async fn count_found_by_site(&self, matcher: &crate::query::Matcher) -> Result<Vec<(String, usize)>> {
+        let (sql, values) = Self::rowids(matcher);
+        let rows = self
+            .reader
+            .query_all(Statement::from_sql_and_values(
+                self.reader.get_database_backend(),
+                format!("SELECT w.website AS website, count(*) AS n FROM works w JOIN ({sql}) x ON w.rowid = x.r GROUP BY w.website"),
+                values,
+            ))
+            .await?;
+
+        rows.iter().map(|row| Ok((row.try_get("", "website")?, row.try_get::<i64>("", "n")?.max(0) as usize))).collect()
     }
 
     /// For every site: (name, works, works whose page is gone, works never looked at by the verification).
@@ -1348,11 +1317,12 @@ impl SearchStore {
         Ok(crawl_state::Entity::find().order_by_asc(crawl_state::Column::Website).all(&self.reader).await?)
     }
 
-    /// The `limit` works of a site that `matcher` finds, the last added first (the order of the rows).
-    pub async fn top_found(&self, matcher: &crate::query::Matcher, website: &SiteKey, limit: usize) -> Result<Vec<Candidate>> {
+    /// The `limit` works that `matcher` finds, the last added first: (site, work). The order is the order of the rows, so the same request
+    /// is answered in the same order every time.
+    pub async fn top_found(&self, matcher: &crate::query::Matcher, limit: usize) -> Result<Vec<(String, Candidate)>> {
         use sea_orm::FromQueryResult;
 
-        let (sql, mut values) = Self::rowids(matcher, Some(std::slice::from_ref(website)));
+        let (sql, mut values) = Self::rowids(matcher);
         values.push((limit as i64).into());
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
@@ -1367,7 +1337,7 @@ impl SearchStore {
             .all(&self.reader)
             .await?
             .into_iter()
-            .map(|row| Candidate { site: 0, path: row.path, title: row.title, title_romaji: row.title_romaji, title_key: row.title_key, language: row.language })
+            .map(|row| (row.website, Candidate { site: 0, path: row.path, title: row.title, title_romaji: row.title_romaji, title_key: row.title_key, language: row.language }))
             .collect())
     }
 
@@ -2083,27 +2053,6 @@ mod tests {
         assert_eq!(paths(store.candidates_owned(&["shitara"]).await.unwrap()).await, ["/g/4/"]);
     }
 
-    #[test]
-    fn a_site_is_asked_for_by_a_piece_and_a_word_that_no_other_site_has() {
-        let names: Vec<&str> = crate::sites::all().iter().map(|site| site.def.name).collect();
-        let keys = SiteKey::of(&names);
-
-        for (place, key) in keys.iter().enumerate() {
-            let own = names[place].to_lowercase();
-            assert!(own.contains(&key.piece) && own.contains(&key.word), "{}: {} / {}", key.name, key.piece, key.word);
-            assert!(key.piece.chars().count() == 3 || key.piece == own, "{}: {}", key.name, key.piece);
-
-            for (other, name) in names.iter().enumerate().filter(|(other, _)| *other != place) {
-                let name = name.to_lowercase();
-                assert!(!name.contains(&key.piece), "{} is also in {}", key.piece, names[other]);
-                assert!(!name.split(|c: char| !c.is_alphanumeric()).any(|word| word == key.word), "{} is also a word of {}", key.word, names[other]);
-            }
-        }
-        // two names that are made of the same pieces are asked for by the whole name
-        let keys = SiteKey::of(&["abc", "abcd"]);
-        assert_eq!((keys[0].piece.as_str(), keys[1].piece.as_str()), ("abc", "bcd"));
-    }
-
     #[tokio::test]
     async fn a_database_of_the_old_version_gets_the_keys_outside_the_parentheses_and_the_new_indexes() {
         let dir = std::env::temp_dir().join(format!("okazuri-version-{}", std::process::id()));
@@ -2130,19 +2079,15 @@ mod tests {
 
         // the index has the new keys and the site: the work whose title has the words only in its parentheses is not found
         let matcher = crate::query::Matcher { long: vec!["comic".into()], short: Vec::new() };
-        let keys = SiteKey::of(&["Site", "Other"]);
-        assert_eq!(store.count_found(&matcher, Some(&keys[..1])).await.unwrap(), 1);
-        assert_eq!(store.count_found(&matcher, Some(&keys[1..])).await.unwrap(), 0);
-        assert_eq!(store.count_found(&matcher, None).await.unwrap(), 1, "all the sites");
-        assert_eq!(store.count_found(&matcher, Some(&[])).await.unwrap(), 0, "no site");
-        assert_eq!(store.count_found(&matcher, Some(&keys)).await.unwrap(), 1);
-        let top = store.top_found(&matcher, &keys[0], 5).await.unwrap();
-        assert_eq!(top.iter().map(|w| w.path.as_str()).collect::<Vec<_>>(), ["/g/2/"]);
+        assert_eq!(store.count_found(&matcher).await.unwrap(), 1);
+        assert_eq!(store.count_found_by_site(&matcher).await.unwrap(), [("Site".to_string(), 1)]);
+        let top = store.top_found(&matcher, 5).await.unwrap();
+        assert_eq!(top.iter().map(|(site, w)| (site.as_str(), w.path.as_str())).collect::<Vec<_>>(), [("Site", "/g/2/")]);
 
         // opened again, nothing is made again
         drop(store);
         let store = SearchStore::open(&path).await.unwrap();
-        assert_eq!(store.count_found(&matcher, Some(&keys[..1])).await.unwrap(), 1);
+        assert_eq!(store.count_found(&matcher).await.unwrap(), 1);
 
         fs::remove_dir_all(&dir).ok();
     }

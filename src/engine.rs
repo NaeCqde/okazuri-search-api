@@ -384,8 +384,6 @@ pub struct Engine {
     sites: Vec<Site>,
     /// Indexes into `sites` of the ones that are searched.
     active: Vec<usize>,
-    /// How the indexes of the database are asked for the works of each site (`sites` order).
-    keys: Vec<crate::store::SiteKey>,
     /// The sites that `[search] disabled_sites` names: not asked by a search or the prefetch, and not walked by the crawl or the verification.
     off: Vec<bool>,
     /// The place of a searched site in the list, to put the works in the order of the sites.
@@ -434,13 +432,10 @@ impl Engine {
 
         let delays = sites.iter().map(|site| Self::delay_of(site, config)).collect();
 
-        let keys = crate::store::SiteKey::of(&sites.iter().map(|site| site.def.name).collect::<Vec<_>>());
-
         let off = sites.iter().map(|site| disabled.contains(&site.def.name.to_lowercase())).collect();
 
         Arc::new(Self {
             off,
-            keys,
             delays,
             gates: sites.iter().map(|_| Mutex::new(None)).collect(),
             sites,
@@ -997,23 +992,24 @@ impl Engine {
         let plan = self.plan(query)?;
         let terms = Terms::new(&plan.query);
         let matcher = terms.matcher().ok_or("the indexes cannot count this query (no word of 3 letters or more)")?;
-        let total = self.store.count_found(&matcher, None).await?;
+        let total = self.store.count_found(&matcher).await?;
+        let found = self.store.count_found_by_site(&matcher).await?;
         let mut sites = Vec::new();
 
         for index in self.sites_in_order() {
-            let found = self.store.count_found(&matcher, Some(std::slice::from_ref(&self.keys[index]))).await?;
-            if found > 0 {
-                sites.push((self.sites[index].def.name, self.sites[index].def.legal, found));
+            let name = self.sites[index].def.name;
+            if let Some((_, count)) = found.iter().find(|(site, _)| site == name) {
+                sites.push((name, self.sites[index].def.legal, *count));
             }
         }
 
         Ok((total, sites))
     }
 
-    /// The works of the answer from the indexes of the database: how many works there are (no work is read for that), and the head of the
-    /// answer (the last added first in a site, the sites in their order), `request.limit` works. `after` is an earlier search of the same
-    /// request: its works are not counted again, and its place in the answer is not filled again. Returns the head as candidates and places,
-    /// the counts, and how many rows were read.
+    /// The works of the answer from the indexes of the database (nothing is counted): the last added first, whatever the site (one read; the
+    /// same request has the same order every time), `request.limit` works and one more, which tells whether the answer goes on. `after` is
+    /// an earlier search of the same request: its works are among those it finds again, so that many more are read. Returns the head as
+    /// candidates and places, and how many rows were read.
     async fn indexed_items(
         &self,
         request: &Request<'_>,
@@ -1021,35 +1017,29 @@ impl Engine {
         after: Option<&Searched>,
         fetched: &Fetched,
     ) -> Result<(Arc<Candidates>, Vec<Item>, bool, usize)> {
-        let order = self.sites_in_order();
+        // the places of the answer that the earlier search left; it has every one of its works in `Merged::items` when it did not fill the answer
+        // (one work more than the limit: it tells whether the answer goes on)
+        let spare = after.map_or(0, |after| after.items);
+        let left = (request.limit.max(1) + 1).saturating_sub(spare);
 
         let mut websites: Vec<String> = Vec::new();
         let mut works: Vec<Candidate> = Vec::new();
         let mut items: Vec<Item> = Vec::new();
-        // the places of the answer that the earlier search left; it has every one of its works in `Merged::items` when it did not fill the answer,
-        // and those that this search also finds are filtered out of what it reads, so that many more are read
-        // (one work more than the limit: it tells whether the answer goes on; nothing is counted)
-        let mut left = (request.limit.max(1) + 1).saturating_sub(after.map_or(0, |after| after.items));
-        // the works of the earlier search that this one finds again are among its works of the answer, so that many more are read
-        let spare = after.map_or(0, |after| after.items);
 
-        for index in order {
-            if left == 0 {
-                break;
-            }
-
-            let name = self.sites[index].def.name;
-            let rows = self.store.top_found(matcher, &self.keys[index], left + spare).await?;
-            if rows.is_empty() {
-                continue;
-            }
-            websites.push(name.to_string());
-            // (some of the rows may be the works of the earlier search, which are filtered out: only the ones above its number are sure to stay)
-            left = left.saturating_sub(rows.len().saturating_sub(spare));
-
-            for mut row in rows {
-                row.site = (websites.len() - 1) as u16;
-                let is_new = !fetched.new.is_empty() && fetched.new.contains(&(name.to_string(), row.path.clone()));
+        if left > 0 {
+            // the works of the earlier search that this one finds again are among the rows, so that many more are read
+            for (name, mut row) in self.store.top_found(matcher, left + spare).await? {
+                // the work of a site that is not in the list (it was removed from the code) is not in the answer
+                let Some(index) = self.site_named(&name) else { continue };
+                let place = match websites.iter().position(|known| *known == name) {
+                    Some(place) => place,
+                    None => {
+                        websites.push(name.clone());
+                        websites.len() - 1
+                    }
+                };
+                row.site = place as u16;
+                let is_new = !fetched.new.is_empty() && fetched.new.contains(&(name, row.path.clone()));
 
                 items.push(Item { set: 0, index: works.len() as u32, site: index as u16, is_new });
                 works.push(row);
@@ -2332,32 +2322,25 @@ pub(crate) mod tests {
         assert!(outcome.translation_ja.is_none());
     }
 
-    /// The saved works the way the words are defined, row by row: the sites in their order, the last added first in a site. A word of 3
-    /// characters or more is in the key of what is outside the parentheses of the title; a shorter one is a word of the whole romaji.
+    /// The saved works the way the words are defined, row by row: the last added first, whatever the site. A word of 3 characters or more is in
+    /// the key of what is outside the parentheses of the title; a shorter one is a word of the whole romaji.
     async fn expected_titles(engine: &Arc<Engine>, query: &str) -> Vec<String> {
         let words: Vec<String> = Terms::new(&engine.plan(query).unwrap().query).keys().into_iter().map(str::to_string).collect();
         let works = engine.store.candidates_owned(&[]).await.unwrap();
-        let mut titles = Vec::new();
 
-        for index in engine.sites_in_order() {
-            titles.extend(
-                works
-                    .iter()
-                    .filter(|w| w.website == engine.sites[index].def.name)
-                    .filter(|w| {
-                        words.iter().all(|word| {
-                            if word.chars().count() >= 3 {
-                                w.title_key.contains(word.as_str())
-                            } else {
-                                w.title_romaji.split(|c: char| !c.is_ascii_alphanumeric()).any(|piece| piece == word)
-                            }
-                        })
-                    })
-                    .map(|w| w.title.clone()),
-            );
-        }
-
-        titles
+        works
+            .iter()
+            .filter(|w| {
+                words.iter().all(|word| {
+                    if word.chars().count() >= 3 {
+                        w.title_key.contains(word.as_str())
+                    } else {
+                        w.title_romaji.split(|c: char| !c.is_ascii_alphanumeric()).any(|piece| piece == word)
+                    }
+                })
+            })
+            .map(|w| w.title.clone())
+            .collect()
     }
 
     #[tokio::test]
@@ -2397,9 +2380,11 @@ pub(crate) mod tests {
             assert_eq!(head.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>(), expected[..expected.len().min(3)], "{query}");
         }
 
-        // the last added work of a site is its first
+        // the last added work is the first, whatever its site, and the same request has the same order every time
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
-        assert_eq!(outcome.results[0].path, "/work/2", "the first of the list of the page is the last added");
+        assert_eq!(outcome.results[0].path, "/work/102", "the first of the list of the page is the last added (a list is saved newest first, and the second site is saved last)");
+        let again = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
+        assert_eq!(outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>(), again.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>());
     }
 
     #[tokio::test]
