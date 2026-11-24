@@ -124,6 +124,12 @@ max_queries_per_round = 0
 # The wait between two rounds when everything is searched already (a change of the copy starts one at once).
 round_interval_minutes = 60
 
+# Which log lines have what a person searched for (and what it was translated to). `off` (the default): none, a line says that there was a
+# query and keeps its time and its error. `errors`: the lines of a failure (warnings and errors) have it, to find the query that failed.
+# `all`: every line that talks of a query has it, the timings too. Set when the file is read.
+[log]
+queries = "off"
+
 # Scheduled HTTP requests: the server calls a URL on a schedule, so a job that has to be run from this
 # machine needs no crontab and curl next to it. Off unless enabled = true; while it is off, the jobs
 # below are not even checked. A mistake in this section stops the start with a message that names the job.

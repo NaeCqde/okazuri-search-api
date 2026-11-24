@@ -19,6 +19,26 @@ pub struct Config {
     pub crawl: CrawlConfig,
     pub verify: VerifyConfig,
     pub cron: CronConfig,
+    pub log: LogConfig,
+}
+
+/// Which log lines have what a person searched for, or what it was translated to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogQueries {
+    /// No line has it (the lines say that there was a query, with the time and the error).
+    #[default]
+    Off,
+    /// The lines of a failure (warnings and errors) have it, so that the failed query can be found.
+    Errors,
+    /// Every line that talks of a query has it (also the timings).
+    All,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    pub queries: LogQueries,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -348,12 +368,23 @@ pub async fn load(path: &Path) -> Result<Config> {
         Err(e) => return Err(format!("cannot read {}: {}", path.display(), e).into()),
     };
 
-    toml::from_str(&text).map_err(|e| format!("{}: {}", path.display(), e).into())
+    let config: Config = toml::from_str(&text).map_err(|e| format!("{}: {}", path.display(), e))?;
+    crate::utils::set_log_queries(config.log.queries);
+
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_queries_is_off_unless_the_file_says_otherwise() {
+        assert_eq!(toml::from_str::<Config>("").unwrap().log.queries, LogQueries::Off);
+        assert_eq!(toml::from_str::<Config>("[log]\nqueries = \"errors\"").unwrap().log.queries, LogQueries::Errors);
+        assert_eq!(toml::from_str::<Config>("[log]\nqueries = \"all\"").unwrap().log.queries, LogQueries::All);
+        assert!(toml::from_str::<Config>("[log]\nqueries = \"sometimes\"").is_err());
+    }
 
     #[test]
     fn an_empty_file_is_the_defaults() {
