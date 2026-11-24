@@ -27,6 +27,8 @@ use tokio::sync::{Mutex, Semaphore};
 
 /// A site that answers 429 is asked once more after the seconds of its Retry-After (this when it gives none), but
 /// never after more than the longest wait.
+/// An English text with fewer letters (squashed: no spaces or symbols) is not translated with the titles of Hitomi.La.
+const MIN_ENGLISH_KEY_CHARS: usize = 4;
 const DEFAULT_RETRY_WAIT_SECS: u64 = 5;
 const MAX_RETRY_WAIT_SECS: u64 = 30;
 
@@ -1392,6 +1394,8 @@ impl Engine {
         self.sites.iter().any(|site| site.def.format == Format::Hitomi)
     }
 
+    /// A translation is a title that is the whole text (`exact`), never one that only has the text in it; an English text of less than
+    /// `MIN_ENGLISH_KEY_CHARS` letters has none.
     /// The translation of a text, Japanese to English or English to Japanese, from the titles of Hitomi.La (a work has both).
     /// The answer is saved in the tables `translation_lookups` and `translations` (source `hitomi`): `live` is the one of the
     /// search, a saved answer is kept for good and is the one that is given unless it is `on`, and a translation that was
@@ -1408,6 +1412,11 @@ impl Engine {
             return Ok((Vec::new(), false));
         }
 
+        // a short English word is no title to translate: a gallery whose English side is `wat` (the name of an artist, say) is not its translation
+        if from == Lang::English && key.chars().count() < MIN_ENGLISH_KEY_CHARS {
+            return Ok((Vec::new(), true));
+        }
+
         // Hitomi.La is used only when its whole list is saved (asked live, a translation takes far too long): nothing is answered
         // before, and `translate_auto` goes on to Google
         if self.hitomi_waits_for_its_list().await? {
@@ -1420,12 +1429,13 @@ impl Engine {
 
         if live != Live::Force && !saved.is_empty() {
             text_log!(info, "timing of the Hitomi.La translation of {text:?}: {laps}"; "timing of a Hitomi.La translation: {laps}");
-            return Ok((saved.into_iter().map(Translation::from).collect(), true));
+            // only a title that is the whole text is a translation of it (a title that has the text in it, `Baltimore` for `ore`, is not)
+            return Ok((saved.into_iter().map(Translation::from).filter(|translation| translation.exact).collect(), true));
         }
 
         // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
         if live != Live::Force {
-            let others = self.store.translations_with("hitomi", from == Lang::English, &key, false, 20).await?;
+            let others = self.store.translations_with("hitomi", from == Lang::English, &key, true, 20).await?;
             laps.lap("other direction");
 
             if !others.is_empty() {
@@ -1460,7 +1470,7 @@ impl Engine {
         laps.lap("save");
         text_log!(info, "timing of the Hitomi.La translation of {text:?}: {laps}"; "timing of a Hitomi.La translation: {laps}");
 
-        Ok((found, false))
+        Ok((found.into_iter().filter(|translation| translation.exact).collect(), false))
     }
 
     /// The translation of Google Translate (`gtranslate.rs`), saved in the same tables (source `google`, kept for good):
@@ -2271,9 +2281,17 @@ pub(crate) mod tests {
 
         // a translation that was asked from the other side answers too: Japanese to English saved, English to Japanese asked
         store.save_translations("九", "hitomi", "九", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 9, english: "Nine Lives".into(), japanese: "九つの命".into(), english_key: "ninelives".into(), japanese_key: "九つの命".into(), ..row.clone() }]).await.unwrap();
-        let (found, saved) = engine.translate_hitomi("Nine", Lang::English, Live::Diff).await.unwrap();
+        // a title that only has the text in it is not its translation
+        assert_eq!(engine.translate_hitomi("Nine", Lang::English, Live::Diff).await.unwrap(), (vec![], true));
+        let (found, saved) = engine.translate_hitomi("Nine Lives", Lang::English, Live::Diff).await.unwrap();
         assert!(saved);
-        assert_eq!((found[0].japanese.as_str(), found[0].exact), ("九つの命", false));
+        assert_eq!((found[0].japanese.as_str(), found[0].exact), ("九つの命", true));
+
+        // a short English text has no translation, even when a title is the whole text; a Japanese one is as short as it likes
+        store.save_translations("wat", "hitomi", "wat", "en", unix_now(), &[crate::entity::translation::Model { gallery_id: 5, english: "wat".into(), japanese: "都市伝説".into(), english_key: "wat".into(), japanese_key: "都市伝説".into(), ..row.clone() }]).await.unwrap();
+        assert_eq!(engine.translate_hitomi("wat", Lang::English, Live::Diff).await.unwrap(), (vec![], true));
+        assert_eq!(engine.translate_hitomi("wat", Lang::English, Live::Force).await.unwrap(), (vec![], true), "`on` does not ask the site for it either");
+        assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 1);
         assert_eq!(engine.translate_hitomi("九つの命", Lang::Japanese, Live::Force).await.is_err(), true, "`on` asks the site");
         assert_eq!(engine.translate_hitomi("Nine Lives", Lang::English, Live::Off).await.unwrap().0[0].exact, true);
 
