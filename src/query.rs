@@ -21,19 +21,25 @@ fn bracket_group() -> &'static str {
 /// The title of the work alone, for a translation by title (Hitomi.La): what a site puts around the title is left out: the event
 /// and the circle and the artist at the front (`(C103) [Circle (Artist)]`), the series, the tags and the language at the back
 /// (`(Series) [English] [DL版]`), and the other title after a bar (`English | 日本語`, `日本語 / English`): the one in the
-/// language of the text (`japanese`) is kept. When nothing is left, the text is as it was.
+/// language of the text (`japanese`) is kept. The tags that E-Hentai's listing writes after the title (` f:big breasts m:sole male`: a letter or
+/// two and a colon) are cut off from the first one. When nothing is left, the text is as it was.
 pub fn work_title(text: &str, japanese: bool) -> String {
     use regex::Regex;
     use std::sync::OnceLock;
 
-    static EDGES: OnceLock<(Regex, Regex)> = OnceLock::new();
-    let (front, back) = EDGES.get_or_init(|| {
+    static EDGES: OnceLock<(Regex, Regex, Regex)> = OnceLock::new();
+    let (front, back, tags) = EDGES.get_or_init(|| {
         let group = bracket_group();
 
-        (Regex::new(&format!(r"^(?:\s*{group})+")).unwrap(), Regex::new(&format!(r"(?:{group}\s*)+$")).unwrap())
+        (Regex::new(&format!(r"^(?:\s*{group})+")).unwrap(), Regex::new(&format!(r"(?:{group}\s*)+$")).unwrap(), Regex::new(r"\s[a-z]{1,3}:\S").unwrap())
     });
 
     let tidied = tidy(text);
+    // the tags of a work of E-Hentai are after its title: `title (Series) [Language] series character f:tag m:tag`
+    let tidied = match tags.find(&tidied) {
+        Some(found) if found.start() > 0 => tidied[..found.start()].to_string(),
+        _ => tidied,
+    };
     let segments: Vec<&str> = tidied.split(" | ").flat_map(|part| part.split(" / ")).collect();
     let chosen = segments.iter().find(|segment| has_japanese(segment) == japanese).or(segments.first()).copied().unwrap_or("");
 
@@ -365,6 +371,10 @@ mod tests {
         assert_eq!(ja("ゼンゼロ逆レ合同「パエトーン強襲戦」"), "ゼンゼロ逆レ合同「パエトーン強襲戦」");
         assert_eq!(ja("  姉弟で　シたらいけません "), "姉弟で シたらいけません");
         assert_eq!(en("(C103) [Circle (Artist)] Siblings Shouldn't Do It! (Original) [English] [Digital]"), "Siblings Shouldn't Do It!");
+        // the tags of E-Hentai after the title are cut off (a colon after more than 3 letters, or a title that starts with one, is not a tag)
+        assert_eq!(ja("[Circle] 旧作167 Kushida (Series) [AI Generated] series kushida f:apparel bukkake f:big breasts m:sole male"), "旧作167 Kushida (Series) [AI Generated] series kushida");
+        assert_eq!(ja("Re:ゼロ Part:2 から始める"), "Re:ゼロ Part:2 から始める");
+        assert_eq!(ja("f:先頭 の題名"), "f:先頭 の題名");
     }
 
     #[test]
