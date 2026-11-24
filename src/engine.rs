@@ -1444,7 +1444,9 @@ impl Engine {
             }
         }
 
-        if live == Live::Off {
+        // the whole list of Hitomi.La is saved (the check above): what the site would say is in the database already, and asking it takes seconds
+        // for every new text. Only `on` (force) asks the site; `diff` and `off` answer from the database and, when it has nothing, `translate_auto` goes on to Google
+        if live != Live::Force {
             return Ok((Vec::new(), true));
         }
 
@@ -2282,10 +2284,11 @@ pub(crate) mod tests {
         let (back, saved) = engine.translate_google("Ten", Lang::English, Live::Diff).await.unwrap();
         assert_eq!((back.japanese.as_str(), saved), ("十", true));
 
-        // a text that found nothing is asked again (`diff`), not taken from the lookup; `off` never asks
+        // a text that found nothing is not asked of the site (`diff` and `off` answer from the database); only `on` asks
         store.save_translations("八", "hitomi", "八", "ja", unix_now(), &[]).await.unwrap();
-        assert!(engine.translate_hitomi("八", Lang::Japanese, Live::Diff).await.is_err());
+        assert_eq!(engine.translate_hitomi("八", Lang::Japanese, Live::Diff).await.unwrap(), (vec![], true));
         assert_eq!(engine.translate_hitomi("八", Lang::Japanese, Live::Off).await.unwrap(), (vec![], true));
+        assert!(engine.translate_hitomi("八", Lang::Japanese, Live::Force).await.is_err(), "`on` asks the site");
     }
 
     #[tokio::test]
