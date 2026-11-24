@@ -2,7 +2,7 @@
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-static LOG_QUERIES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LOG_QUERIES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(crate::config::LogQueries::Errors as u8);
 
 /// Sets which log lines have the text of a query (`[log] queries`); the config sets it when it is read.
 pub fn set_log_queries(mode: crate::config::LogQueries) {
