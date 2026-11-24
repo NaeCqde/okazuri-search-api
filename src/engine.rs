@@ -901,7 +901,7 @@ impl Engine {
         }
 
         let (candidates, items, indexed, rows) = match &matcher {
-            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched).await?,
+            Some(matcher) => self.indexed_items(request, &terms, matcher, after.as_ref(), &fetched).await?,
             None => {
                 let (candidates, items) = self.scanned_items(&terms, &fetched).await?;
                 laps.lap("candidates and match");
@@ -982,6 +982,7 @@ impl Engine {
 
         let origins: Vec<String> = self.sites.iter().map(|site| site.def.origin.to_lowercase()).collect();
         let items = dedupe_items(&candidates.works, &origins, items);
+        let items = rank_first(items, self.config.rank_window, |item| terms.is_good_answer(&candidates.works[item.index as usize].title_romaji));
 
         Ok((candidates, items))
     }
@@ -1013,6 +1014,7 @@ impl Engine {
     async fn indexed_items(
         &self,
         request: &Request<'_>,
+        terms: &Terms,
         matcher: &crate::query::Matcher,
         after: Option<&Searched>,
         fetched: &Fetched,
@@ -1028,7 +1030,12 @@ impl Engine {
 
         if left > 0 {
             // the works of the earlier search that this one finds again are among the rows, so that many more are read
-            for (name, mut row) in self.store.top_found(matcher, left + spare).await? {
+            // the first `rank_window` works are read and put in order (the good answers first); the answer needs only `left + spare` of them
+            let wanted = left + spare;
+            let found = self.store.top_found(matcher, wanted.max(self.config.rank_window)).await?;
+            let found = rank_first(found, self.config.rank_window, |(_, row)| terms.is_good_answer(&row.title_romaji));
+
+            for (name, mut row) in found.into_iter().take(wanted) {
                 // the work of a site that is not in the list (it was removed from the code) is not in the answer
                 let Some(index) = self.site_named(&name) else { continue };
                 let place = match websites.iter().position(|known| *known == name) {
@@ -1738,6 +1745,23 @@ impl crate::hitomi::Fetch for HitomiFetch<'_> {
 
 /// One hit for each address: the same page saved twice (`/g/1/` and `/g/1`, two sites that answer with the same address) is
 /// one result. The first one (the order of the answer) stays, and is new when any of them is.
+/// The first `window` of `rows` with the good ones first (each group in its order); the rows after the window stay where they are, so the order of a
+/// page deep in the answer does not change with the size of the page. `window` 0 leaves the rows as they are.
+fn rank_first<T>(mut rows: Vec<T>, window: usize, good: impl Fn(&T) -> bool) -> Vec<T> {
+    let window = window.min(rows.len());
+
+    if window == 0 {
+        return rows;
+    }
+
+    let tail = rows.split_off(window);
+    let (mut head, bad): (Vec<T>, Vec<T>) = rows.into_iter().partition(|row| good(row));
+
+    head.extend(bad);
+    head.extend(tail);
+    head
+}
+
 fn dedupe_items<'a>(candidates: &'a [Candidate], origins: &'a [String], items: Vec<Item>) -> Vec<Item> {
     // the key is the address in two pieces (the origin of the site, and the path without its `#` and its last `/`), folded to lower case:
     // the same as the address as one text, and no copy for a path that is already in lower case
@@ -2373,6 +2397,27 @@ pub(crate) mod tests {
             })
             .map(|w| w.title.clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn the_answers_that_start_words_come_before_the_ones_that_have_the_words_in_the_middle() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        // the first one has `rashou` and `mon` in the middle of its words, and is the first row
+        let titles = ["Kimera Shoujo ga Hoshii Mono", "Rashoumon", "rashou mon", "Hoge Rashoumon no Hanashi"];
+        let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(n, title)).collect();
+        store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
+
+        let found = |outcome: Outcome| outcome.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>();
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("rashou mon") }).await.unwrap();
+        let ranked = found(outcome);
+        assert_eq!(ranked.last().map(String::as_str), Some("Kimera Shoujo ga Hoshii Mono"));
+        assert_eq!(ranked.len(), 4);
+
+        // without the window the rows stay in their order
+        let engine = Engine::with_sites(sites::all(), &SearchConfig { rank_window: 0, ..config() }, engine.store.clone(), engine.romanizer.clone());
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("rashou mon") }).await.unwrap();
+        assert_ne!(found(outcome).last().map(String::as_str), Some("Kimera Shoujo ga Hoshii Mono"), "the rows are in their own order");
     }
 
     #[tokio::test]

@@ -206,6 +206,9 @@ pub struct Matcher {
     pub short: Vec<String>,
 }
 
+/// The most words of a query that are joined as one word of a title (`rashou mon` is `Rashoumon`).
+const MOST_JOINED_WORDS: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Term {
     key: String,
@@ -297,6 +300,61 @@ impl Terms {
             Some(number) => has_number(folded.get_or_insert_with(|| fold(title)), number),
             None => key.contains(&term.key),
         })
+    }
+
+    /// Is the title a good answer: do the words of the query start words of the title, rather than only be somewhere in the middle of one?
+    /// The words of the title are all its words (a short word may be in parentheses: the candidates are the ones that match). A word of the query starts a word of the title (`rashou` starts `Rashoumon`),
+    /// or the words of the query that are next to each other, written together, start one (`rashou mon` is `rashoumon`: a title writes
+    /// `Rashoumon` or `Rashou Mon`). A word of 1 or 2 letters is a word of the title (`o` is not the start of `oneesan`). The words that are
+    /// numbers are left out (they are matched by value). `kimerashoujo ga hoshii mono` has `rashou` and `mon` in it, and is no good answer.
+    pub fn is_good_answer(&self, title: &str) -> bool {
+        let words: Vec<&Term> = self.0.iter().filter(|term| term.number.is_none()).collect();
+
+        if words.is_empty() {
+            return true;
+        }
+
+        let title_words: Vec<String> = title.split(|c: char| !c.is_alphanumeric()).map(title_key).filter(|word| !word.is_empty()).collect();
+        let all: String = title_words.concat();
+        let mut starts = Vec::with_capacity(title_words.len());
+        let mut at = 0;
+
+        for word in &title_words {
+            starts.push(at);
+            at += word.len();
+        }
+
+        // `whole_end`: the text has to end where a word of the title ends (the last word of the query is a short word: `o` is not the start of `oneesan`)
+        let starts_a_word = |text: &str, whole_end: bool| -> bool {
+            if text.chars().count() <= 2 {
+                return title_words.iter().any(|word| word == text);
+            }
+
+            starts.iter().any(|&start| {
+                all[start..].starts_with(text) && (!whole_end || start + text.len() == all.len() || starts.contains(&(start + text.len())))
+            })
+        };
+
+        // the words are cut into runs of words that are next to each other, each run joined and starting a word of the title
+        let mut reached = vec![false; words.len() + 1];
+        reached[0] = true;
+
+        for end in 1..=words.len() {
+            for begin in end.saturating_sub(MOST_JOINED_WORDS)..end {
+                if reached[begin] {
+                    let joined: String = words[begin..end].iter().map(|term| term.key.as_str()).collect();
+
+                    let whole_end = words[end - 1].key.chars().count() <= 2;
+
+                    if starts_a_word(&joined, whole_end) {
+                        reached[end] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        reached[words.len()]
     }
 
     /// Does the title have the query? The words (the name of the magazine) have to be **outside the parentheses** of the
@@ -471,6 +529,24 @@ mod tests {
         assert!(matches("vol.100", "コミックグレープ Vol.100"));
         assert!(matches("100", "コミックグレープ Vol.100"));
         assert!(matches("100", "COMIC ExE 100"));
+    }
+
+    #[test]
+    fn a_good_answer_has_the_words_at_the_start_of_its_words() {
+        let terms = Terms::new("rashou mon");
+
+        assert!(terms.is_good_answer("Rashoumon"), "written together");
+        assert!(terms.is_good_answer("Rashou Mon no Hanashi"), "apart");
+        assert!(terms.is_good_answer("羅生門 rashou mon"));
+        assert!(!terms.is_good_answer("[Saiogauma] Kimera Shoujo ga Hoshii Mono"), "the middle of a word");
+        assert!(!terms.is_good_answer("Gifs Archive uraraka shouko komi"));
+        // a prefix of a word is a start; 1 or 2 letters are a word of the title
+        assert!(Terms::new("kairaku").is_good_answer("COMIC Kairakuten 2026"));
+        assert!(Terms::new("jinsei o dainashi").is_good_answer("Jinsei o Dainashi ni suru"));
+        assert!(!Terms::new("jinsei o dainashi").is_good_answer("Jinsei Oneesan Dainashi"));
+        // the numbers are not looked at
+        assert!(Terms::new("comic 2026").is_good_answer("COMIC Kairakuten 2026"));
+        assert!(Terms::new("2026").is_good_answer("anything"));
     }
 
     #[test]
