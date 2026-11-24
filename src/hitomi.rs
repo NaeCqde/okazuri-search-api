@@ -342,10 +342,62 @@ pub fn squash(text: &str) -> String {
     text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
+/// Whether a title is the whole text (`key` is the text as `squash` writes it): the title itself, or a part of it that is quoted
+/// (`「…」`, `『…』`, `“…”`, `"…"`): `ゼンゼロ逆レ合同「パエトーン強襲戦」` is the work `パエトーン強襲戦`, the name that
+/// the circle gave it, while `Baltimore` is not `ore`.
+pub fn is_whole_title(title: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+
+    if squash(title) == key {
+        return true;
+    }
+
+    let mut quoted = String::new();
+    let mut closing: Option<char> = None;
+
+    for c in title.chars() {
+        match closing {
+            None => {
+                closing = match c {
+                    '「' => Some('」'),
+                    '『' => Some('』'),
+                    '“' => Some('”'),
+                    '"' => Some('"'),
+                    _ => None,
+                };
+                quoted.clear();
+            }
+            Some(end) if c == end => {
+                if squash(&quoted) == key {
+                    return true;
+                }
+
+                closing = None;
+            }
+            Some(_) => quoted.push(c),
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_quoted_part_of_a_title_is_the_whole_text() {
+        assert!(is_whole_title("ゼンゼロ逆レ合同「パエトーン強襲戦」", &squash("パエトーン強襲戦")));
+        assert!(is_whole_title("ZenZero Gyaku Ra Goudou \"Phaethon Assault\"", &squash("Phaethon Assault")));
+        assert!(is_whole_title("Time Lapse", &squash("time lapse")));
+        assert!(!is_whole_title("Baltimore", "ore"));
+        assert!(!is_whole_title("ゼンゼロ逆レ合同「パエトーン強襲戦」", &squash("パエトーン")));
+        assert!(!is_whole_title("A \"b", "b"));
+        assert!(!is_whole_title("x", ""));
+    }
 
     fn node(keys: &[[u8; 4]], datas: &[(u64, i32)], subnodes: &[u64]) -> Vec<u8> {
         let mut bytes = Vec::new();

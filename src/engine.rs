@@ -1435,22 +1435,24 @@ impl Engine {
 
         // the other direction, asked before (a Japanese to English translation answers English to Japanese): `diff` and `off`
         if live != Live::Force {
-            let others = self.store.translations_with("hitomi", from == Lang::English, &key, true, 20).await?;
+            // the title has the text in it (`contains`); it is a translation only when it is the whole text, or a quoted part of it
+            let mut others = self.store.translations_with("hitomi", from == Lang::English, &key, true, 20).await?;
+
+            if others.is_empty() {
+                others = self.store.translations_with("hitomi", from == Lang::English, &key, false, 1000).await?;
+            }
+
             laps.lap("other direction");
 
             if !others.is_empty() {
                 text_log!(info, "timing of the Hitomi.La translation of {text:?}: {laps}"; "timing of a Hitomi.La translation: {laps}");
-                let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english_key.clone() } else { row.japanese_key.clone() };
-                let mut found: Vec<Translation> = others
+                let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english.clone() } else { row.japanese.clone() };
+                let found: Vec<Translation> = others
                     .into_iter()
-                    .map(|row| {
-                        let exact = side(&row) == key;
-
-                        Translation { exact, ..Translation::from(row) }
-                    })
+                    .filter(|row| crate::hitomi::is_whole_title(&side(row), &key))
+                    .map(|row| Translation { exact: true, ..Translation::from(row) })
+                    .take(20)
                     .collect();
-
-                found.sort_by_key(|translation| !translation.exact);
 
                 return Ok((found, true));
             }
@@ -1645,13 +1647,14 @@ impl Engine {
                 }
 
                 let english = english_of(other);
-                let side = squash(if from == Lang::Japanese { &japanese } else { &english });
+                let side_text = if from == Lang::Japanese { &japanese } else { &english };
+                let side = squash(side_text);
 
                 if side.contains(&wanted) {
                     found.push(Translation {
                         id: other.id,
                         url: self.sites[index].address(&other.path()),
-                        exact: side == wanted,
+                        exact: crate::hitomi::is_whole_title(side_text, &wanted),
                         english,
                         japanese: japanese.clone(),
                         source: "hitomi".into(),
@@ -2286,6 +2289,13 @@ pub(crate) mod tests {
         let (found, saved) = engine.translate_hitomi("Nine Lives", Lang::English, Live::Diff).await.unwrap();
         assert!(saved);
         assert_eq!((found[0].japanese.as_str(), found[0].exact), ("九つの命", true));
+
+        // a part of the title in quotes is the work (`パエトーン強襲戦` of `ゼンゼロ逆レ合同「パエトーン強襲戦」`); a part that is not quoted is not
+        store.save_translations("十", "hitomi", "十", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 11, english: "Circle Joint \"Phaethon Assault\"".into(), japanese: "合同「パエトーン強襲戦」".into(), english_key: "circlejointphaethonassault".into(), japanese_key: "合同パエトーン強襲戦".into(), ..row.clone() }]).await.unwrap();
+        let (found, _) = engine.translate_hitomi("パエトーン強襲戦", Lang::Japanese, Live::Diff).await.unwrap();
+        assert_eq!((found.len(), found[0].english.as_str(), found[0].exact), (1, "Circle Joint \"Phaethon Assault\"", true));
+        assert_eq!(engine.translate_hitomi("パエトーン", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 0);
+        assert_eq!(engine.translate_hitomi("Phaethon Assault", Lang::English, Live::Diff).await.unwrap().0.len(), 1);
 
         // a short English text has no translation, even when a title is the whole text; a Japanese one is as short as it likes
         store.save_translations("wat", "hitomi", "wat", "en", unix_now(), &[crate::entity::translation::Model { gallery_id: 5, english: "wat".into(), japanese: "都市伝説".into(), english_key: "wat".into(), japanese_key: "都市伝説".into(), ..row.clone() }]).await.unwrap();
