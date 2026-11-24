@@ -72,7 +72,7 @@ disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 skip_crawled = true
 # Keep the pages of the database file (db_path, not its WAL) in memory: the file is mapped and locked (mlock), so the system never takes its
 # pages out of the page cache and a search never waits for the disk (it is what `vmtouch -l search.db` does). The file is locked again when
-# it grows. It needs the right to lock that much memory: in Docker, `cap_add: [IPC_LOCK]` and `ulimits: memlock: {soft: -1, hard: -1}`;
+# it grows or is replaced by another file (its inode changes). It needs the right to lock that much memory: in Docker, `cap_add: [IPC_LOCK]` and `ulimits: memlock: {soft: -1, hard: -1}`;
 # without it the server only warns and goes on. Unix only.
 pin_db = false
 # Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
