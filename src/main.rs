@@ -1,8 +1,8 @@
-/// A log line that has what a person searched for or what it was translated to: the first form is written by a debug build only, a release
-/// build writes the second one (the same line without the text), so that the timings and the errors are still in the log.
+/// A log line that has what a person searched for or what it was translated to: `[log] queries` says when the first form is written (never,
+/// only a failure, always); otherwise the second one is (the same line without the text), so that the timings and the errors are still in the log.
 macro_rules! text_log {
     ($level:ident, $with:literal $(, $a:expr)* ; $without:literal $(, $b:expr)* $(,)?) => {
-        if cfg!(debug_assertions) {
+        if crate::utils::log_text(stringify!($level)) {
             log::$level!($with $(, $a)*)
         } else {
             log::$level!($without $(, $b)*)

@@ -58,6 +58,7 @@ curl "http://127.0.0.1:8000/romaji?q=%E3%83%81%E3%83%BC%E3%83%88"        # cheat
 | `[translation]` | 翻訳の出どころの設定(Google 翻訳のブリッジ `google_bridge_url`、`google_bridge_token`)。 | |
 | `[magazine]` | Worker の D1 データベースにある雑誌のテーブルの写し。2 つ目の SQLite ファイル(`mirror_path`)に保存します。 | オフ |
 | `[magazine.prefetch]` | 写しにあるすべての号を、あらかじめ検索します。 | オフ |
+| `[log]` | `queries` = `off`・`errors`(既定)・`all`: ログの行に、検索語と翻訳結果を入れるか(`errors` は失敗の行だけ)。 | `errors` |
 | `[cron]` | 決めた時刻にサーバーが送る HTTP リクエスト(`[[cron.jobs]]`)。値の中の `${NAME}` は環境変数です。 | オフ |
 | `[romaji]`、`[romaji.exceptions]` | `/romaji` のクエリの最大長。辞書を引かず、指定した綴りで書く語。変換そのものは切り替えられません。 | **常にオン** |
 
