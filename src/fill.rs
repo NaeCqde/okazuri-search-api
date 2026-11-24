@@ -19,6 +19,11 @@ use crate::utils::Result;
 /// How many titles are read before the ones that are not translated are asked for.
 const PAGE: u64 = 500;
 
+/// The most characters the bridge of Google Translate takes in a text (`MAX_TEXT_CHARS` of `tools/google-translate-bridge/server.mjs`): a longer
+/// title (E-Hentai's have the tags of the work after the title) is answered with a 422. That is not Google failing, so it is not asked at all;
+/// asked, five of them in a row stopped the round, and the newest titles are such ones.
+const MAX_TEXT_CHARS: usize = 300;
+
 /// A round stops when Google does not answer this many times in a row.
 const MAX_FAILURES_IN_A_ROW: usize = 5;
 
@@ -87,7 +92,7 @@ impl TitleTranslator {
             let text = work_title(title, true);
             let key = squash(&text);
 
-            if key.is_empty() || !has_japanese(&text) || failed.contains(&key) || !seen.insert(key.clone()) {
+            if key.is_empty() || !has_japanese(&text) || text.chars().count() > MAX_TEXT_CHARS || failed.contains(&key) || !seen.insert(key.clone()) {
                 continue;
             }
             wanted.push((text, key));
@@ -185,6 +190,7 @@ mod tests {
         let (store, fill) = translator().await;
         store.save_translations(&squash("翻訳済み"), "google", "翻訳済み", "ja", 1, &[google("翻訳済み", "Translated")]).await.unwrap();
 
+        let long = format!("長い題名 {}", "x".repeat(MAX_TEXT_CHARS));
         let titles: Vec<String> = [
             "翻訳済み",                          // translated already
             "未翻訳 (Series) [English]",         // the title alone is asked for
@@ -192,6 +198,7 @@ mod tests {
             "Latin only",                        // nothing to translate
             "Both | りょうほう",                 // the work has its English title
             "失敗",                              // Google had no answer for it
+            &long,                               // more than the bridge takes: not asked
         ]
         .map(String::from)
         .to_vec();
