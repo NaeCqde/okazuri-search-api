@@ -1409,7 +1409,20 @@ impl Engine {
     /// saved for the other direction answers too. A text that Hitomi.La has nothing for is asked again every time (`diff`):
     /// the site may have the work now. `off` never asks the site. Returns the translations (the ones that are the whole
     /// title first) and whether they are the saved ones.
+    ///
+    /// An English title of one word is not a translation of a Japanese text: Hitomi.La names its tags that way (`男の娘` is `Femboys`, a
+    /// plural that a title of `femboy` does not have), and one word finds works that have nothing to do with the text.
     pub async fn translate_hitomi(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
+        let (mut found, saved) = self.hitomi_titles(text, from, live).await?;
+
+        if from == Lang::Japanese {
+            found.retain(|translation| translation.english.split_whitespace().count() > 1);
+        }
+
+        Ok((found, saved))
+    }
+
+    async fn hitomi_titles(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
         // only the title of the work: the circle, the artist, the event, the series and the tags around it are left out
         let title = crate::query::work_title(text, from == Lang::Japanese);
         let text = title.as_str();
@@ -2279,9 +2292,9 @@ pub(crate) mod tests {
             gallery_id: 7,
             position: 0,
             url: "https://hitomi.la/galleries/7.html".into(),
-            english: "Seven".into(),
+            english: "Seven Days".into(),
             japanese: "七".into(),
-            english_key: "seven".into(),
+            english_key: "sevendays".into(),
             japanese_key: "七".into(),
             exact: true,
             source: "hitomi".into(),
@@ -2296,7 +2309,7 @@ pub(crate) mod tests {
         store.save_translations("七", "hitomi", "七", "ja", unix_now(), &[row.clone()]).await.unwrap();
         let (found, saved) = engine.translate_hitomi("七", Lang::Japanese, Live::Diff).await.unwrap();
         assert!(saved);
-        assert_eq!((found[0].id, found[0].text(Lang::English), found[0].text(Lang::Japanese), found[0].exact), (7, "Seven", "七", true));
+        assert_eq!((found[0].id, found[0].text(Lang::English), found[0].text(Lang::Japanese), found[0].exact), (7, "Seven Days", "七", true));
         assert_eq!(engine.translate_hitomi("七", Lang::Japanese, Live::Off).await.unwrap().0.len(), 1);
 
         // a saved answer never gets old: only `on` asks the site again (the engine of the tests has no Hitomi.La: that is an error)
@@ -2319,6 +2332,10 @@ pub(crate) mod tests {
         assert_eq!((found.len(), found[0].english.as_str(), found[0].exact), (1, "Circle Joint \"Phaethon Assault\"", true));
         assert_eq!(engine.translate_hitomi("パエトーン", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 0);
         assert_eq!(engine.translate_hitomi("Phaethon Assault", Lang::English, Live::Diff).await.unwrap().0.len(), 1);
+
+        // an English title of one word (a tag of Hitomi.La: `Femboys`) is no translation of a Japanese text
+        store.save_translations("男の娘", "hitomi", "男の娘", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 12, english: "Femboys".into(), japanese: "男の娘".into(), english_key: "femboys".into(), japanese_key: "男の娘".into(), ..row.clone() }]).await.unwrap();
+        assert_eq!(engine.translate_hitomi("男の娘", Lang::Japanese, Live::Diff).await.unwrap(), (vec![], true));
 
         // a short English text has no translation, even when a title is the whole text; a Japanese one is as short as it likes
         store.save_translations("wat", "hitomi", "wat", "en", unix_now(), &[crate::entity::translation::Model { gallery_id: 5, english: "wat".into(), japanese: "都市伝説".into(), english_key: "wat".into(), japanese_key: "都市伝説".into(), ..row.clone() }]).await.unwrap();
