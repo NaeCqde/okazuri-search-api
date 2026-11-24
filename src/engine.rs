@@ -29,6 +29,8 @@ use tokio::sync::{Mutex, Semaphore};
 /// never after more than the longest wait.
 /// An English text with fewer letters (squashed: no spaces or symbols) is not translated with the titles of Hitomi.La.
 const MIN_ENGLISH_KEY_CHARS: usize = 4;
+/// A Japanese text of no space and this many letters or less is one word (`is_one_word`).
+const ONE_WORD_JAPANESE_CHARS: usize = 5;
 const DEFAULT_RETRY_WAIT_SECS: u64 = 5;
 const MAX_RETRY_WAIT_SECS: u64 = 30;
 
@@ -1413,6 +1415,17 @@ impl Engine {
         crate::titles::title_of_page(name, &page).map(|title| (name, title, "page")).ok_or_else(|| Some("the page has no title".to_string()))
     }
 
+    /// Whether a text is asked of Hitomi.La at all: a query of one word is not. Its titles are made of several words, and a single word
+    /// (`男の娘`) is what the site names its tags by (`Femboys`, `Otokonoko (decensored)`), which finds works that have nothing to do with it.
+    /// A Japanese text is one word when it has no space and is at most `ONE_WORD_JAPANESE_CHARS` letters long (the name of a work in
+    /// Japanese has none: `パエトーン強襲戦` is a title); an English one when it has no space.
+    pub(crate) fn is_one_word(text: &str, from: Lang) -> bool {
+        let title = crate::query::work_title(text, from == Lang::Japanese);
+        let title = title.trim();
+
+        !title.chars().any(char::is_whitespace) && (from == Lang::English || title.chars().count() <= ONE_WORD_JAPANESE_CHARS)
+    }
+
     /// Whether the translation can be asked: Hitomi.La is one of the sites.
     pub fn can_translate(&self) -> bool {
         self.sites.iter().any(|site| site.def.format == Format::Hitomi)
@@ -1426,20 +1439,7 @@ impl Engine {
     /// saved for the other direction answers too. A text that Hitomi.La has nothing for is asked again every time (`diff`):
     /// the site may have the work now. `off` never asks the site. Returns the translations (the ones that are the whole
     /// title first) and whether they are the saved ones.
-    ///
-    /// An English title of one word is not a translation of a Japanese text: Hitomi.La names its tags that way (`男の娘` is `Femboys`, a
-    /// plural that a title of `femboy` does not have), and one word finds works that have nothing to do with the text.
     pub async fn translate_hitomi(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
-        let (mut found, saved) = self.hitomi_titles(text, from, live).await?;
-
-        if from == Lang::Japanese {
-            found.retain(|translation| translation.english.split_whitespace().count() > 1);
-        }
-
-        Ok((found, saved))
-    }
-
-    async fn hitomi_titles(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Vec<Translation>, bool)> {
         // only the title of the work: the circle, the artist, the event, the series and the tags around it are left out
         let title = crate::query::work_title(text, from == Lang::Japanese);
         let text = title.as_str();
@@ -1559,7 +1559,7 @@ impl Engine {
     /// The translation from Hitomi.La, and from Google Translate when Hitomi.La fails or has nothing (`translator=auto`).
     /// The first translation and whether it is the saved one; an error when neither has one.
     pub async fn translate_auto(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
-        match self.translate_hitomi(text, from, live).await {
+        match if Self::is_one_word(text, from) { Ok((Vec::new(), true)) } else { self.translate_hitomi(text, from, live).await } {
             Ok((found, saved)) => {
                 if let Some(first) = found.into_iter().next() {
                     return Ok((first, saved));
@@ -1574,7 +1574,7 @@ impl Engine {
     /// The English title of a Japanese text by the translator of a search (`Translator`): None when the translator has none.
     /// `auto` asks Hitomi.La, and Google Translate when Hitomi.La fails or has nothing; `hitomi` and `google` only that one.
     async fn english_of(self: &Arc<Self>, text: &str, translator: Translator, live: Live) -> Option<Translation> {
-        if translator != Translator::Google {
+        if translator != Translator::Google && !Self::is_one_word(text, Lang::Japanese) {
             match self.translate_hitomi(text, Lang::Japanese, live).await {
                 Ok((found, _)) => {
                     if let Some(first) = found.into_iter().next() {
@@ -1597,7 +1597,7 @@ impl Engine {
 
     /// The Japanese title of an English (or romaji) text by the translator of a search: `english_of` the other way.
     async fn japanese_of(self: &Arc<Self>, text: &str, translator: Translator, live: Live) -> Option<Translation> {
-        if translator != Translator::Google {
+        if translator != Translator::Google && !Self::is_one_word(text, Lang::English) {
             match self.translate_hitomi(text, Lang::English, live).await {
                 Ok((found, _)) => {
                     if let Some(first) = found.into_iter().next() {
@@ -2350,9 +2350,9 @@ pub(crate) mod tests {
         assert_eq!(engine.translate_hitomi("パエトーン", Lang::Japanese, Live::Diff).await.unwrap().0.len(), 0);
         assert_eq!(engine.translate_hitomi("Phaethon Assault", Lang::English, Live::Diff).await.unwrap().0.len(), 1);
 
-        // an English title of one word (a tag of Hitomi.La: `Femboys`) is no translation of a Japanese text
-        store.save_translations("男の娘", "hitomi", "男の娘", "ja", unix_now(), &[crate::entity::translation::Model { gallery_id: 12, english: "Femboys".into(), japanese: "男の娘".into(), english_key: "femboys".into(), japanese_key: "男の娘".into(), ..row.clone() }]).await.unwrap();
-        assert_eq!(engine.translate_hitomi("男の娘", Lang::Japanese, Live::Diff).await.unwrap(), (vec![], true));
+        // a query of one word is not asked of Hitomi.La; a long name of no space is a title
+        assert!(Engine::is_one_word("男の娘", Lang::Japanese) && Engine::is_one_word("femboy", Lang::English));
+        assert!(!Engine::is_one_word("パエトーン強襲戦", Lang::Japanese) && !Engine::is_one_word("Nine Lives", Lang::English));
 
         // a short English text has no translation, even when a title is the whole text; a Japanese one is as short as it likes
         store.save_translations("wat", "hitomi", "wat", "en", unix_now(), &[crate::entity::translation::Model { gallery_id: 5, english: "wat".into(), japanese: "都市伝説".into(), english_key: "wat".into(), japanese_key: "都市伝説".into(), ..row.clone() }]).await.unwrap();
