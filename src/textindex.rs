@@ -231,7 +231,7 @@ impl TextIndex {
 
     /// The query of a `Matcher`: every piece of its key (the trigrams) and every short word, and, to put the best answers first, the pieces that
     /// start a word of the title and the author that has all the pieces.
-    fn query(&self, matcher: &Matcher) -> Result<Box<dyn Query>> {
+    fn query_of(&self, matcher: &Matcher) -> Result<Box<dyn Query>> {
         let alts = |piece: &String| matcher.alts.get(piece).cloned().unwrap_or_default();
         let mut must: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut boost: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -276,11 +276,23 @@ impl TextIndex {
         Ok(Box::new(BooleanQuery::new(must)))
     }
 
+    /// The query of several matchers (a query and its translation): a work that one of them finds, and the more of them, the higher the score. Each
+    /// has its weight (the query itself 1, its translation less).
+    fn query(&self, matchers: &[(&Matcher, f32)]) -> Result<Box<dyn Query>> {
+        let mut any: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        for &(matcher, weight) in matchers {
+            any.push((Occur::Should, Box::new(BoostQuery::new(self.query_of(matcher)?, weight))));
+        }
+
+        Ok(Box::new(BooleanQuery::new(any)))
+    }
+
     /// The row numbers of the works that the pieces find, the best first, `limit` of them after the first `offset`. The pieces of the key are
     /// found as trigrams: a work may have them apart (`Matcher::accepts` tells).
-    pub fn best(&self, matcher: &Matcher, offset: usize, limit: usize) -> Result<Vec<i64>> {
+    pub fn best(&self, matchers: &[(&Matcher, f32)], offset: usize, limit: usize) -> Result<Vec<i64>> {
         let searcher = self.reader.searcher();
-        let query = self.query(matcher)?;
+        let query = self.query(matchers)?;
         // the same score: the smaller row number (the work that was added first) first
         let collector = TopDocs::with_limit(limit.max(1)).and_offset(offset).tweak_score(move |reader: &SegmentReader| {
             let column = reader.fast_fields().u64("rowid").ok();
@@ -295,7 +307,7 @@ impl TextIndex {
     /// The row numbers of every work that the pieces find, the smallest first.
     pub fn all(&self, matcher: &Matcher) -> Result<Vec<i64>> {
         let searcher = self.reader.searcher();
-        let query = self.query(matcher)?;
+        let query = self.query(&[(matcher, 1.0)])?;
         let mut rows = Vec::new();
 
         let count = searcher.search(&*query, &tantivy::collector::Count)?;
@@ -330,7 +342,7 @@ mod tests {
     fn the_same_score_is_ordered_by_the_row_number() {
         let index = index(&[(5, "COMIC ExE one", "comicexeone"), (3, "COMIC ExE two", "comicexetwo"), (9, "COMIC ExE three", "comicexethree")]);
 
-        assert_eq!(index.best(&matcher(&["comic", "exe"], &[]), 0, 10).unwrap(), [3, 5, 9]);
+        assert_eq!(index.best(&[(&matcher(&["comic", "exe"], &[]), 1.0)], 0, 10).unwrap(), [3, 5, 9]);
     }
 
     #[test]
@@ -359,10 +371,19 @@ mod tests {
         ]);
 
         // the work 2 starts a word with the piece and is short
-        assert_eq!(index.best(&matcher(&["rashou"], &[]), 0, 10).unwrap(), [2, 1]);
+        assert_eq!(index.best(&[(&matcher(&["rashou"], &[]), 1.0)], 0, 10).unwrap(), [2, 1]);
         // the author is the query: it is first, though its title has nothing
-        let by_author = index.best(&matcher(&["rashou"], &[]), 0, 10);
+        let by_author = index.best(&[(&matcher(&["rashou"], &[]), 1.0)], 0, 10);
         assert!(by_author.is_ok());
+    }
+
+    #[test]
+    fn a_work_that_has_both_the_query_and_its_translation_comes_before_the_one_that_has_one() {
+        let index = index(&[(1, "a", "nine lives"), (2, "b", "kyuu no inochi"), (3, "c", "kyuu no inochi nine lives")]);
+        let (query, translation) = (matcher(&["kyuu", "inochi"], &[]), matcher(&["nine", "lives"], &[]));
+
+        // the query alone: 2 and 3; with its translation: 3 has both, then the query's, then the translation's
+        assert_eq!(index.best(&[(&query, 1.0), (&translation, 0.5)], 0, 10).unwrap(), [3, 2, 1]);
     }
 
     #[test]
