@@ -118,7 +118,20 @@ impl TextIndex {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let (schema, fields) = schema();
-        let index = Index::open_or_create(MmapDirectory::open(dir)?, schema)?;
+        let index = match Index::open_or_create(MmapDirectory::open(dir)?, schema.clone()) {
+            Ok(index) => index,
+            // an index of an older version of the program has other fields: it is put aside (`<dir>.old`, deleted when the next one is put aside), and the
+            // store fills a new one from the table
+            Err(tantivy::TantivyError::SchemaError(why)) => {
+                let aside = dir.with_extension("old");
+                log::warn!("the text index in {} has another schema ({why}): it is moved to {} and made again", dir.display(), aside.display());
+                let _ = std::fs::remove_dir_all(&aside);
+                std::fs::rename(dir, &aside).map_err(|e| format!("cannot move {} to {}: {e}", dir.display(), aside.display()))?;
+                std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                Index::open_or_create(MmapDirectory::open(dir)?, schema)?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         Self::with(index, fields)
     }
@@ -411,5 +424,31 @@ mod tests {
 
         index.replace(&[], &[1]).unwrap();
         assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn an_index_with_another_schema_is_put_aside_and_made_again() {
+        let dir = std::env::temp_dir().join(format!("okazuri-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.with_extension("old"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // an index of an older version: other fields
+        let mut builder = Schema::builder();
+        builder.add_text_field("key", text("ng3"));
+        builder.add_u64_field("rowid", INDEXED | FAST);
+        Index::create_in_dir(&dir, builder.build()).unwrap();
+
+        let index = TextIndex::open(&dir).unwrap();
+        assert_eq!(index.len(), 0);
+        assert!(dir.with_extension("old").join("meta.json").exists(), "the old index is kept beside");
+
+        index.fill(&[Doc { rowid: 1, key: "abc", romaji: "abc", title: "a", uploader: "", tags: &[7] }]).unwrap();
+        assert_eq!(index.len(), 1);
+        drop(index);
+        assert_eq!(TextIndex::open(&dir).unwrap().len(), 1, "the new one opens as it is");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.with_extension("old"));
     }
 }
