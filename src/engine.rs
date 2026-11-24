@@ -124,6 +124,9 @@ struct Plan {
     input: String,
     /// Its romaji.
     query: String,
+    /// What is matched: the romaji of each word the user typed (split by spaces) with no space inside it, as the keys of the titles
+    /// have none (`ふぃに` is `fi ni` as a query and `fini` here, not the two words `fi` and `ni` that almost any title has).
+    words: String,
     /// The text and its romaji with the `×` in them; only for a text that has one to put.
     times: Option<(String, String)>,
 }
@@ -470,6 +473,18 @@ impl Engine {
         Ok(normalize(&romaji(&normalize(text), &self.romanizer)?))
     }
 
+    /// The romaji of each word of the text with the spaces inside the word taken out.
+    fn joined_words(&self, text: &str) -> Result<String> {
+        let mut words = Vec::new();
+
+        for word in text.split_whitespace() {
+            let romaji = romaji(word, &self.romanizer)?;
+            words.push(normalize(&romaji.split_whitespace().collect::<String>()));
+        }
+
+        Ok(words.join(" "))
+    }
+
     /// The index of a site by its name, searched or not (the crawl reads sites that have no search too).
     pub(crate) fn site_named(&self, name: &str) -> Option<usize> {
         self.sites.iter().position(|site| site.def.name == name)
@@ -620,7 +635,9 @@ impl Engine {
         let kept = restore_times(&tidy(&romaji(&tidied, &self.romanizer)?));
         let times = (tidied != input || kept != query).then_some((tidied, kept));
 
-        Ok(Plan { input, query, times })
+        let words = self.joined_words(&input)?;
+
+        Ok(Plan { input, query, words, times })
     }
 
     /// The sites to ask, each with the queries that are missing or old (all of them with `refresh`).
@@ -864,7 +881,7 @@ impl Engine {
     async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched>) -> Result<Lite> {
         let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
-        let terms = Terms::new(&plan.query);
+        let terms = Terms::new(&plan.words);
         laps.lap("plan");
 
         if terms.is_empty() {
@@ -991,7 +1008,7 @@ impl Engine {
     /// count (it only tells whether there is a next page): this is the `count` command. Returns (all, sites in the order of the answer).
     pub async fn count(&self, query: &str) -> Result<(usize, Vec<(&'static str, bool, usize)>)> {
         let plan = self.plan(query)?;
-        let terms = Terms::new(&plan.query);
+        let terms = Terms::new(&plan.words);
         let matcher = terms.matcher().ok_or("the indexes cannot count this query (no word of 3 letters or more)")?;
         let total = self.store.count_found(&matcher).await?;
         let found = self.store.count_found_by_site(&matcher).await?;
@@ -2521,6 +2538,18 @@ pub(crate) mod tests {
             let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
             assert_eq!((titles(&page), page.has_more), (expected.into_iter().map(String::from).collect::<Vec<_>>(), true), "limit {limit}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_words_of_a_query_are_the_ones_typed_not_the_ones_of_the_dictionary() {
+        let (engine, _, _) = setup(&config()).await;
+
+        // the dictionary cuts `ふぃに` in two words; it is one word of the user, matched as the text `fini`
+        let plan = engine.plan("ふぃに").unwrap();
+        assert_eq!(Terms::new(&plan.words).keys(), ["fini"], "query {:?}", plan.query);
+        // a space the user typed is kept; text in the Latin alphabet is not touched
+        let plan = engine.plan("ふぃに COMIC").unwrap();
+        assert_eq!(Terms::new(&plan.words).keys(), ["fini", "comic"]);
     }
 
     #[tokio::test]
