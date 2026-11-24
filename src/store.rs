@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work};
+use crate::entity::{crawl_state, listing, search, tag, translation, translation_lookup, uploader, work};
 use crate::language;
 use crate::query::{outside_key, title_key};
 use crate::sites::toggle_slash;
@@ -71,6 +71,19 @@ const INDEX_FILL_CHUNK: i64 = 50_000;
 /// The candidates of the words asked lately (`SearchStore::candidates`), the oldest first.
 /// A work the index found, with its row number.
 #[derive(Debug, sea_orm::FromQueryResult)]
+struct RawRow {
+    r: i64,
+    website: String,
+    path: String,
+    title: String,
+    title_romaji: String,
+    language: Option<String>,
+    tags: Option<String>,
+    uploader_romaji: Option<String>,
+}
+
+/// A work the index found, with the romaji of its tags and uploader.
+#[derive(Debug)]
 struct IndexedRow {
     r: i64,
     website: String,
@@ -78,32 +91,33 @@ struct IndexedRow {
     title: String,
     title_romaji: String,
     language: Option<String>,
-    extra_romaji: Option<String>,
+    /// The romaji of its tags and of its uploader, with a space between.
+    extra: String,
 }
 
 impl IndexedRow {
     /// What the search matches (`index_key`).
     fn key(&self) -> String {
-        index_key(&self.title_romaji, self.extra_romaji.as_deref())
+        index_key(&self.title_romaji, &self.extra)
     }
 }
 
 /// What a work is found by: the key of what is outside the parentheses of its romaji (`query::outside_key`), and, after a `|`, the key of its
-/// uploader and tags (a query piece may be in any of them).
-fn index_key(romaji: &str, extra_romaji: Option<&str>) -> String {
+/// tags and uploader (a query piece may be in any of them).
+fn index_key(romaji: &str, extra: &str) -> String {
     let mut key = outside_key(romaji);
 
-    if let Some(extra) = extra_romaji.filter(|extra| !extra.is_empty()) {
+    if !extra.trim().is_empty() {
         key.push('|');
-        key.push_str(&title_key(&extra.replace('\n', " ")));
+        key.push_str(&title_key(extra));
     }
 
     key
 }
 
-/// The uploader in the romaji of the extra text (its first line, lower case; empty when there is none).
-fn uploader_line(extra_romaji: Option<&str>) -> String {
-    extra_romaji.and_then(|text| text.lines().next()).unwrap_or_default().to_lowercase()
+/// The ids in the `tags` of a work (` 12 45 `).
+fn tag_ids_of(tags: &str) -> impl Iterator<Item = i64> + '_ {
+    tags.split_whitespace().filter_map(|id| id.parse().ok())
 }
 
 /// A work a search reads, as it is kept: the site is a number (a search of 700,000 works does not hash 700,000 names), and the one thing that
@@ -146,6 +160,8 @@ pub struct SearchStore {
     text: TextIndex,
     /// One task at a time brings the index up to date.
     sync: tokio::sync::Mutex<()>,
+    /// The romaji of the tags (`tags.romaji`) by id, kept in memory: the tags are some tens of thousands, and every search reads them.
+    tag_romaji: std::sync::Mutex<HashMap<i64, String>>,
 }
 
 impl SearchStore {
@@ -194,7 +210,7 @@ impl SearchStore {
             None => db.clone(),
         };
 
-        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()) };
+        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default() };
         store.fill_text_index(dir.as_deref()).await?;
 
         Ok(store)
@@ -209,7 +225,11 @@ impl SearchStore {
         let mut listings = schema.create_table_from_entity(listing::Entity);
         let mut translation_lookups = schema.create_table_from_entity(translation_lookup::Entity);
         let mut translations = schema.create_table_from_entity(translation::Entity);
+        let mut tags = schema.create_table_from_entity(tag::Entity);
+        let mut uploaders = schema.create_table_from_entity(uploader::Entity);
         db.execute(backend.build(works.if_not_exists())).await?;
+        db.execute(backend.build(tags.if_not_exists())).await?;
+        db.execute(backend.build(uploaders.if_not_exists())).await?;
         let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
         db.execute(backend.build(searches.if_not_exists())).await?;
         db.execute(backend.build(crawls.if_not_exists())).await?;
@@ -278,7 +298,7 @@ impl SearchStore {
         }
 
         // the columns of what a list page shows besides the title (tags, uploader, posted date) are added to a database that has not got them
-        for (column, kind) in [("tags", "TEXT"), ("uploader", "TEXT"), ("posted_at", "INTEGER"), ("extra_romaji", "TEXT")] {
+        for (column, kind) in [("tags", "TEXT"), ("uploader", "TEXT"), ("posted_at", "INTEGER")] {
             let has = db
                 .query_one(Statement::from_sql_and_values(db.get_database_backend(), "SELECT 1 AS x FROM pragma_table_info('works') WHERE name = ?", [column.into()]))
                 .await?
@@ -302,7 +322,7 @@ impl SearchStore {
             "CREATE TABLE IF NOT EXISTS index_queue (seq INTEGER PRIMARY KEY AUTOINCREMENT, row INTEGER NOT NULL)",
             "CREATE TRIGGER IF NOT EXISTS works_queue_insert AFTER INSERT ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
             "CREATE TRIGGER IF NOT EXISTS works_queue_delete AFTER DELETE ON works BEGIN INSERT INTO index_queue(row) VALUES (old.rowid); END",
-            "CREATE TRIGGER IF NOT EXISTS works_queue_update AFTER UPDATE OF title, title_romaji, extra_romaji ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
+            "CREATE TRIGGER IF NOT EXISTS works_queue_update AFTER UPDATE OF title, title_romaji, tags, uploader ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
         ] {
             db.execute_unprepared(sql).await?;
         }
@@ -350,19 +370,19 @@ impl SearchStore {
                 .db
                 .query_all(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
-                    "SELECT rowid AS r, title, title_romaji, extra_romaji FROM works WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    "SELECT w.rowid AS r, w.title, w.title_romaji, w.tags, u.romaji AS uploader_romaji FROM works w LEFT JOIN uploaders u ON u.website = w.website AND u.id = w.uploader WHERE w.rowid > ? ORDER BY w.rowid LIMIT ?",
                     [after.into(), INDEX_FILL_CHUNK.into()],
                 ))
                 .await?;
             let Some(end) = rows.last() else { break };
             after = end.try_get("", "r")?;
 
-            let rows: Vec<(i64, String, String, Option<String>)> = rows
+            let rows: Vec<(i64, String, String, Option<String>, Option<String>)> = rows
                 .iter()
-                .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "extra_romaji")?)))
+                .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "tags")?, row.try_get("", "uploader_romaji")?)))
                 .collect::<Result<_>>()?;
-            let keys: Vec<(String, String)> = rows.iter().map(|(_, _, romaji, extra)| (index_key(romaji, extra.as_deref()), uploader_line(extra.as_deref()))).collect();
-            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
+            let keys = self.keys_of(&rows).await?;
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
             self.text.fill(&docs)?;
             filled += docs.len() as u64;
         }
@@ -376,6 +396,64 @@ impl SearchStore {
         log::info!("the text index is filled: {filled} works in {} s", started.elapsed().as_secs());
 
         Ok(())
+    }
+
+    /// The romaji of the tags with these ids, in the order of the ids: from memory, and the ones that are not there are read from the table.
+    async fn tag_romaji_of(&self, wanted: &[i64]) -> Result<Vec<String>> {
+        let missing: Vec<i64> = {
+            let known = self.tag_romaji.lock().map_err(|_| "the tags are poisoned")?;
+            let mut missing: Vec<i64> = wanted.iter().copied().filter(|id| !known.contains_key(id)).collect();
+            missing.sort_unstable();
+            missing.dedup();
+            missing
+        };
+
+        for chunk in missing.chunks(20_000) {
+            let rows = self
+                .reader
+                .query_all(Statement::from_sql_and_values(
+                    self.reader.get_database_backend(),
+                    "SELECT t.id AS id, t.romaji AS romaji FROM json_each(?) j JOIN tags t ON t.id = j.value",
+                    [serde_json::to_string(chunk)?.into()],
+                ))
+                .await?;
+            let mut known = self.tag_romaji.lock().map_err(|_| "the tags are poisoned")?;
+
+            for row in rows {
+                known.insert(row.try_get("", "id")?, row.try_get("", "romaji")?);
+            }
+            // an id that has no row (a tag that was removed) is a tag with no name
+            for id in chunk {
+                known.entry(*id).or_default();
+            }
+        }
+
+        let known = self.tag_romaji.lock().map_err(|_| "the tags are poisoned")?;
+
+        Ok(wanted.iter().map(|id| known.get(id).cloned().unwrap_or_default()).collect())
+    }
+
+    /// The text that the tags (by id) and the uploader add to a work: their romaji with a space between.
+    async fn extras_of(&self, rows: &[(Option<&str>, Option<&str>)]) -> Result<Vec<String>> {
+        let ids: Vec<i64> = rows.iter().flat_map(|(tags, _)| tags.into_iter().flat_map(|tags| tag_ids_of(tags))).collect();
+        let _ = self.tag_romaji_of(&ids).await?;
+        let known = self.tag_romaji.lock().map_err(|_| "the tags are poisoned")?;
+
+        Ok(rows
+            .iter()
+            .map(|(tags, uploader)| {
+                let mut text: Vec<&str> = tags.into_iter().flat_map(|tags| tag_ids_of(tags)).filter_map(|id| known.get(&id).map(String::as_str)).collect();
+                text.extend(uploader);
+                text.join(" ")
+            })
+            .collect())
+    }
+
+    /// What the index has of the works: their keys, and their uploaders (lower case) for the field of the authors.
+    async fn keys_of(&self, rows: &[(i64, String, String, Option<String>, Option<String>)]) -> Result<Vec<(String, String)>> {
+        let extras = self.extras_of(&rows.iter().map(|(_, _, _, tags, uploader)| (tags.as_deref(), uploader.as_deref())).collect::<Vec<_>>()).await?;
+
+        Ok(rows.iter().zip(extras).map(|((_, _, romaji, _, uploader), extra)| (index_key(romaji, &extra), uploader.clone().unwrap_or_default().to_lowercase())).collect())
     }
 
     pub async fn count_works(&self) -> Result<u64> {
@@ -416,18 +494,18 @@ impl SearchStore {
                 .db
                 .query_all(Statement::from_sql_and_values(
                     backend,
-                    "SELECT w.rowid AS r, w.title, w.title_romaji, w.extra_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value",
+                    "SELECT w.rowid AS r, w.title, w.title_romaji, w.tags, u.romaji AS uploader_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value LEFT JOIN uploaders u ON u.website = w.website AND u.id = w.uploader",
                     [serde_json::to_string(&rowids)?.into()],
                 ))
                 .await?;
-            let rows: Vec<(i64, String, String, Option<String>)> = rows
+            let rows: Vec<(i64, String, String, Option<String>, Option<String>)> = rows
                 .iter()
-                .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "extra_romaji")?)))
+                .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "tags")?, row.try_get("", "uploader_romaji")?)))
                 .collect::<Result<_>>()?;
             let found: HashSet<i64> = rows.iter().map(|row| row.0).collect();
             let gone: Vec<i64> = rowids.iter().copied().filter(|rowid| !found.contains(rowid)).collect();
-            let keys: Vec<(String, String)> = rows.iter().map(|(_, _, romaji, extra)| (index_key(romaji, extra.as_deref()), uploader_line(extra.as_deref()))).collect();
-            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
+            let keys = self.keys_of(&rows).await?;
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
             self.text.replace(&docs, &gone)?;
         }
 
@@ -641,6 +719,64 @@ impl SearchStore {
         Ok(kept)
     }
 
+    /// Saves the tags and the accounts that the list shows (a tag that is new gets its own id; an account is by the site and its id on the site),
+    /// and returns, by the path of a work, the ids of its tags as they are written in `work.tags` (` 12 45 `).
+    async fn save_extras(db: &impl ConnectionTrait, website: &str, listed: &[NewWork]) -> Result<HashMap<String, String>> {
+        let backend = db.get_database_backend();
+        let mut tags: Vec<(&str, &str)> = Vec::new();
+        let mut accounts: Vec<(&str, &str, &str)> = Vec::new();
+
+        for item in listed.iter().filter(|item| !item.extra.is_empty()) {
+            for (place, name) in item.extra.tags.iter().enumerate() {
+                tags.push((name.as_str(), item.extra.romaji.get(place).map_or(name.as_str(), String::as_str)));
+            }
+            if let Some(account) = &item.extra.uploader {
+                accounts.push((account.id.as_str(), account.name.as_str(), item.extra.romaji.get(item.extra.tags.len()).map_or(account.name.as_str(), String::as_str)));
+            }
+        }
+        if tags.is_empty() && accounts.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        tags.sort_unstable();
+        tags.dedup_by_key(|(name, _)| *name);
+        for chunk in tags.chunks(300) {
+            let sql = format!("INSERT OR IGNORE INTO tags (name, romaji, weight) VALUES {}", vec!["(?, ?, 1.0)"; chunk.len()].join(", "));
+            let values: Vec<sea_orm::Value> = chunk.iter().flat_map(|(name, romaji)| [(*name).into(), (*romaji).into()]).collect();
+            db.execute(Statement::from_sql_and_values(backend, sql, values)).await?;
+        }
+        accounts.sort_unstable();
+        accounts.dedup_by_key(|(id, _, _)| *id);
+        for chunk in accounts.chunks(200) {
+            let sql = format!(
+                "INSERT INTO uploaders (website, id, name, romaji) VALUES {} ON CONFLICT(website, id) DO UPDATE SET name = excluded.name, romaji = excluded.romaji",
+                vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
+            );
+            let values: Vec<sea_orm::Value> = chunk.iter().flat_map(|(id, name, romaji)| [website.into(), (*id).into(), (*name).into(), (*romaji).into()]).collect();
+            db.execute(Statement::from_sql_and_values(backend, sql, values)).await?;
+        }
+
+        let names: Vec<&str> = tags.iter().map(|(name, _)| *name).collect();
+        let mut ids: HashMap<String, i64> = HashMap::new();
+        for chunk in names.chunks(5_000) {
+            let rows = db
+                .query_all(Statement::from_sql_and_values(backend, "SELECT t.id AS id, t.name AS name FROM json_each(?) j JOIN tags t ON t.name = j.value", [serde_json::to_string(chunk)?.into()]))
+                .await?;
+            for row in rows {
+                ids.insert(row.try_get("", "name")?, row.try_get("", "id")?);
+            }
+        }
+
+        Ok(listed
+            .iter()
+            .filter(|item| !item.extra.tags.is_empty())
+            .map(|item| {
+                let list: Vec<String> = item.extra.tags.iter().filter_map(|name| ids.get(name)).map(i64::to_string).collect();
+                (item.path.clone(), format!(" {} ", list.join(" ")))
+            })
+            .collect())
+    }
+
     /// Adds the works that are not saved, updates the ones whose title changed. Returns the paths of the new ones.
     async fn save_works(db: &impl ConnectionTrait, website: &str, now: i64, listed: &[NewWork]) -> Result<Vec<String>> {
         let paths: Vec<&str> = listed.iter().map(|w| w.path.as_str()).collect();
@@ -653,6 +789,7 @@ impl SearchStore {
             .map(|row| (row.path.clone(), row))
             .collect();
 
+        let extras = Self::save_extras(db, website, listed).await?;
         let mut added = Vec::new();
 
         for item in listed {
@@ -667,20 +804,18 @@ impl SearchStore {
                     language: Set(item.language.clone()),
                     deleted: Set(false),
                     checked_at: Set(None),
-                    tags: Set(item.extra.tags_text()),
-                    uploader: Set(item.extra.uploader.clone()),
+                    tags: Set(extras.get(&item.path).cloned()),
+                    uploader: Set(item.extra.uploader.as_ref().map(|account| account.id.clone())),
                     posted_at: Set(item.extra.posted_at),
-                    extra_romaji: Set(item.extra.romaji_text()),
                 }),
                 // a work whose page is gone is not saved again
                 Some(known) if known.deleted => {}
-                Some(known) if known.title != item.title || known.title_romaji != item.romaji || (!item.extra.is_empty() && known.extra_romaji != item.extra.romaji_text()) => {
+                Some(known) if known.title != item.title || known.title_romaji != item.romaji || (!item.extra.is_empty() && (known.tags != extras.get(&item.path).cloned() || known.uploader.as_deref() != item.extra.uploader.as_ref().map(|account| account.id.as_str()) || known.posted_at != item.extra.posted_at)) => {
                     let mut changed = known.clone().into_active_model();
                     if !item.extra.is_empty() {
-                        changed.tags = Set(item.extra.tags_text());
-                        changed.uploader = Set(item.extra.uploader.clone());
+                        changed.tags = Set(extras.get(&item.path).cloned());
+                        changed.uploader = Set(item.extra.uploader.as_ref().map(|account| account.id.clone()));
                         changed.posted_at = Set(item.extra.posted_at);
-                        changed.extra_romaji = Set(item.extra.romaji_text());
                     }
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
@@ -1368,11 +1503,18 @@ impl SearchStore {
 
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
-            "SELECT w.rowid AS r, w.website, w.path, w.title, w.title_romaji, w.language, w.extra_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value ORDER BY j.key",
+            "SELECT w.rowid AS r, w.website, w.path, w.title, w.title_romaji, w.language, w.tags, u.romaji AS uploader_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value \
+             LEFT JOIN uploaders u ON u.website = w.website AND u.id = w.uploader ORDER BY j.key",
             [serde_json::to_string(rowids)?.into()],
         );
+        let raw = RawRow::find_by_statement(statement).all(&self.reader).await?;
+        let extras = self.extras_of(&raw.iter().map(|row| (row.tags.as_deref(), row.uploader_romaji.as_deref())).collect::<Vec<_>>()).await?;
 
-        Ok(IndexedRow::find_by_statement(statement).all(&self.reader).await?)
+        Ok(raw
+            .into_iter()
+            .zip(extras)
+            .map(|(row, extra)| IndexedRow { r: row.r, website: row.website, path: row.path, title: row.title, title_romaji: row.title_romaji, language: row.language, extra })
+            .collect())
     }
 
     /// The websites of every work that `matcher` finds: the index finds the pieces as trigrams, and a work that has them apart is not counted.
@@ -1638,7 +1780,7 @@ mod tests {
         // the columns of the table are all there is
         assert_eq!(
             store.columns_of("works").await.unwrap(),
-            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at", "tags", "uploader", "posted_at", "extra_romaji"]
+            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at", "tags", "uploader", "posted_at"]
         );
 
         let works = store.candidates_owned(&[]).await.unwrap();
@@ -1750,7 +1892,7 @@ mod tests {
         // the list, the crawl and an import all bring /a again: it is left out
         store.save("q2", "Site", 300, &Ok(vec![work("/a"), work("/c")]), false).await.unwrap();
         store.save_crawled("Site", 300, &[work("/a"), work("/d")], None).await.unwrap();
-        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None, tags: None, uploader: None, posted_at: None, extra_romaji: None };
+        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None, tags: None, uploader: None, posted_at: None };
         assert_eq!(store.import_works(vec![gone]).await.unwrap(), 0);
         let mut found = paths(store.candidates_owned(&["title"]).await.unwrap()).await;
         found.sort();
@@ -2392,7 +2534,7 @@ mod tests {
         let tagged = |path: &str, title: &str, uploader: &str, tags: &[&str]| {
             let mut work = link(path, title);
             let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
-            work.extra = Extra { romaji: format!("{uploader}\n{}", tags.join("\n")), tags, uploader: Some(uploader.to_string()), posted_at: Some(1_700_000_000) };
+            work.extra = Extra { romaji: tags.iter().cloned().chain([uploader.to_string()]).collect(), tags, uploader: Some(crate::sites::Account { id: format!("id-{uploader}"), name: uploader.to_string() }), posted_at: Some(1_700_000_000) };
             work
         };
 
@@ -2415,6 +2557,11 @@ mod tests {
             let row = store.db.query_one(Statement::from_string(store.db.get_database_backend(), "SELECT tags, uploader, posted_at FROM works WHERE path = '/g/1/'")).await.unwrap().unwrap();
             (row.try_get("", "tags").unwrap(), row.try_get("", "uploader").unwrap(), row.try_get("", "posted_at").unwrap())
         };
-        assert_eq!((tags.as_deref(), uploader.as_deref(), posted), (Some("cosplay\nbig breasts"), Some("fini"), Some(1_700_000_000)));
+        assert_eq!((tags.as_deref(), uploader.as_deref(), posted), (Some(" 2 1 "), Some("id-fini"), Some(1_700_000_000)));
+
+        let names: Vec<(i64, String)> = store.db.query_all(Statement::from_string(store.db.get_database_backend(), "SELECT id, name FROM tags ORDER BY id")).await.unwrap().iter().map(|r| (r.try_get("", "id").unwrap(), r.try_get("", "name").unwrap())).collect();
+        assert_eq!(names, [(1, "big breasts".to_string()), (2, "cosplay".to_string())], "a tag has its own id");
+        let account: String = store.db.query_one(Statement::from_string(store.db.get_database_backend(), "SELECT name FROM uploaders WHERE website = 'A' AND id = 'id-fini'")).await.unwrap().unwrap().try_get("", "name").unwrap();
+        assert_eq!(account, "fini", "the account is by the site and its id on the site");
     }
 }

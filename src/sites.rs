@@ -449,12 +449,20 @@ pub struct Link {
 pub struct Extra {
     /// The tags, flat: the namespace of E-Hentai (`female:`) is dropped, the category (`Cosplay`) is a tag, the hashtags of other sites are tags.
     pub tags: Vec<String>,
-    /// The name of the uploader.
-    pub uploader: Option<String>,
+    /// The account that posted the work.
+    pub uploader: Option<Account>,
     /// When the work was posted, in seconds since the epoch (UTC).
     pub posted_at: Option<i64>,
-    /// The romaji of the uploader and the tags (the uploader first, one line each), made with the title: what a query is matched with.
-    pub romaji: String,
+    /// The romaji of the tags and then of the name of the account (one line each, in this order), made with the title: what a query is matched with.
+    pub romaji: Vec<String>,
+}
+
+/// An account of a site (`entity/uploader.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// The id on the site.
+    pub id: String,
+    pub name: String,
 }
 
 impl Extra {
@@ -462,20 +470,21 @@ impl Extra {
         self.tags.is_empty() && self.uploader.is_none() && self.posted_at.is_none()
     }
 
-    /// The text of the uploader (the first line, empty when there is none) and the tags (one per line): what is romanized.
-    pub fn text(&self) -> String {
-        std::iter::once(self.uploader.clone().unwrap_or_default()).chain(self.tags.iter().cloned()).collect::<Vec<_>>().join("\n")
+    /// The texts that are romanized: the tags, then the name of the account.
+    pub fn texts(&self) -> Vec<String> {
+        self.tags.iter().cloned().chain(self.uploader.iter().map(|account| account.name.clone())).collect()
     }
+}
 
-    /// The tags as they are saved (one per line); `None` when there are none.
-    pub fn tags_text(&self) -> Option<String> {
-        (!self.tags.is_empty()).then(|| self.tags.join("\n"))
-    }
+/// Seconds since the epoch of a date and a time (UTC, the civil calendar).
+pub fn epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64) -> i64 {
+    let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
 
-    /// The romaji as it is saved; `None` when the list page showed nothing.
-    pub fn romaji_text(&self) -> Option<String> {
-        (!self.is_empty()).then(|| self.romaji.clone())
-    }
+    days * 86400 + hour * 3600 + minute * 60
 }
 
 /// The works of an E-Hentai list page (the extended view the crawl reads), by gallery id: the category and the tags (flat), the uploader and the
@@ -489,7 +498,7 @@ fn ehentai_extras(html: &str) -> HashMap<String, Extra> {
     let gid = GID.get_or_init(|| Regex::new(r#"/g/(\d+)/"#).unwrap());
     let category = CATEGORY.get_or_init(|| Regex::new(r#"<div class="cn c[a-z]+"[^>]*>([^<]+)</div>"#).unwrap());
     let tag = TAG.get_or_init(|| Regex::new(r#"<div class="gt[a-z]*" title="([^"]+)""#).unwrap());
-    let uploader = UPLOADER.get_or_init(|| Regex::new(r#"/uploader/[^"]*">([^<]+)</a>"#).unwrap());
+    let uploader = UPLOADER.get_or_init(|| Regex::new(r#"/uploader/([^"/]+)">([^<]+)</a>"#).unwrap());
     let posted = POSTED.get_or_init(|| Regex::new(r#"id="posted_\d+">(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)</div>"#).unwrap());
     let mut found = HashMap::new();
 
@@ -509,18 +518,11 @@ fn ehentai_extras(html: &str) -> HashMap<String, Extra> {
                 extra.tags.push(name);
             }
         }
-        extra.uploader = uploader.captures(row).map(|c| decode(c[1].trim())).filter(|name| !name.is_empty());
+        extra.uploader = uploader.captures(row).map(|c| Account { id: c[1].to_string(), name: decode(c[2].trim()) }).filter(|account| !account.name.is_empty());
         extra.posted_at = posted.captures(row).and_then(|c| {
             let number = |n: usize| c[n].parse::<i64>().ok();
             let (year, month, day) = (number(1)?, number(2)?, number(3)?);
-            // days since 1970-01-01 (the civil calendar)
-            let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
-            let era = y.div_euclid(400);
-            let yoe = y - era * 400;
-            let doy = (153 * m + 2) / 5 + day - 1;
-            let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
-
-            Some(days * 86400 + number(4)? * 3600 + number(5)? * 60)
+            Some(epoch(year, month, day, number(4)?, number(5)?))
         });
 
         if !extra.is_empty() {
@@ -1110,7 +1112,7 @@ mod tests {
         assert_eq!(links.len(), 1);
         let extra = &links[0].extra;
         assert_eq!(extra.tags, ["cosplay", "english", "big ass", "glasses"], "flat, the category first, no repeats");
-        assert_eq!(extra.uploader.as_deref(), Some("masterreviewer1000"));
+        assert_eq!(extra.uploader, Some(Account { id: "masterreviewer1000".into(), name: "masterreviewer1000".into() }));
         assert_eq!(extra.posted_at, Some(1_755_954_300), "2025-08-23 13:05 UTC");
     }
 }

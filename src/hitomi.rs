@@ -230,6 +230,11 @@ pub struct Gallery {
     pub artists: Vec<String>,
     pub groups: Vec<String>,
     pub parodies: Vec<String>,
+    /// The characters and the tags (flat: `female`, `male` are dropped), in lower case.
+    pub characters: Vec<String>,
+    pub tags: Vec<String>,
+    /// When the gallery was posted (seconds since the epoch, UTC).
+    pub posted_at: Option<i64>,
     /// The number of pages.
     pub pages: usize,
 }
@@ -270,8 +275,30 @@ impl Gallery {
             _ => self.title.clone(),
         };
 
-        Link { path: self.path(), title, extra: Default::default() }
+        let mut tags: Vec<String> = Vec::new();
+        for tag in self.kind.iter().chain(&self.parodies).chain(&self.characters).chain(&self.tags) {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        let creators: Vec<&str> = self.artists.iter().chain(&self.groups).map(String::as_str).collect();
+        let extra = crate::sites::Extra { tags, uploader: (!creators.is_empty()).then(|| { let name = creators.join(" "); crate::sites::Account { id: name.clone(), name } }), posted_at: self.posted_at, romaji: Vec::new() };
+
+        Link { path: self.path(), title, extra }
     }
+}
+
+/// `2022-12-29 19:23:00-06`: the time of a gallery, with the hours the zone is behind UTC.
+fn posted_at(text: &str) -> Option<i64> {
+    let (date, time) = text.split_once(' ')?;
+    let mut date = date.split('-').map(|part| part.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let (clock, zone) = time.find(['+', '-']).map_or((time, ""), |at| time.split_at(at));
+    let mut clock = clock.split(':').map(|part| part.parse::<i64>().ok());
+    let (hour, minute) = (clock.next()??, clock.next()??);
+    let offset: i64 = if zone.is_empty() { 0 } else { zone.get(1..3)?.parse::<i64>().ok()? * if zone.starts_with('-') { -1 } else { 1 } };
+
+    Some(crate::sites::epoch(year, month, day, hour, minute) - offset * 3600)
 }
 
 /// The gallery that `/galleries/<id>.js` describes. None when it has no title.
@@ -298,6 +325,9 @@ pub fn parse_gallery(id: u32, body: &str) -> Option<Gallery> {
         artists: names("artists", "artist"),
         groups: names("groups", "group"),
         parodies: names("parodys", "parody"),
+        characters: names("characters", "character"),
+        tags: names("tags", "tag"),
+        posted_at: text("date").and_then(posted_at),
         pages: info.get("files").and_then(|files| files.as_array()).map_or(0, Vec::len),
     })
 }
@@ -606,5 +636,15 @@ mod tests {
     #[tokio::test]
     async fn a_broken_site_is_an_error() {
         assert!(gallery_ids(&mut Broken, "kyoudai", 10).await.is_err(), "the version is not a number");
+    }
+
+    #[test]
+    fn a_gallery_gives_its_tags_creators_and_date() {
+        let body = r#"var galleryinfo = {"title":"T","japanese_title":null,"type":"doujinshi","language":"japanese","artists":[{"artist":"Fini"}],"groups":[{"group":"Circle"}],"parodys":[{"parody":"vocaloid"}],"characters":[{"character":"hatsune miku"}],"tags":[{"tag":"big breasts","female":"1"}],"date":"2022-12-29 19:23:00-06","files":[{},{}]}"#;
+        let link = parse_gallery(1, body).unwrap().link();
+
+        assert_eq!(link.extra.tags, ["doujinshi", "vocaloid", "hatsune miku", "big breasts"]);
+        assert_eq!(link.extra.uploader.map(|account| account.name), Some("fini circle".to_string()));
+        assert_eq!(link.extra.posted_at, Some(1_672_363_380), "2022-12-30 01:23 UTC");
     }
 }

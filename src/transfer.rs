@@ -149,7 +149,6 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                     tags: None,
                     uploader: None,
                     posted_at: None,
-                    extra_romaji: None,
                 }
             })
             .collect::<Vec<_>>()

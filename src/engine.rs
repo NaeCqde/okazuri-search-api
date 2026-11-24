@@ -562,7 +562,7 @@ impl Engine {
                 let mut extra = link.extra;
                 if !extra.is_empty() {
                     // the uploader and the tags are romanized the same way, one line each
-                    extra.romaji = extra.text().lines().map(|line| romaji(line, &self.romanizer).unwrap_or_else(|_| line.to_string())).collect::<Vec<_>>().join("\n");
+                    extra.romaji = extra.texts().iter().map(|text| romaji(text, &self.romanizer).unwrap_or_else(|_| text.clone())).collect();
                 }
 
                 NewWork { path: link.path, title, romaji: converted, language, extra }
