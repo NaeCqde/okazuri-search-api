@@ -38,6 +38,8 @@ unicode-normalization = "0.1"
 # executable large). The TLS used to download it is rustls, so no OpenSSL is needed, also for musl.
 lindera = { version = "6", default-features = false, features = ["embed-unidic"] }
 brotli = { version = "9.1.3", default-features = false, features = ["std"] }
+# The text index of the titles (`textindex.rs`): the pieces of the keys by trigrams, the words, the starts of the words, and the author, scored.
+tantivy = { version = "0.22", default-features = false, features = ["mmap", "lz4-compression"] }
 # `[search] pin_db`: the database file is mapped and locked in memory (`pin.rs`).
 memmap2 = "0.9"
 # The public dataset (`dataset`) is gzip: the format every tool reads.

@@ -940,7 +940,7 @@ impl Engine {
         }
 
         let (candidates, items, indexed, rows) = match &matcher {
-            Some(matcher) => self.indexed_items(request, &terms, matcher, after.as_ref(), &fetched).await?,
+            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched).await?,
             None => {
                 let (candidates, items) = self.scanned_items(&terms, &fetched).await?;
                 laps.lap("candidates and match");
@@ -1053,7 +1053,6 @@ impl Engine {
     async fn indexed_items(
         &self,
         request: &Request<'_>,
-        terms: &Terms,
         matcher: &crate::query::Matcher,
         after: Option<&Searched>,
         fetched: &Fetched,
@@ -1069,10 +1068,9 @@ impl Engine {
 
         if left > 0 {
             // the works of the earlier search that this one finds again are among the rows, so that many more are read
-            // the first `rank_window` works are read and put in order (the good answers first); the answer needs only `left + spare` of them
+            // the index gives the best answers first (by score); the answer needs only `left + spare` of them
             let wanted = left + spare;
-            let found = self.store.top_found(matcher, wanted.max(self.config.rank_window)).await?;
-            let found = rank_first(found, self.config.rank_window, |(_, row)| terms.answer_tier(&row.title_romaji));
+            let found = self.store.top_found(matcher, wanted).await?;
 
             for (name, mut row) in found.into_iter().take(wanted) {
                 // the work of a site that is not in the list (it was removed from the code) is not in the answer
@@ -2477,11 +2475,6 @@ pub(crate) mod tests {
         let ranked = found(outcome);
         assert_eq!(ranked.last().map(String::as_str), Some("Kimera Shoujo ga Hoshii Mono"));
         assert_eq!(ranked.len(), 4);
-
-        // without the window the rows stay in their order
-        let engine = Engine::with_sites(sites::all(), &SearchConfig { rank_window: 0, ..config() }, engine.store.clone(), engine.romanizer.clone());
-        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("rashou mon") }).await.unwrap();
-        assert_ne!(found(outcome).last().map(String::as_str), Some("Kimera Shoujo ga Hoshii Mono"), "the rows are in their own order");
     }
 
     #[tokio::test]
@@ -2526,7 +2519,11 @@ pub(crate) mod tests {
             let found: Vec<String> = outcome.results.iter().map(|hit| hit.title.clone()).collect();
             let expected = expected_titles(&engine, query).await;
 
-            assert_eq!(found, expected, "{query}");
+            // the same works as the rows say, in the order of the scores
+            let (mut sorted, mut wanted) = (found.clone(), expected.clone());
+            sorted.sort();
+            wanted.sort();
+            assert_eq!(sorted, wanted, "{query}");
             assert!(!outcome.has_more, "{query}");
             // `count` counts the works, and Good (the legal site) has half of them
             let (total, sites) = engine.count(query).await.unwrap();
@@ -2541,12 +2538,11 @@ pub(crate) mod tests {
             // a page that is cut: it says whether there is a next page, and the page is the head of the answer
             let head = engine.search(&Request { live: Live::Off, limit: 3, ..Request::new(query) }).await.unwrap();
             assert_eq!(head.has_more, expected.len() > 3, "{query}");
-            assert_eq!(head.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>(), expected[..expected.len().min(3)], "{query}");
+            assert_eq!(head.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>(), found[..found.len().min(3)], "{query}");
         }
 
-        // the work with the smallest row number is the first, whatever its site, and the same request has the same order every time
+        // the same request has the same order every time
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
-        assert_eq!(outcome.results[0].path, "/work/7", "the first of the list of the page is the first added (a list is saved newest first, and the first site is saved first)");
         let again = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
         assert_eq!(outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>(), again.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>());
     }
@@ -2577,12 +2573,12 @@ pub(crate) mod tests {
 
         let titles = |outcome: &Outcome| outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
         let whole = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
-        // the English title's works (the smallest row number first), and then the works of the Japanese title that are not in the answer yet
-        assert_eq!(titles(&whole), ["/work/3", "/work/1", "/work/2"]);
+        // the English title's works (the best score first), and then the works of the Japanese title that are not in the answer yet
+        assert_eq!(titles(&whole), ["/work/1", "/work/3", "/work/2"]);
         assert_eq!(whole.results.len(), 3, "the work of both titles is in the answer once");
 
         // a page that is cut inside the first title, and one that is cut at its end: the page says that the answer goes on
-        for (limit, expected) in [(1, vec!["/work/3"]), (2, vec!["/work/3", "/work/1"])] {
+        for (limit, expected) in [(1, vec!["/work/1"]), (2, vec!["/work/1", "/work/3"])] {
             let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
             assert_eq!((titles(&page), page.has_more), (expected.into_iter().map(String::from).collect::<Vec<_>>(), true), "limit {limit}");
         }
@@ -2639,9 +2635,9 @@ pub(crate) mod tests {
         let none = engine.search(&Request { live: Live::Off, ..Request::new("alpha gamma") }).await.unwrap();
         assert_eq!((none.has_more, none.results.len()), (false, 0));
 
-        // a word alone finds the titles of any query, the smallest row number first
+        // a word alone finds the titles of any query, the best score first
         let one = engine.search(&Request { live: Live::Off, ..Request::new("ONE") }).await.unwrap();
-        assert_eq!(one.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["alpha beta one", "gamma one"]);
+        assert_eq!(one.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["gamma one", "alpha beta one"], "the shorter title first");
     }
 
     #[tokio::test]

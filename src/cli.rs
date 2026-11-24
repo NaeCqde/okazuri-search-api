@@ -56,6 +56,11 @@ count <words>...                       Count the saved works whose title has all
 stats                                  Print what the database holds: the works of each site (gone, not yet looked at by the
                                        verification), the crawl of each site, the translations by source. Safe while the server runs
     --config <path>      Config file
+build-index                            Fill the text index (the directory `<db_path>.index`) from the works when it is not complete, and exit. The
+                                       server does the same when it starts: this does it before, while the server runs the old version
+    --config <path>      Config file
+drop-legacy-index                      Drop the FTS5 tables of the older versions from the database (the free space stays in the file)
+    --config <path>      Config file
 sync                                   Copy the magazine tables of the D1 database now ([magazine])\n\
     --config <path>      Config file\n\
 prefetch                               Search for the issues of the copy once through ([magazine.prefetch])\n\
@@ -111,6 +116,8 @@ pub enum Command {
     Works { issue: String, config: Option<PathBuf> },
     Count { query: String, config: Option<PathBuf> },
     Stats { config: Option<PathBuf> },
+    BuildIndex { config: Option<PathBuf> },
+    DropLegacyIndex { config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
@@ -140,6 +147,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "works" => parse_works(rest),
         "count" => parse_count(rest),
         "stats" => parse_config_only(rest, "stats").map(|config| Command::Stats { config }),
+        "build-index" => parse_config_only(rest, "build-index").map(|config| Command::BuildIndex { config }),
+        "drop-legacy-index" => parse_config_only(rest, "drop-legacy-index").map(|config| Command::DropLegacyIndex { config }),
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
@@ -482,6 +491,8 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Works { issue, config } => works(issue, config).await,
         Command::Count { query, config } => count(query, config).await,
         Command::Stats { config } => stats(config).await,
+        Command::BuildIndex { config } => build_index(config).await,
+        Command::DropLegacyIndex { config } => drop_legacy_index(config).await,
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
@@ -926,6 +937,29 @@ async fn stats(config: Option<PathBuf>) -> Result<()> {
     for (source, rows) in store.translation_stats().await? {
         println!("translations {source:<8} {rows:>9}");
     }
+
+    Ok(())
+}
+
+/// Opens the database: the text index beside it is filled when it is not complete (the same as the start of the server, without the server).
+async fn build_index(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let started = std::time::Instant::now();
+    let store = SearchStore::open(&config.search.db_path).await?;
+    let works = store.count_works().await?;
+
+    println!("{works} works, the text index is complete ({} s)", started.elapsed().as_secs());
+
+    Ok(())
+}
+
+/// Drops the FTS5 tables of the older versions from the database (their triggers are gone): the space is free inside the file.
+async fn drop_legacy_index(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open(&config.search.db_path).await?;
+    store.drop_legacy_index().await?;
+
+    println!("the FTS5 tables are dropped");
 
     Ok(())
 }
