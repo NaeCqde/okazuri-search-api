@@ -362,8 +362,9 @@ async fn title(State(state): State<Arc<AppState>>, RawQuery(raw): RawQuery) -> R
 }
 
 /// The longest `q` of the lookups in the copy of the catalogue (`/okazuri/magazine`, `/okazuri/works`), in characters.
-/// The most `offset` of a search can skip.
-const MAX_SEARCH_OFFSET: usize = 10_000;
+/// The most `offset` of a search can skip: the memory of the server holds the answer up to it (a work is some hundreds of bytes and the server has little to spare). A page is the head of the answer cut off, so a
+/// page at the end of a long answer costs as much as the whole answer up to it.
+const MAX_SEARCH_OFFSET: usize = 200_000;
 
 const MAX_LOOKUP_CHARS: usize = 300;
 
@@ -871,7 +872,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
             (serde_json::from_str(&first).unwrap(), serde_json::from_str(&second).unwrap(), serde_json::from_str(&past).unwrap());
         assert_ne!(first["results"][0]["url"], second["results"][0]["url"]);
         assert_eq!((second["has_more"].as_bool(), past["results"].as_array().unwrap().len()), (Some(false), 0));
-        assert_eq!(get_from(state, &format!("/okazuri/search?live=diff&q={q}&offset=10001")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state, &format!("/okazuri/search?live=diff&q={q}&offset=200001")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
