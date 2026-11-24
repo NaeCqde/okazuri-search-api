@@ -731,7 +731,7 @@ impl Engine {
         self.fill_english(&mut meta.results).await?;
         laps.lap("fill_english");
 
-        log::info!("timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, meta.results.len());
+        text_log!(info, "timing of the search {:?} (live {:?}, {} works): {laps}", request.query, request.live, meta.results.len(); "timing of the search (live {:?}, {} works): {laps}", request.live, meta.results.len());
 
         Ok(meta)
     }
@@ -761,7 +761,7 @@ impl Engine {
         laps.lap("first search");
         let merged = Merged { sets: vec![first.set], items: first.items, indexed: first.indexed, meta: first.meta };
         let merged = self.search_all_more(request, merged, &mut laps).await;
-        log::info!("timing of the two searches of {:?}: {laps}", request.query);
+        text_log!(info, "timing of the two searches of {:?}: {laps}", request.query; "timing of the two searches: {laps}");
 
         merged
     }
@@ -792,7 +792,7 @@ impl Engine {
                 true
             }
             Err(e) => {
-                log::warn!("cannot search the title {text:?} of {:?}: {e}", request.query);
+                text_log!(warn, "cannot search the title {text:?} of {:?}: {e}", request.query; "cannot search the other title of a query: {e}");
 
                 false
             }
@@ -911,7 +911,7 @@ impl Engine {
 
         let reports = self.reports(&plan, &fetched.asked, request.live != Live::Off, exclude, request.exclude).await?;
         laps.lap("site reports");
-        log::info!("timing of the search of {:?} ({rows} candidates): {laps}", request.query);
+        text_log!(info, "timing of the search of {:?} ({rows} candidates): {laps}", request.query; "timing of the search of a query ({rows} candidates): {laps}");
 
         let meta = Outcome {
             sites: {
@@ -1189,8 +1189,8 @@ impl Engine {
             };
 
             match &outcome {
-                Ok(links) => log::debug!("search {name}: {} works in {:?} ({query})", links.len(), started.elapsed()),
-                Err(error) => log::warn!("search {name}: {error} ({query})"),
+                Ok(links) => text_log!(debug, "search {name}: {} works in {:?} ({query})", links.len(), started.elapsed(); "search {name}: {} works in {:?}", links.len(), started.elapsed()),
+                Err(error) => text_log!(warn, "search {name}: {error} ({query})"; "search {name}: {error}"),
             }
 
             // a list as long as the most that is kept may have been cut: then a work that is missing is not gone
@@ -1235,7 +1235,8 @@ impl Engine {
                 request = request.header("Cookie", cookie);
             }
 
-            let response = request.send().await.map_err(|e| e.to_string())?;
+            // the error of reqwest has the address, and the address has the query: it is left out of the message
+            let response = request.send().await.map_err(|e| e.without_url().to_string())?;
             let status = response.status().as_u16();
 
             // too many requests: wait as long as the site says (not too long), and ask once more
@@ -1255,7 +1256,7 @@ impl Engine {
             }
 
             let page_url = response.url().to_string();
-            let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+            let bytes = response.bytes().await.map_err(|e| e.without_url().to_string())?;
 
             break (status, page_url, String::from_utf8_lossy(&bytes).into_owned());
         };
@@ -1417,7 +1418,7 @@ impl Engine {
         laps.lap("saved");
 
         if live != Live::Force && !saved.is_empty() {
-            log::info!("timing of the Hitomi.La translation of {text:?}: {laps}");
+            text_log!(info, "timing of the Hitomi.La translation of {text:?}: {laps}"; "timing of a Hitomi.La translation: {laps}");
             return Ok((saved.into_iter().map(Translation::from).collect(), true));
         }
 
@@ -1427,7 +1428,7 @@ impl Engine {
             laps.lap("other direction");
 
             if !others.is_empty() {
-                log::info!("timing of the Hitomi.La translation of {text:?}: {laps}");
+                text_log!(info, "timing of the Hitomi.La translation of {text:?}: {laps}"; "timing of a Hitomi.La translation: {laps}");
                 let side = |row: &crate::entity::translation::Model| if from == Lang::English { row.english_key.clone() } else { row.japanese_key.clone() };
                 let mut found: Vec<Translation> = others
                     .into_iter()
@@ -1456,7 +1457,7 @@ impl Engine {
 
         self.store.save_translations(&key, "hitomi", text.trim(), from.code(), unix_now(), &rows).await?;
         laps.lap("save");
-        log::info!("timing of the Hitomi.La translation of {text:?}: {laps}");
+        text_log!(info, "timing of the Hitomi.La translation of {text:?}: {laps}"; "timing of a Hitomi.La translation: {laps}");
 
         Ok((found, false))
     }
@@ -1478,7 +1479,7 @@ impl Engine {
             let row = self.store.translations(&key, "google").await?.into_iter().next();
             laps.lap("saved");
             if let Some(row) = row {
-                log::info!("timing of the Google translation of {text:?}: {laps}");
+                text_log!(info, "timing of the Google translation of {text:?}: {laps}"; "timing of a Google translation: {laps}");
                 return Ok((Translation::from(row), true));
             }
 
@@ -1486,7 +1487,7 @@ impl Engine {
             let row = self.store.translations_with("google", from == Lang::English, &key, true, 1).await?.into_iter().next();
             laps.lap("other direction");
             if let Some(row) = row {
-                log::info!("timing of the Google translation of {text:?}: {laps}");
+                text_log!(info, "timing of the Google translation of {text:?}: {laps}"; "timing of a Google translation: {laps}");
                 return Ok((Translation { exact: true, ..Translation::from(row) }, true));
             }
         }
@@ -1500,7 +1501,7 @@ impl Engine {
 
         self.store.save_translations(&key, "google", text.trim(), from.code(), unix_now(), &[translation.row(0)]).await?;
         laps.lap("save");
-        log::info!("timing of the Google translation of {text:?}: {laps}");
+        text_log!(info, "timing of the Google translation of {text:?}: {laps}"; "timing of a Google translation: {laps}");
 
         Ok((translation, false))
     }
@@ -1514,7 +1515,7 @@ impl Engine {
                     return Ok((first, saved));
                 }
             }
-            Err(e) => log::warn!("no translation of {text:?} from Hitomi.La: {e}"),
+            Err(e) => text_log!(warn, "no translation of {text:?} from Hitomi.La: {e}"; "no translation from Hitomi.La: {e}"),
         }
 
         self.translate_google(text, from, live).await
@@ -1530,14 +1531,14 @@ impl Engine {
                         return Some(first);
                     }
                 }
-                Err(e) => log::warn!("no English title of {text:?} from Hitomi.La: {e}"),
+                Err(e) => text_log!(warn, "no English title of {text:?} from Hitomi.La: {e}"; "no English title from Hitomi.La: {e}"),
             }
         }
 
         if translator != Translator::Hitomi {
             match self.translate_google(text, Lang::Japanese, live).await {
                 Ok((found, _)) => return Some(found),
-                Err(e) => log::warn!("no English title of {text:?} from Google Translate: {e}"),
+                Err(e) => text_log!(warn, "no English title of {text:?} from Google Translate: {e}"; "no English title from Google Translate: {e}"),
             }
         }
 
@@ -1553,14 +1554,14 @@ impl Engine {
                         return Some(first);
                     }
                 }
-                Err(e) => log::warn!("no Japanese title of {text:?} from Hitomi.La: {e}"),
+                Err(e) => text_log!(warn, "no Japanese title of {text:?} from Hitomi.La: {e}"; "no Japanese title from Hitomi.La: {e}"),
             }
         }
 
         if translator != Translator::Hitomi {
             match self.translate_google(text, Lang::English, live).await {
                 Ok((found, _)) => return Some(found),
-                Err(e) => log::warn!("no Japanese title of {text:?} from Google Translate: {e}"),
+                Err(e) => text_log!(warn, "no Japanese title of {text:?} from Google Translate: {e}"; "no Japanese title from Google Translate: {e}"),
             }
         }
 
@@ -1706,7 +1707,7 @@ impl crate::hitomi::Fetch for HitomiFetch<'_> {
             request = request.header("Range", format!("bytes={from}-{to}")).header("Accept-Encoding", "identity");
         }
 
-        let response = request.send().await.map_err(|e| format!("{path}: {e}"))?;
+        let response = request.send().await.map_err(|e| format!("{path}: {}", e.without_url()))?;
         let status = response.status().as_u16();
 
         if status != 200 && status != 206 {

@@ -159,12 +159,12 @@ pub async fn translate(client: &reqwest::Client, bridge: Bridge<'_>, text: &str,
         if !answer.classic {
             break;
         }
-        log::info!("Google Translate: the classic model answered {text:?} (the token was not honoured): try {attempt} of {attempts}");
+        text_log!(info, "Google Translate: the classic model answered {text:?} (the token was not honoured): try {attempt} of {attempts}"; "Google Translate: the classic model answered (the token was not honoured): try {attempt} of {attempts}");
         answer = ask(client, bridge, text, from, to).await?;
     }
 
     if answer.classic && !bridge.url.is_empty() {
-        log::warn!("Google Translate: the classic model answered {text:?} {attempts} times: its answer is taken");
+        text_log!(warn, "Google Translate: the classic model answered {text:?} {attempts} times: its answer is taken"; "Google Translate: the classic model answered {attempts} times: its answer is taken");
     }
 
     Ok(answer.text)

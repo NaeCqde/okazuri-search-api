@@ -134,12 +134,12 @@ impl TitleTranslator {
                         in_a_row = 0;
                         if !saved {
                             round.translated += 1;
-                            log::debug!("fill: {text:?} -> {:?}", translation.english);
+                            text_log!(debug, "fill: {text:?} -> {:?}", translation.english; "fill: a title translated");
                             tokio::time::sleep(Duration::from_millis(self.config.pause_ms)).await;
                         }
                     }
                     Err(e) => {
-                        log::warn!("fill: {text:?}: {e}");
+                        text_log!(warn, "fill: {text:?}: {e}"; "fill: a title failed: {e}");
                         failed.insert(squash(&text));
                         round.failed += 1;
                         in_a_row += 1;
