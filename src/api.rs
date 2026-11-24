@@ -149,7 +149,8 @@ async fn run_search(engine: &Arc<Engine>, params: SearchQuery, exclude: &[usize]
         return invalid(&format!("q is too long (at most {} characters)", engine.max_query_chars()));
     }
 
-    let Some(live) = Live::parse(params.live.as_deref().unwrap_or("")) else {
+    // `live` is `off` unless the request asks for more: the answer is the database's (the sites are asked only with `diff` or `force`)
+    let Some(live) = Live::parse(params.live.as_deref().filter(|text| !text.trim().is_empty()).unwrap_or("off")) else {
         return invalid("live is off, diff or force");
     };
 
@@ -645,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn the_search_has_no_route_while_it_is_off_and_the_romaji_is_always_there() {
         // the search is off in the state of the romaji tests
-        assert_eq!(get_path("/okazuri/search?q=a").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_path("/okazuri/search?live=diff&q=a").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/okazuri/sites").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/hitomila/translate?q=a").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_path("/romaji?q=a").await.0, StatusCode::OK);
@@ -743,10 +744,10 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(get_from(state.clone(), "/auto/translate").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get_from(state.clone(), &format!("/auto/translate?q={}&live=off", encode("姉弟"))).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // the sites that are left out of a search
-        assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&exclude=Nowhere").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), "/okazuri/search?live=diff&q=a&exclude=Nowhere").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         // Hitomi.La is not one of the sites of the tests: no route
         // the translator of a search
-        assert_eq!(get_from(state.clone(), "/okazuri/search?q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state.clone(), "/okazuri/search?live=diff&q=a&translator=bing").await.0, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, content_type, body) = get_from(state, &format!("/hitomila/translate?q={}&live=force", encode("姉弟"))).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(content_type.starts_with("application/json"));
@@ -763,7 +764,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
     async fn searches_the_sites_and_answers_json() {
         let (state, hits) = search_state().await;
 
-        let (status, content_type, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}", encode("COMIC ExE"))).await;
+        let (status, content_type, body) = get_from(state.clone(), &format!("/okazuri/search?live=diff&translator=none&q={}", encode("COMIC ExE"))).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "application/json; charset=utf-8");
@@ -783,7 +784,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(json["sites"][1]["status"], "failed");
 
         // live=diff (the default) does not ask a site again within the validity of the answer (a month): the database answers
-        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?translator=none&q={}", encode("COMIC ExE"))).await;
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?live=diff&translator=none&q={}", encode("COMIC ExE"))).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(json["sites"][0]["status"], "cached");
@@ -803,10 +804,29 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
     }
 
     #[tokio::test]
+    async fn live_is_off_unless_the_request_says_otherwise() {
+        let (state, hits) = search_state().await;
+
+        for url in ["/okazuri/search?q=ExE", "/okazuri/search?q=ExE&live="] {
+            let (status, _, body) = get_from(state.clone(), url).await;
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["sites"][0]["status"], "not searched", "{url}");
+        }
+        assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 0, "no site was asked");
+
+        // `diff` asks them
+        let (_, _, body) = get_from(state.clone(), "/okazuri/search?q=ExE&live=diff").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["sites"][0]["status"], "searched");
+    }
+
+    #[tokio::test]
     async fn the_query_is_always_turned_into_romaji_and_the_input_is_kept() {
         let (state, hits) = search_state().await;
 
-        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={}", encode("チート"))).await;
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?live=diff&q={}", encode("チート"))).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
         assert_eq!(json["input"], "チート");
@@ -818,7 +838,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         // the same words in romaji are asked in romaji only (it has no Japanese in it)
-        let (_, _, body) = get_from(state, "/okazuri/search?q=cheat").await;
+        let (_, _, body) = get_from(state, "/okazuri/search?live=diff&q=cheat").await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["input"], "cheat");
         assert_eq!(json["sites"][0]["queries"], serde_json::json!(["cheat"]));
@@ -839,19 +859,19 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // limit=1 cuts the answer, and has_more says that there is a next page
-        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1")).await;
+        let (_, _, body) = get_from(state.clone(), &format!("/okazuri/search?live=diff&q={q}&limit=1")).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!((json["results"].as_array().unwrap().len(), json["has_more"].as_bool().unwrap()), (1, true));
 
         // offset skips the head of the answer: the second page is the other work, and a page past the end is empty
-        let (_, _, first) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1")).await;
-        let (_, _, second) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1&offset=1")).await;
-        let (_, _, past) = get_from(state.clone(), &format!("/okazuri/search?q={q}&limit=1&offset=2")).await;
+        let (_, _, first) = get_from(state.clone(), &format!("/okazuri/search?live=diff&q={q}&limit=1")).await;
+        let (_, _, second) = get_from(state.clone(), &format!("/okazuri/search?live=diff&q={q}&limit=1&offset=1")).await;
+        let (_, _, past) = get_from(state.clone(), &format!("/okazuri/search?live=diff&q={q}&limit=1&offset=2")).await;
         let (first, second, past): (serde_json::Value, serde_json::Value, serde_json::Value) =
             (serde_json::from_str(&first).unwrap(), serde_json::from_str(&second).unwrap(), serde_json::from_str(&past).unwrap());
         assert_ne!(first["results"][0]["url"], second["results"][0]["url"]);
         assert_eq!((second["has_more"].as_bool(), past["results"].as_array().unwrap().len()), (Some(false), 0));
-        assert_eq!(get_from(state, &format!("/okazuri/search?q={q}&offset=10001")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(get_from(state, &format!("/okazuri/search?live=diff&q={q}&offset=10001")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -860,10 +880,10 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
 
         for path in [
             "/okazuri/search".to_string(),
-            "/okazuri/search?q=".to_string(),
-            "/okazuri/search?q=%20%20".to_string(),
+            "/okazuri/search?live=diff&q=".to_string(),
+            "/okazuri/search?live=diff&q=%20%20".to_string(),
             "/okazuri/search?q=a&live=maybe".to_string(),
-            format!("/okazuri/search?q={}", "a".repeat(301)),
+            format!("/okazuri/search?live=diff&q={}", "a".repeat(301)),
         ] {
             assert_eq!(get_from(state.clone(), &path).await.0, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
         }
