@@ -53,6 +53,10 @@ search <words>...                      Search the sites for the words (in romaji
 count <words>...                       Count the saved works whose title has all the words (the search itself only tells whether
                                        there is a next page), and how many each site has
     --config <path>      Config file
+build-index                            Make the file of the indexes ([search] index_db_path) have all the works of the database (the first time it
+                                       reads every work: minutes). Safe while the server runs (the server that was started without the setting does
+                                       not use the file)
+    --config <path>      Config file
 stats                                  Print what the database holds: the works of each site (gone, not yet looked at by the
                                        verification), the crawl of each site, the translations by source. Safe while the server runs
     --config <path>      Config file
@@ -111,6 +115,7 @@ pub enum Command {
     Works { issue: String, config: Option<PathBuf> },
     Count { query: String, config: Option<PathBuf> },
     Stats { config: Option<PathBuf> },
+    BuildIndex { config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
     Prefetch { limit: Option<usize>, config: Option<PathBuf> },
     Reromanize { config: Option<PathBuf> },
@@ -140,6 +145,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "works" => parse_works(rest),
         "count" => parse_count(rest),
         "stats" => parse_config_only(rest, "stats").map(|config| Command::Stats { config }),
+        "build-index" => parse_config_only(rest, "build-index").map(|config| Command::BuildIndex { config }),
         "sync" => parse_sync(rest),
         "prefetch" => parse_prefetch(rest),
         "reromanize" => parse_reromanize(rest),
@@ -482,6 +488,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Works { issue, config } => works(issue, config).await,
         Command::Count { query, config } => count(query, config).await,
         Command::Stats { config } => stats(config).await,
+        Command::BuildIndex { config } => build_index(config).await,
         Command::Sync { config } => sync(config).await,
         Command::Prefetch { limit, config } => prefetch(limit, config).await,
         Command::Reromanize { config } => reromanize(config).await,
@@ -507,7 +514,7 @@ fn load_romanizer(config: &Config) -> Result<Arc<Romanizer>> {
 
 /// The engine. It turns every query into romaji, so it needs the romaji conversion.
 async fn open_engine(config: &Config, romanizer: Arc<Romanizer>) -> Result<Arc<Engine>> {
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
     store.set_max_candidates(config.search.max_candidates);
 
     // the bridge of Google Translate is in [translation], the engine reads it with the settings of the search
@@ -642,6 +649,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     }
     if config.search.enabled && config.search.pin_db {
         tasks.push(tokio::spawn(crate::pin::run(config.search.db_path.clone())));
+    }
+    if config.search.enabled && config.search.pin_index_db && !config.search.index_db_path.as_os_str().is_empty() {
+        tasks.push(tokio::spawn(crate::pin::run(config.search.index_db_path.clone())));
     }
     if let Some(d1) = background.d1 {
         let interval = Duration::from_secs(config.magazine.check_interval_minutes.max(1) * 60);
@@ -860,7 +870,7 @@ async fn reromanize(config: Option<PathBuf>) -> Result<()> {
 /// Makes the translations of Hitomi.La from the saved works.
 async fn translations(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
 
     println!("{} translations made", store.build_hitomi_translations().await?);
 
@@ -871,7 +881,7 @@ async fn translations(config: Option<PathBuf>) -> Result<()> {
 /// rows of the same titles, and the lookups that said "nothing found"), `google` drops the Google translations so that the fill asks again.
 async fn retranslate(source: &str, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
 
     if source == "hitomi" {
         let new = store.build_hitomi_translations().await?;
@@ -905,10 +915,28 @@ async fn count(query: String, config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Makes the file of the indexes (`[search] index_db_path`) have all the works of the database: opening the database does it (the first time it reads
+/// every work). Run it before the server is started with the setting, so the server does not wait for it.
+async fn build_index(config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+
+    if config.search.index_db_path.as_os_str().is_empty() {
+        return Err("[search] index_db_path is not set: there is no file of the indexes to make".into());
+    }
+
+    let started = std::time::Instant::now();
+    let store = SearchStore::open_configured(&config.search).await?;
+    let works: Vec<_> = store.site_stats().await?;
+
+    println!("{} works, the indexes are in {} ({} s)", works.iter().map(|(_, n, _, _)| n).sum::<i64>(), config.search.index_db_path.display(), started.elapsed().as_secs());
+
+    Ok(())
+}
+
 /// Prints what the database holds.
 async fn stats(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
     let crawls = store.crawl_states().await?;
 
     println!("{:<14} {:>10} {:>9} {:>10}  crawl", "site", "works", "gone", "unchecked");
@@ -933,7 +961,7 @@ async fn stats(config: Option<PathBuf>) -> Result<()> {
 /// Reads the language of every saved title again.
 async fn relanguage(config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
     let (looked, changed) = store.relanguage().await?;
 
     println!("{looked} works looked at, {changed} written again");
@@ -943,7 +971,7 @@ async fn relanguage(config: Option<PathBuf>) -> Result<()> {
 
 async fn export(file: PathBuf, sites: Vec<String>, since: i64, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
     let moved = crate::transfer::export(&store, &file, &sites, since).await?;
     let size = tokio::fs::metadata(&file).await.map(|m| m.len()).unwrap_or(0);
 
@@ -954,7 +982,7 @@ async fn export(file: PathBuf, sites: Vec<String>, since: i64, config: Option<Pa
 
 async fn dataset(dir: PathBuf, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
     let written = crate::dataset::write(&store, &crate::sites::all(), &dir).await?;
 
     println!("{} works of {} sites written to {}", written.works, written.sites, dir.display());
@@ -964,7 +992,7 @@ async fn dataset(dir: PathBuf, config: Option<PathBuf>) -> Result<()> {
 
 async fn import(files: Vec<PathBuf>, mark_done: Vec<String>, config: Option<PathBuf>) -> Result<()> {
     let config = load(config).await?;
-    let store = SearchStore::open(&config.search.db_path).await?;
+    let store = SearchStore::open_configured(&config.search).await?;
     // the romaji of the titles is made here, with the rules of this program
     let romanizer = load_romanizer(&config)?;
 
