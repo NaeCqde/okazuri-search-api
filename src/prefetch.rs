@@ -104,8 +104,13 @@ impl Prefetcher {
             match self.engine.fetch_with(&query, false, &left_out).await {
                 Ok(fetched) => {
                     round.searched += 1;
-                    log::info!(
+                    text_log!(
+                        info,
                         "prefetch: {}/{total} {query:?}: {} sites asked, {} new works",
+                        number + 1,
+                        fetched.asked.len(),
+                        fetched.new.len();
+                        "prefetch: {}/{total}: {} sites asked, {} new works",
                         number + 1,
                         fetched.asked.len(),
                         fetched.new.len()
@@ -113,7 +118,7 @@ impl Prefetcher {
                 }
                 Err(e) => {
                     round.failed += 1;
-                    log::warn!("prefetch: {query:?}: {e}");
+                    text_log!(warn, "prefetch: {query:?}: {e}"; "prefetch: a search failed: {e}");
                 }
             }
 
@@ -138,7 +143,7 @@ impl Prefetcher {
         let found = match self.engine.translate_hitomi(query, Lang::Japanese, Live::Diff).await {
             Ok((found, _)) => found,
             Err(e) => {
-                log::warn!("prefetch: no English title for {query:?}: {e}");
+                text_log!(warn, "prefetch: no English title for {query:?}: {e}"; "prefetch: no English title: {e}");
                 return;
             }
         };
@@ -155,7 +160,7 @@ impl Prefetcher {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => {
-                    log::warn!("prefetch: {english:?}: {e}");
+                    text_log!(warn, "prefetch: {english:?}: {e}"; "prefetch: an English search failed: {e}");
                     continue;
                 }
             }
@@ -163,9 +168,9 @@ impl Prefetcher {
             match self.engine.fetch_with(english, false, left_out).await {
                 Ok(fetched) => {
                     round.english += 1;
-                    log::info!("prefetch: {query:?} in English {english:?}: {} sites asked, {} new works", fetched.asked.len(), fetched.new.len());
+                    text_log!(info, "prefetch: {query:?} in English {english:?}: {} sites asked, {} new works", fetched.asked.len(), fetched.new.len(); "prefetch: an English title: {} sites asked, {} new works", fetched.asked.len(), fetched.new.len());
                 }
-                Err(e) => log::warn!("prefetch: {english:?}: {e}"),
+                Err(e) => text_log!(warn, "prefetch: {english:?}: {e}"; "prefetch: an English search failed: {e}"),
             }
 
             tokio::time::sleep(Duration::from_millis(self.config.query_delay_ms)).await;

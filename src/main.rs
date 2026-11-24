@@ -1,3 +1,15 @@
+/// A log line that has what a person searched for or what it was translated to: the first form is written by a debug build only, a release
+/// build writes the second one (the same line without the text), so that the timings and the errors are still in the log.
+macro_rules! text_log {
+    ($level:ident, $with:literal $(, $a:expr)* ; $without:literal $(, $b:expr)* $(,)?) => {
+        if cfg!(debug_assertions) {
+            log::$level!($with $(, $a)*)
+        } else {
+            log::$level!($without $(, $b)*)
+        }
+    };
+}
+
 mod api;
 mod cli;
 mod config;

@@ -360,7 +360,7 @@ impl SearchStore {
 
                 let removed = Self::save_listing(&transaction, query, website, listed, complete).await?;
                 if removed > 0 {
-                    log::info!("search {website}: {removed} works are not on the list of {query:?} any more, removed");
+                    text_log!(info, "search {website}: {removed} works are not on the list of {query:?} any more, removed"; "search {website}: {removed} works are not on the list of a query any more, removed");
                 }
 
                 // the search worked: the count is the one of this try
@@ -1375,7 +1375,7 @@ impl SearchStore {
     pub async fn candidates(&self, parts: &[&str]) -> Result<Arc<Candidates>> {
         let started = Instant::now();
         let found = Arc::new(self.candidates_up_to(parts, self.max_candidates.load(std::sync::atomic::Ordering::Relaxed)).await?);
-        log::info!("candidates of {parts:?}: {} read from the database in {} ms", found.len(), started.elapsed().as_millis());
+        text_log!(info, "candidates of {parts:?}: {} read from the database in {} ms", found.len(), started.elapsed().as_millis(); "candidates of a query: {} read from the database in {} ms", found.len(), started.elapsed().as_millis());
 
         Ok(found)
     }

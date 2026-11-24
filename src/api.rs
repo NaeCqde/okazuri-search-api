@@ -108,7 +108,7 @@ async fn romaji(State(state): State<Arc<AppState>>, Query(query): Query<RomajiQu
     match romanizer.romanize(&text, loanwords) {
         Ok(romaji) => plain_text(StatusCode::OK, romaji),
         Err(e) => {
-            log::error!("cannot convert {:?}: {}", text, e);
+            text_log!(error, "cannot convert {:?}: {}", text, e; "cannot convert a text: {}", e);
             plain_text(StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
         }
     }
@@ -176,7 +176,7 @@ async fn run_search(engine: &Arc<Engine>, params: SearchQuery, exclude: &[usize]
             json(StatusCode::OK, &outcome)
         }
         Err(e) => {
-            log::error!("cannot search {:?}: {}", text, e);
+            text_log!(error, "cannot search {:?}: {}", text, e; "cannot search: {}", e);
             server_error()
         }
     }
@@ -242,7 +242,7 @@ async fn hitomila_translate(State(state): State<Arc<AppState>>, Query(params): Q
             )
         }
         Err(e) => {
-            log::warn!("cannot translate {:?} with Hitomi.La: {}", text, e);
+            text_log!(warn, "cannot translate {:?} with Hitomi.La: {}", text, e; "cannot translate with Hitomi.La: {}", e);
             json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Hitomi.La did not answer" }))
         }
     }
@@ -270,7 +270,7 @@ async fn google_translate(State(state): State<Arc<AppState>>, Query(params): Que
             )
         }
         Err(e) => {
-            log::warn!("cannot translate {:?} with Google Translate: {}", text, e);
+            text_log!(warn, "cannot translate {:?} with Google Translate: {}", text, e; "cannot translate with Google Translate: {}", e);
             json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "Google Translate did not answer" }))
         }
     }
@@ -298,7 +298,7 @@ async fn auto_translate(State(state): State<Arc<AppState>>, Query(params): Query
             )
         }
         Err(e) => {
-            log::warn!("cannot translate {:?}: {}", text, e);
+            text_log!(warn, "cannot translate {:?}: {}", text, e; "cannot translate: {}", e);
             json(StatusCode::BAD_GATEWAY, &serde_json::json!({ "detail": "neither Hitomi.La nor Google Translate answered" }))
         }
     }
@@ -395,7 +395,7 @@ async fn magazine(State(state): State<Arc<AppState>>, Query(params): Query<Magaz
         Ok(Some(found)) => found,
         Ok(None) => return json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "detail": "the copy of the works is not ready yet" })),
         Err(e) => {
-            log::error!("cannot look up the work {:?}: {}", title, e);
+            text_log!(error, "cannot look up the work {:?}: {}", title, e; "cannot look up a work: {}", e);
             return json(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "detail": "cannot read the copy of the catalogue" }));
         }
     };
@@ -488,7 +488,7 @@ async fn issue_works(State(state): State<Arc<AppState>>, Query(params): Query<Ma
         Ok(Some(None)) => json(StatusCode::NOT_FOUND, &serde_json::json!({ "detail": "no such issue" })),
         Ok(None) => json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({ "detail": "the copy of the works is not ready yet" })),
         Err(e) => {
-            log::error!("cannot list the works of {:?}: {}", name, e);
+            text_log!(error, "cannot list the works of {:?}: {}", name, e; "cannot list the works of a magazine: {}", e);
             json(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "detail": "cannot read the copy of the catalogue" }))
         }
     }
