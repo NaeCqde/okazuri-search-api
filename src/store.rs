@@ -1233,9 +1233,9 @@ impl SearchStore {
         Ok(forgotten)
     }
 
-    /// The SQL of the row numbers of the works that a `Matcher` finds through the indexes (every site: the works of a site are told apart
-    /// after the rows are read, a site in the query makes the index walk the long list of its works).
-    fn rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+    /// The two searches of a `Matcher` in the language of FTS5: the one of the pieces of 3 characters or more (the trigram index), and the one of the
+    /// shorter words (the index of words).
+    fn match_texts(matcher: &crate::query::Matcher) -> (Option<String>, Option<String>) {
         let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
         let long = (!matcher.long.is_empty()).then(|| {
             let pieces = matcher.long.iter().map(|piece| quote(piece)).collect::<Vec<_>>().join(" AND ");
@@ -1247,6 +1247,14 @@ impl SearchStore {
 
             format!("title_romaji : ({words})")
         });
+
+        (long, short)
+    }
+
+    /// The SQL of the row numbers of the works that a `Matcher` finds through the indexes (every site: the works of a site are told apart
+    /// after the rows are read, a site in the query makes the index walk the long list of its works). All the rows, for a count.
+    fn rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+        let (long, short) = Self::match_texts(matcher);
 
         match (long, short) {
             (Some(long), Some(short)) => (
@@ -1317,18 +1325,38 @@ impl SearchStore {
         Ok(crawl_state::Entity::find().order_by_asc(crawl_state::Column::Website).all(&self.reader).await?)
     }
 
+    /// The SQL of the row numbers of the newest works that a `Matcher` finds, the newest first, with a `LIMIT ?` to bind after its values. With
+    /// pieces and short words, the rows of the pieces are walked from the newest and each is asked of the index of words by its row number: it
+    /// stops at the `limit`th row, and the list of a word that most titles have (`no`) is not built (the join of the two lists of `rowids`
+    /// takes seconds for it).
+    fn newest_rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+        match Self::match_texts(matcher) {
+            (Some(long), Some(short)) => (
+                "SELECT r FROM (SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ? ORDER BY rowid DESC) f \
+                 WHERE EXISTS (SELECT 1 FROM works_words WHERE works_words MATCH ? AND rowid = f.r) LIMIT ?"
+                    .to_string(),
+                vec![long.into(), short.into()],
+            ),
+            _ => {
+                let (sql, values) = Self::rowids(matcher);
+
+                (format!("SELECT r FROM ({sql}) ORDER BY r DESC LIMIT ?"), values)
+            }
+        }
+    }
+
     /// The `limit` works that `matcher` finds, the last added first: (site, work). The order is the order of the rows, so the same request
     /// is answered in the same order every time.
     pub async fn top_found(&self, matcher: &crate::query::Matcher, limit: usize) -> Result<Vec<(String, Candidate)>> {
         use sea_orm::FromQueryResult;
 
-        let (sql, mut values) = Self::rowids(matcher);
+        let (sql, mut values) = Self::newest_rowids(matcher);
         values.push((limit as i64).into());
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
             format!(
                 "SELECT w.website, w.path, w.title, w.title_romaji, w.title_key, w.language FROM works w \
-                 JOIN (SELECT r FROM ({sql}) ORDER BY r DESC LIMIT ?) x ON w.rowid = x.r ORDER BY x.r DESC"
+                 JOIN ({sql}) x ON w.rowid = x.r ORDER BY x.r DESC"
             ),
             values,
         );
