@@ -2,6 +2,25 @@
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+static LOG_QUERIES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets which log lines have the text of a query (`[log] queries`); the config sets it when it is read.
+pub fn set_log_queries(mode: crate::config::LogQueries) {
+    LOG_QUERIES.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a log line of this level (`"info"`, `"warn"`...) has the text of a query: never (`off`), only a failure (`errors`: warnings and
+/// errors), or every line (`all`).
+pub fn log_text(level: &str) -> bool {
+    use crate::config::LogQueries;
+
+    match LOG_QUERIES.load(std::sync::atomic::Ordering::Relaxed) {
+        x if x == LogQueries::All as u8 => true,
+        x if x == LogQueries::Errors as u8 => matches!(level, "warn" | "error"),
+        _ => false,
+    }
+}
+
 /// Seconds since 1970-01-01 UTC.
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -92,6 +111,19 @@ pub fn is_kana(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_query_is_in_a_log_line_as_the_setting_says() {
+        use crate::config::LogQueries;
+
+        set_log_queries(LogQueries::Off);
+        assert!(!log_text("info") && !log_text("warn") && !log_text("error"));
+        set_log_queries(LogQueries::Errors);
+        assert!(!log_text("info") && !log_text("debug") && log_text("warn") && log_text("error"));
+        set_log_queries(LogQueries::All);
+        assert!(log_text("info") && log_text("warn"));
+        set_log_queries(LogQueries::Off);
+    }
+
     use super::*;
 
     #[test]
