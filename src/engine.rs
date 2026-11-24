@@ -153,6 +153,26 @@ fn without_the(english: &str) -> String {
     }
 }
 
+/// `Otokonoko (feminine-looking boy)` -> `Otokonoko`: Google adds a note in parentheses to a short word, and it is no part of a title. What is left
+/// when nothing would be (`(a)`) is the text as it is.
+fn without_notes(english: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+
+    for c in english.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if out.is_empty() { english.trim().to_string() } else { out }
+}
+
 /// The two languages that are translated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -1516,7 +1536,18 @@ impl Engine {
     /// the saved one is the answer unless `live` is `on`, and so is a saved translation of the other direction when its title
     /// is the whole text. Google is always asked when nothing is saved (there is no `off` for it: `off` is `diff`). In
     /// English a translation from Japanese does not start with `The`: it is taken off (Google puts it in front of a title).
+    /// A note in parentheses that Google adds to the English of a Japanese text is left out, unless the text has parentheses of its own.
     pub async fn translate_google(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
+        let (mut translation, saved) = self.google_translation(text, from, live).await?;
+
+        if from == Lang::Japanese && !text.contains(['(', '（']) {
+            translation.english = without_notes(&translation.english);
+        }
+
+        Ok((translation, saved))
+    }
+
+    async fn google_translation(self: &Arc<Self>, text: &str, from: Lang, live: Live) -> Result<(Translation, bool)> {
         let key = crate::hitomi::squash(text);
 
         if key.is_empty() {
@@ -2567,6 +2598,14 @@ pub(crate) mod tests {
         // a space the user typed is kept; text in the Latin alphabet is not touched
         let plan = engine.plan("ふぃに COMIC").unwrap();
         assert_eq!(Terms::new(&plan.words).keys(), ["fini", "comic"]);
+    }
+
+    #[test]
+    fn a_note_in_parentheses_is_taken_off_the_translation() {
+        assert_eq!(without_notes("Otokonoko (feminine-looking boy)"), "Otokonoko");
+        assert_eq!(without_notes("A (b (c)) d"), "A d");
+        assert_eq!(without_notes("(a)"), "(a)");
+        assert_eq!(without_notes("Nine Lives"), "Nine Lives");
     }
 
     #[tokio::test]
