@@ -298,6 +298,8 @@ impl Romanizer {
             let no_space = word.pos1 == "接頭辞"
                 || next.is_some_and(|n| n.pos1 == "補助記号" || n.pos1 == "接尾辞")
                 || next.is_some_and(|n| n.surface == ",")
+                // 羅生|門: UniDic cuts a name it does not know (a proper noun in kanji) from the one character that ends it; a title writes `Rashoumon`
+                || (word.pos2 == "固有名詞" && self.is_kanji_noun(word) && next.is_some_and(|n| !n.white_space && n.surface.chars().count() == 1 && self.is_kanji_noun(n)))
                 || (foreign && romaji.ends_with('-'))
                 || next.is_some_and(|n| n.pos2 == "接続助詞")
                 || (is_digits(&word.surface) && next.is_some_and(|n| is_digits(&n.surface)))
@@ -319,6 +321,14 @@ impl Romanizer {
         }
 
         out
+    }
+
+    /// A noun that is written in kanji only (not a number, not a word that has an exception of its own).
+    fn is_kanji_noun(&self, word: &Word) -> bool {
+        word.pos1 == "名詞"
+            && word.pos2 != "数詞"
+            && !self.exceptions.contains_key(&word.surface)
+            && word.surface.chars().all(|c| matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '々'))
     }
 
     /// `Cutlet.romaji_word`: the romaji of one word.
@@ -640,6 +650,14 @@ mod tests {
         assert_eq!(romaji("三つ巴"), "mitsudomoe");
         assert_eq!(romaji("三つ編み"), "mitsuami");
         assert_eq!(romaji("二つ名"), "futatsu mei");
+    }
+
+    #[test]
+    fn a_name_in_kanji_is_not_cut_from_its_last_character() {
+        assert_eq!(romaji("羅生門"), "rashoumon");
+        // two words of the dictionary stay two words
+        assert_eq!(romaji("魔法少女"), "mahou shoujo");
+        assert_eq!(romaji("温泉旅行"), "onsen ryokou");
     }
 
     #[test]
