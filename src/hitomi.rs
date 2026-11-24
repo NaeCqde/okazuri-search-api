@@ -658,4 +658,22 @@ mod tests {
         assert_eq!(link.extra.uploader, None, "nobody posted it that the site tells");
         assert_eq!(link.extra.posted_at, Some(1_672_363_380), "2022-12-30 01:23 UTC");
     }
+
+    #[test]
+    fn a_gallery_with_no_artist_or_no_group_is_read() {
+        let gallery = |lists: &str| parse_gallery(1, &format!(r#"var galleryinfo = {{"title":"T","files":[{{}}]{lists}}};"#)).unwrap().link().extra;
+        let names = |extra: &crate::sites::Extra| extra.tags.iter().map(|tag| (tag.name.clone(), tag.kind.code())).collect::<Vec<_>>();
+
+        // no artist (the list is null, empty or not there) and a group
+        for lists in [r#","artists":null,"groups":[{"group":"circle"}]"#, r#","artists":[],"groups":[{"group":"circle"}]"#, r#","groups":[{"group":"circle"}]"#] {
+            assert_eq!(names(&gallery(lists)), [("circle".to_string(), 2)], "{lists}");
+        }
+        // an artist and no group
+        assert_eq!(names(&gallery(r#","artists":[{"artist":"fini"}],"groups":null"#)), [("fini".to_string(), 1)]);
+        // neither, no tags, no date, no kind: nothing, and it is still a work
+        let nothing = gallery(r#","artists":null,"groups":null,"tags":null,"date":null"#);
+        assert!(nothing.is_empty());
+        // a date that cannot be read is no date
+        assert_eq!(gallery(r#","date":"yesterday""#).posted_at, None);
+    }
 }

@@ -1156,4 +1156,22 @@ mod tests {
         assert_eq!(extra.uploader, Some(Account { id: "masterreviewer1000".into(), name: "masterreviewer1000".into() }));
         assert_eq!(extra.posted_at, Some(1_755_954_300), "2025-08-23 13:05 UTC");
     }
+
+    #[test]
+    fn an_ehentai_row_with_no_tags_no_uploader_or_no_date_is_read() {
+        let site = Site::new(SITES.iter().find(|d| d.name == "EHentai").unwrap());
+        // the uploader is gone (no link), no tag, a date
+        let row = |inner: &str| format!(r#"<table><tr><td class="gl2c"><div id="posted_7">2025-01-02 03:04</div></td><td class="gl3c glname"><a href="https://e-hentai.org/g/7/abc/"><div class="glink">T</div>{inner}</a></td></tr></table>"#);
+        let links = site.extract("https://e-hentai.org/", &row(""), 10);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].extra.uploader, None);
+        assert!(links[0].extra.tags.is_empty());
+        assert_eq!(links[0].extra.posted_at, Some(epoch(2025, 1, 2, 3, 4)));
+
+        // nothing at all but the title: the work has an empty extra
+        let bare = r#"<table><tr><td class="gl3c glname"><a href="https://e-hentai.org/g/8/abc/"><div class="glink">T</div></a></td></tr></table>"#;
+        let links = site.extract("https://e-hentai.org/", bare, 10);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].extra.is_empty());
+    }
 }
