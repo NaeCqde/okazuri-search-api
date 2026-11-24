@@ -164,13 +164,15 @@ pub struct SearchStore {
     tag_romaji: std::sync::Mutex<HashMap<i64, String>>,
     /// The tags by their key (what a query piece is compared with), with the boost of each in thousandths, and when they were read.
     tag_keys: std::sync::Mutex<Option<(Instant, HashMap<String, Vec<(u64, u32)>>)>>,
+    /// The boost of a match by the kind of the tag (`[search] tag_boost`).
+    kind_boost: std::sync::Mutex<[f64; 4]>,
 }
 
 /// How long the tags kept in memory for the boosts are used before they are read again.
 const TAG_KEYS_FOR: Duration = Duration::from_secs(60);
 
 /// How much a match of a tag adds to the score, by kind (`TagKind`: a tag, an author, a circle, a weak tag), before the weight of the tag.
-const KIND_BOOST: [f64; 4] = [1.0, 6.0, 4.0, 0.25];
+pub const KIND_BOOST: [f64; 4] = [1.0, 6.0, 4.0, 0.25];
 
 impl SearchStore {
     pub async fn open(path: &Path) -> Result<Self> {
@@ -218,7 +220,7 @@ impl SearchStore {
             None => db.clone(),
         };
 
-        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default() };
+        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default(), kind_boost: std::sync::Mutex::new(KIND_BOOST) };
         store.fill_text_index(dir.as_deref()).await?;
 
         Ok(store)
@@ -415,10 +417,11 @@ impl SearchStore {
         if stale {
             let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT id, kind, romaji, weight FROM tags")).await?;
             let mut keys: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
+            let kind_boost = *self.kind_boost.lock().map_err(|_| "the boosts are poisoned")?;
 
             for row in rows {
                 let (id, kind, romaji, weight): (i64, i64, String, f64) = (row.try_get("", "id")?, row.try_get("", "kind")?, row.try_get("", "romaji")?, row.try_get("", "weight")?);
-                let milli = (KIND_BOOST.get(kind as usize).copied().unwrap_or(1.0) * weight * 1000.0).round().max(0.0) as u32;
+                let milli = (kind_boost.get(kind as usize).copied().unwrap_or(1.0) * weight * 1000.0).round().max(0.0) as u32;
 
                 keys.entry(title_key(&romaji)).or_default().push((id as u64, milli));
             }
@@ -1671,6 +1674,20 @@ impl SearchStore {
     }
 
     /// The most rows a search of the database reads when the indexes cannot answer it (the newest ones are kept).
+    /// Sets the boost of a match by the kind of the tag (the names of `[search] tag_boost`: `tag`, `author`, `circle`, `weak`). An unknown name is an error.
+    pub fn set_kind_boost(&self, boosts: &std::collections::BTreeMap<String, f64>) -> Result<()> {
+        let mut now = KIND_BOOST;
+
+        for (name, boost) in boosts {
+            let place = ["tag", "author", "circle", "weak"].iter().position(|kind| kind == name).ok_or_else(|| format!("[search] tag_boost: {name} is not a kind of tag (tag, author, circle, weak)"))?;
+            now[place] = *boost;
+        }
+        *self.kind_boost.lock().map_err(|_| "the boosts are poisoned")? = now;
+        *self.tag_keys.lock().map_err(|_| "the tags are poisoned")? = None;
+
+        Ok(())
+    }
+
     pub fn set_max_candidates(&self, most: usize) {
         self.max_candidates.store(most as u64, std::sync::atomic::Ordering::Relaxed);
     }

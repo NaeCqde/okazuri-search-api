@@ -102,6 +102,9 @@ pub struct SearchConfig {
     /// How many of the first works that an answer finds are put in order by how good they are (the words start words of the title, not the middle of one);
     /// the good ones first, each group in the order of the rows. The works after them stay in the order of the rows. 0: no such order.
     pub rank_window: usize,
+    /// How much a query that names a tag adds to the score, by what the tag is (`tag`, `author`, `circle`, `weak`; the weight of the tag in the
+    /// `tags` table counts too). A kind that is not here keeps its default (1, 6, 4, 0.25).
+    pub tag_boost: BTreeMap<String, f64>,
     /// Names of the sites (`GET /okazuri/sites`) that are left out.
     pub disabled_sites: Vec<String>,
     /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
@@ -140,6 +143,7 @@ impl Default for SearchConfig {
             max_results: 100,
             max_candidates: 800_000,
             rank_window: 2000,
+            tag_boost: BTreeMap::new(),
             disabled_sites: Vec::new(),
             skip_crawled: false,
             pin_db: false,
