@@ -61,7 +61,7 @@ const READERS: u32 = 4;
 
 
 /// The version of the keys and the indexes (`PRAGMA user_version`).
-const INDEX_VERSION: i64 = 1;
+const INDEX_VERSION: i64 = 2;
 
 /// How many works are put in the text index at a time.
 const INDEX_FILL_CHUNK: i64 = 50_000;
@@ -70,14 +70,19 @@ const INDEX_FILL_CHUNK: i64 = 50_000;
 /// A work the index found, with its row number.
 #[derive(Debug, sea_orm::FromQueryResult)]
 struct IndexedRow {
-    #[allow(dead_code)]
     r: i64,
     website: String,
     path: String,
     title: String,
     title_romaji: String,
-    title_key: String,
     language: Option<String>,
+}
+
+impl IndexedRow {
+    /// The key of what is outside the parentheses of the romaji (`query::outside_key`): what the search matches.
+    fn key(&self) -> String {
+        outside_key(&self.title_romaji)
+    }
 }
 
 /// A work a search reads, as it is kept: the site is a number (a search of 700,000 works does not hash 700,000 names), and the one thing that
@@ -222,7 +227,7 @@ impl SearchStore {
             .try_get("", "user_version")?;
 
         if version < INDEX_VERSION {
-            log::info!("the search database is changed to version {INDEX_VERSION}: the keys and the indexes are made again");
+            log::info!("the search database is changed to version {INDEX_VERSION}: the FTS5 indexes are dropped");
             for sql in [
                 "DROP TRIGGER IF EXISTS works_fts_insert",
                 "DROP TRIGGER IF EXISTS works_fts_delete",
@@ -236,7 +241,19 @@ impl SearchStore {
                 db.execute_unprepared(sql).await?;
             }
 
-            Self::rewrite_keys(db).await?;
+        }
+
+        // the key of a title is made from its romaji when it is needed (`query::outside_key`): the column that kept it is dropped (the table is written
+        // again, which takes a few minutes for ten million works)
+        let has_key = db
+            .query_one(Statement::from_string(db.get_database_backend(), "SELECT 1 AS x FROM pragma_table_info('works') WHERE name = 'title_key'"))
+            .await?
+            .is_some();
+
+        if has_key {
+            log::info!("the column title_key is dropped from the works");
+            db.execute_unprepared("DROP TRIGGER IF EXISTS works_queue_update").await?;
+            db.execute_unprepared("ALTER TABLE works DROP COLUMN title_key").await?;
         }
 
         // the text index is a directory beside the database (`textindex.rs`): the changes of the works are queued by three triggers, and the
@@ -251,7 +268,7 @@ impl SearchStore {
             "CREATE TABLE IF NOT EXISTS index_queue (seq INTEGER PRIMARY KEY AUTOINCREMENT, row INTEGER NOT NULL)",
             "CREATE TRIGGER IF NOT EXISTS works_queue_insert AFTER INSERT ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
             "CREATE TRIGGER IF NOT EXISTS works_queue_delete AFTER DELETE ON works BEGIN INSERT INTO index_queue(row) VALUES (old.rowid); END",
-            "CREATE TRIGGER IF NOT EXISTS works_queue_update AFTER UPDATE OF title, title_key, title_romaji ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
+            "CREATE TRIGGER IF NOT EXISTS works_queue_update AFTER UPDATE OF title, title_romaji ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
         ] {
             db.execute_unprepared(sql).await?;
         }
@@ -299,16 +316,17 @@ impl SearchStore {
                 .db
                 .query_all(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
-                    "SELECT rowid AS r, title, title_romaji, title_key FROM works WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    "SELECT rowid AS r, title, title_romaji FROM works WHERE rowid > ? ORDER BY rowid LIMIT ?",
                     [after.into(), INDEX_FILL_CHUNK.into()],
                 ))
                 .await?;
             let Some(end) = rows.last() else { break };
             after = end.try_get("", "r")?;
 
-            let rows: Vec<(i64, String, String, String)> =
-                rows.iter().map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "title_key")?))).collect::<Result<_>>()?;
-            let docs: Vec<Doc> = rows.iter().map(|(rowid, title, romaji, key)| Doc { rowid: *rowid, key, romaji, title }).collect();
+            let rows: Vec<(i64, String, String)> =
+                rows.iter().map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?))).collect::<Result<_>>()?;
+            let keys: Vec<String> = rows.iter().map(|(_, _, romaji)| outside_key(romaji)).collect();
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji), key)| Doc { rowid: *rowid, key, romaji, title }).collect();
             self.text.fill(&docs)?;
             filled += docs.len() as u64;
         }
@@ -362,55 +380,20 @@ impl SearchStore {
                 .db
                 .query_all(Statement::from_sql_and_values(
                     backend,
-                    "SELECT w.rowid AS r, w.title, w.title_romaji, w.title_key FROM json_each(?) j JOIN works w ON w.rowid = j.value",
+                    "SELECT w.rowid AS r, w.title, w.title_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value",
                     [serde_json::to_string(&rowids)?.into()],
                 ))
                 .await?;
-            let rows: Vec<(i64, String, String, String)> =
-                rows.iter().map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "title_key")?))).collect::<Result<_>>()?;
+            let rows: Vec<(i64, String, String)> =
+                rows.iter().map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?))).collect::<Result<_>>()?;
             let found: HashSet<i64> = rows.iter().map(|row| row.0).collect();
             let gone: Vec<i64> = rowids.iter().copied().filter(|rowid| !found.contains(rowid)).collect();
-            let docs: Vec<Doc> = rows.iter().map(|(rowid, title, romaji, key)| Doc { rowid: *rowid, key, romaji, title }).collect();
+            let keys: Vec<String> = rows.iter().map(|(_, _, romaji)| outside_key(romaji)).collect();
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji), key)| Doc { rowid: *rowid, key, romaji, title }).collect();
             self.text.replace(&docs, &gone)?;
         }
 
         self.db.execute(Statement::from_sql_and_values(backend, "DELETE FROM index_queue WHERE seq <= ?", [last.into()])).await?;
-
-        Ok(())
-    }
-
-    /// Writes the key of what is outside the parentheses of the romaji into `title_key`, for every work whose key is another one.
-    async fn rewrite_keys(db: &DatabaseConnection) -> Result<()> {
-        let backend = db.get_database_backend();
-        let (mut after, mut written) = (0_i64, 0_usize);
-
-        loop {
-            let rows = db
-                .query_all(Statement::from_sql_and_values(
-                    backend,
-                    "SELECT rowid AS r, title_romaji, title_key FROM works WHERE rowid > ? ORDER BY rowid LIMIT 20000",
-                    [after.into()],
-                ))
-                .await?;
-            let Some(last) = rows.last() else { break };
-            after = last.try_get("", "r")?;
-
-            let transaction = db.begin().await?;
-            for row in &rows {
-                let (rowid, romaji, key): (i64, String, String) = (row.try_get("", "r")?, row.try_get("", "title_romaji")?, row.try_get("", "title_key")?);
-                let outside = outside_key(&romaji);
-
-                if outside != key {
-                    transaction
-                        .execute(Statement::from_sql_and_values(backend, "UPDATE works SET title_key = ? WHERE rowid = ?", [outside.into(), rowid.into()]))
-                        .await?;
-                    written += 1;
-                }
-            }
-            transaction.commit().await?;
-        }
-
-        log::info!("title_key: {written} keys written");
 
         Ok(())
     }
@@ -641,7 +624,6 @@ impl SearchStore {
                     path: Set(item.path.clone()),
                     title: Set(item.title.clone()),
                     title_romaji: Set(item.romaji.clone()),
-                    title_key: Set(outside_key(&item.romaji)),
                     first_seen: Set(now),
                     updated_at: Set(now),
                     language: Set(item.language.clone()),
@@ -654,7 +636,6 @@ impl SearchStore {
                     let mut changed = known.clone().into_active_model();
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
-                    changed.title_key = Set(outside_key(&item.romaji));
                     changed.language = Set(item.language.clone());
                     changed.updated_at = Set(now);
                     changed.update(db).await?;
@@ -713,7 +694,6 @@ impl SearchStore {
                     .col_expr(work::Column::Deleted, Expr::value(true))
                     .col_expr(work::Column::Title, Expr::value(""))
                     .col_expr(work::Column::TitleRomaji, Expr::value(""))
-                    .col_expr(work::Column::TitleKey, Expr::value(""))
                     .col_expr(work::Column::Language, Expr::value(Option::<String>::None))
                     .exec(&transaction)
                     .await?;
@@ -1065,7 +1045,6 @@ impl SearchStore {
                     let romaji = language::strip_flags(&row.title_romaji);
                     work::Entity::update_many()
                         .col_expr(work::Column::Title, Expr::value(title))
-                        .col_expr(work::Column::TitleKey, Expr::value(outside_key(&romaji)))
                         .col_expr(work::Column::TitleRomaji, Expr::value(romaji))
                         .col_expr(work::Column::Language, Expr::value(now))
                         .filter(work::Column::Website.eq(row.website.as_str()))
@@ -1308,7 +1287,6 @@ impl SearchStore {
         for (known, romaji) in changes {
             let mut changed = known.clone().into_active_model();
             changed.title_romaji = Set(romaji.clone());
-            changed.title_key = Set(outside_key(romaji));
             changed.language = Set(language::detect(&known.title).or(known.language.clone()));
             changed.update(&transaction).await?;
 
@@ -1342,7 +1320,7 @@ impl SearchStore {
 
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
-            "SELECT w.rowid AS r, w.website, w.path, w.title, w.title_romaji, w.title_key, w.language FROM json_each(?) j JOIN works w ON w.rowid = j.value ORDER BY j.key",
+            "SELECT w.rowid AS r, w.website, w.path, w.title, w.title_romaji, w.language FROM json_each(?) j JOIN works w ON w.rowid = j.value ORDER BY j.key",
             [serde_json::to_string(rowids)?.into()],
         );
 
@@ -1357,7 +1335,7 @@ impl SearchStore {
 
         for chunk in rowids.chunks(INDEX_FILL_CHUNK as usize) {
             for row in self.load(chunk).await? {
-                if matcher.accepts(&row.title_key, &row.title_romaji) {
+                if matcher.accepts(&row.key(), &row.title_romaji) {
                     websites.push(row.website);
                 }
             }
@@ -1422,13 +1400,13 @@ impl SearchStore {
         loop {
             let rowids = self.text.best(matcher, 0, read)?;
             let exhausted = rowids.len() < read;
-            let found: Vec<IndexedRow> = self.load(&rowids).await?.into_iter().filter(|row| matcher.accepts(&row.title_key, &row.title_romaji)).collect();
+            let found: Vec<IndexedRow> = self.load(&rowids).await?.into_iter().filter(|row| matcher.accepts(&row.key(), &row.title_romaji)).collect();
 
             if found.len() >= limit || exhausted {
                 return Ok(found
                     .into_iter()
                     .take(limit)
-                    .map(|row| (row.website, Candidate { site: 0, path: row.path, title: row.title, title_romaji: row.title_romaji, title_key: row.title_key, language: row.language }))
+                    .map(|row| (row.website, Candidate { site: 0, path: row.path, title: row.title, title_key: outside_key(&row.title_romaji), title_romaji: row.title_romaji, language: row.language }))
                     .collect());
             }
 
@@ -1454,38 +1432,69 @@ impl SearchStore {
     /// The row numbers of the works whose title key has every one of `parts` in it, the last added first, at most `most`. The index finds the
     /// pieces as trigrams (a work may have them apart): the caller matches the words again.
     async fn candidate_rowids(&self, parts: &[&str], most: u64) -> Result<Vec<i64>> {
-        use sea_orm::Value;
-
         self.sync_index().await?;
         // the index has the pieces of 3 characters or more, and the short words made of letters and digits (`ai` is not `maid`); any other short
         // piece (Japanese, a symbol) is looked for in the keys of the works the others leave (in all the works when there is no other)
         let (long, short): (Vec<&str>, Vec<&str>) = parts.iter().copied().partition(|part| part.chars().count() >= 3);
         let (words, loose): (Vec<&str>, Vec<&str>) = short.into_iter().partition(|part| part.chars().all(|c| c.is_ascii_alphanumeric()));
         let matcher = crate::query::Matcher { long: long.iter().map(|s| s.to_string()).collect(), short: words.iter().map(|s| s.to_string()).collect(), ..Default::default() };
-        let backend = self.reader.get_database_backend();
-        let like: Vec<String> = loose.iter().map(|_| "instr(w.title_key, ?) > 0".to_string()).collect();
-        let condition = if like.is_empty() { String::new() } else { format!("WHERE {}", like.join(" AND ")) };
-        let mut values: Vec<Value> = loose.iter().map(|part| (*part).into()).collect();
         let narrowed = !matcher.long.is_empty() || !matcher.short.is_empty();
+        let backend = self.reader.get_database_backend();
 
-        let statement = if narrowed {
-            let mut rowids = self.text.all(&matcher)?;
-            rowids.reverse();
-
-            if like.is_empty() {
+        // the works that the index finds, the last added first (all the works when it has nothing to look for)
+        if loose.is_empty() {
+            if narrowed {
+                let mut rowids = self.text.all(&matcher)?;
+                rowids.reverse();
                 rowids.truncate(most as usize);
+
                 return Ok(rowids);
             }
 
-            values.insert(0, serde_json::to_string(&rowids)?.into());
-            values.push((most as i64).into());
-            Statement::from_sql_and_values(backend, format!("SELECT w.rowid AS r FROM json_each(?) j JOIN works w ON w.rowid = j.value {condition} ORDER BY j.key LIMIT ?"), values)
-        } else {
-            values.push((most as i64).into());
-            Statement::from_sql_and_values(backend, format!("SELECT w.rowid AS r FROM works w {condition} ORDER BY w.rowid DESC LIMIT ?"), values)
-        };
+            let rows = self.reader.query_all(Statement::from_sql_and_values(backend, "SELECT rowid AS r FROM works ORDER BY rowid DESC LIMIT ?", [(most as i64).into()])).await?;
 
-        self.reader.query_all(statement).await?.iter().map(|row| Ok(row.try_get("", "r")?)).collect()
+            return rows.iter().map(|row| Ok(row.try_get("", "r")?)).collect();
+        }
+
+        // a short piece that is not letters or digits is looked for in the keys of the works the others leave, chunk by chunk
+        let mut found: Vec<i64> = Vec::new();
+        let mut rest: Vec<i64> = if narrowed { self.text.all(&matcher)? } else { Vec::new() };
+        rest.reverse();
+        let mut before = i64::MAX;
+
+        loop {
+            let chunk: Vec<i64> = if narrowed {
+                let at = rest.len().min(INDEX_FILL_CHUNK as usize);
+                rest.drain(..at).collect()
+            } else {
+                let rows = self
+                    .reader
+                    .query_all(Statement::from_sql_and_values(backend, "SELECT rowid AS r FROM works WHERE rowid < ? ORDER BY rowid DESC LIMIT ?", [before.into(), INDEX_FILL_CHUNK.into()]))
+                    .await?;
+                let ids: Vec<i64> = rows.iter().map(|row| Ok(row.try_get("", "r")?)).collect::<Result<_>>()?;
+                before = ids.last().copied().unwrap_or(i64::MIN);
+                ids
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            for row in self.load(&chunk).await? {
+                let key = row.key();
+
+                if loose.iter().all(|part| key.contains(part)) {
+                    found.push(row.r);
+                }
+            }
+
+            if found.len() as u64 >= most {
+                found.truncate(most as usize);
+                break;
+            }
+        }
+
+        Ok(found)
     }
 
     async fn candidates_up_to(&self, parts: &[&str], most: u64) -> Result<Candidates> {
@@ -1511,8 +1520,8 @@ impl SearchStore {
                 site: site as u16,
                 path: row.path,
                 title: row.title,
+                title_key: outside_key(&row.title_romaji),
                 title_romaji: row.title_romaji,
-                title_key: row.title_key,
                 language: row.language,
             });
         }
@@ -1580,7 +1589,7 @@ mod tests {
         // the columns of the table are all there is
         assert_eq!(
             store.columns_of("works").await.unwrap(),
-            ["website", "path", "title", "title_romaji", "title_key", "first_seen", "updated_at", "language", "deleted", "checked_at"]
+            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at"]
         );
 
         let works = store.candidates_owned(&[]).await.unwrap();
@@ -1644,7 +1653,7 @@ mod tests {
         assert!(new.is_empty());
         let one = store.candidates_owned(&[]).await.unwrap().into_iter().find(|w| w.path == "/g/1/").unwrap();
         assert_eq!((one.title.as_str(), one.updated_at, one.first_seen), ("One (2nd)", 300, 100));
-        assert_eq!(one.title_key, "one", "the key is the key of what is outside the parentheses");
+        assert_eq!(outside_key(&one.title_romaji), "one", "the key is the key of what is outside the parentheses");
     }
 
     #[tokio::test]
@@ -1692,7 +1701,7 @@ mod tests {
         // the list, the crawl and an import all bring /a again: it is left out
         store.save("q2", "Site", 300, &Ok(vec![work("/a"), work("/c")]), false).await.unwrap();
         store.save_crawled("Site", 300, &[work("/a"), work("/d")], None).await.unwrap();
-        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), title_key: "titlea".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None };
+        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None };
         assert_eq!(store.import_works(vec![gone]).await.unwrap(), 0);
         let mut found = paths(store.candidates_owned(&["title"]).await.unwrap()).await;
         found.sort();
@@ -1956,7 +1965,6 @@ mod tests {
             path: Set("/old".into()),
             title: Set("Old".into()),
             title_romaji: Set("old".into()),
-            title_key: Set("old".into()),
             language: Set(None),
             first_seen: Set(1),
             updated_at: Set(1),
@@ -2040,7 +2048,7 @@ mod tests {
     }
     /// What `instr` says: the works (the newest first) whose key has the piece.
     async fn by_instr(store: &SearchStore, part: &str, most: usize) -> Vec<String> {
-        store.candidates_owned(&[]).await.unwrap().into_iter().filter(|w| w.title_key.contains(part)).take(most).map(|w| w.path).collect()
+        store.candidates_owned(&[]).await.unwrap().into_iter().filter(|w| outside_key(&w.title_romaji).contains(part)).take(most).map(|w| w.path).collect()
     }
 
     async fn paths(works: Vec<Work>) -> Vec<String> {
@@ -2158,8 +2166,9 @@ mod tests {
         // the database of version 0: the key is the key of the whole title, and the indexes have no site
         for sql in [
             "PRAGMA user_version = 0",
-            "INSERT INTO works VALUES ('Site', '/g/1/', 'One (Comic Two)', 'one (comic two)', 'one(comictwo)', 1, 1, NULL, 0, NULL)",
-            "INSERT INTO works VALUES ('Site', '/g/2/', 'Comic Two', 'comic two', 'comictwo', 2, 2, NULL, 0, NULL)",
+            "ALTER TABLE works ADD COLUMN title_key TEXT NOT NULL DEFAULT ''",
+            "INSERT INTO works (website, path, title, title_romaji, title_key, first_seen, updated_at, language, deleted, checked_at) VALUES ('Site', '/g/1/', 'One (Comic Two)', 'one (comic two)', 'one(comictwo)', 1, 1, NULL, 0, NULL)",
+            "INSERT INTO works (website, path, title, title_romaji, title_key, first_seen, updated_at, language, deleted, checked_at) VALUES ('Site', '/g/2/', 'Comic Two', 'comic two', 'comictwo', 2, 2, NULL, 0, NULL)",
         ] {
             store.db.execute_unprepared(sql).await.unwrap();
         }
@@ -2167,7 +2176,8 @@ mod tests {
 
         let store = SearchStore::open(&path).await.unwrap();
         let works = store.candidates_owned(&[]).await.unwrap();
-        assert_eq!(works.iter().find(|w| w.path == "/g/1/").unwrap().title_key, "one", "the key is what is outside the parentheses");
+        assert_eq!(outside_key(&works.iter().find(|w| w.path == "/g/1/").unwrap().title_romaji), "one", "the key is what is outside the parentheses");
+        assert!(!store.columns_of("works").await.unwrap().contains(&"title_key".to_string()), "the column of the key is dropped");
 
         // the index has the new keys and the site: the work whose title has the words only in its parentheses is not found
         let matcher = crate::query::Matcher { long: vec!["comic".into()], ..Default::default() };
@@ -2194,7 +2204,7 @@ mod tests {
         // the database of a version that had no index: the works are there, the index is not (the directory of the index is gone)
         store
             .db
-            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 'kyoudai', 1, 1, NULL, 0, NULL), ('A', '/g/2/', 'Other', 'other', 'other', 2, 2, NULL, 0, NULL)")
+            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 1, 1, NULL, 0, NULL), ('A', '/g/2/', 'Other', 'other', 2, 2, NULL, 0, NULL)")
             .await
             .unwrap();
         drop(store);
