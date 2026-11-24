@@ -559,7 +559,13 @@ impl Engine {
                 let title = crate::language::strip_flags(&link.title);
                 let converted = romaji(&title, &self.romanizer).unwrap_or_else(|_| title.clone());
 
-                NewWork { path: link.path, title, romaji: converted, language }
+                let mut extra = link.extra;
+                if !extra.is_empty() {
+                    // the uploader and the tags are romanized the same way, one line each
+                    extra.romaji = extra.text().lines().map(|line| romaji(line, &self.romanizer).unwrap_or_else(|_| line.to_string())).collect::<Vec<_>>().join("\n");
+                }
+
+                NewWork { path: link.path, title, romaji: converted, language, extra }
             })
             .collect()
     }
@@ -2204,7 +2210,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_work_whose_romaji_changed_is_written_again_and_its_search_is_forgotten() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None };
+        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None, extra: Default::default() };
 
         // saved by an older version: the romaji of 彼女を was "kanojo wo"; the second work is the same as now
         store.save("q1", "Good", 7, &Ok(vec![work("/work/1", "彼女を", "kanojo wo")]), false).await.unwrap();
@@ -2228,7 +2234,7 @@ pub(crate) mod tests {
         let (engine, _, store) = setup(&config()).await;
 
         // an earlier search saved a work of the same words that this request will not find again
-        store.save("old", "Good", 1, &Ok(vec![NewWork { path: "/work/77".into(), title: "q earlier".into(), romaji: "q earlier".into(), language: None }]), false).await.unwrap();
+        store.save("old", "Good", 1, &Ok(vec![NewWork { path: "/work/77".into(), title: "q earlier".into(), romaji: "q earlier".into(), language: None, extra: Default::default() }]), false).await.unwrap();
 
         let outcome = engine.search(&Request::new("q")).await.unwrap();
         let by_path = |path: &str| outcome.results.iter().find(|h| h.path == path).map(|h| h.is_new);
@@ -2276,7 +2282,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_page_of_the_answer_is_a_part_of_the_whole_answer() {
         let (engine, _, _) = setup(&config()).await;
-        let works: Vec<NewWork> = (1..=7).map(|n| NewWork { path: format!("/work/{n}"), title: format!("Alpha {n}"), romaji: format!("alpha {n}"), language: None }).collect();
+        let works: Vec<NewWork> = (1..=7).map(|n| NewWork { path: format!("/work/{n}"), title: format!("Alpha {n}"), romaji: format!("alpha {n}"), language: None, extra: Default::default() }).collect();
         engine.store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
 
         let whole = engine.search(&Request { live: Live::Off, limit: 100, ..Request::new("alpha") }).await.unwrap();
@@ -2354,7 +2360,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_saved_work_answers_whatever_the_address_carries_besides_the_page() {
         let (engine, hits, _) = setup(&config()).await;
-        engine.store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/12".into(), title: "Saved title".into(), romaji: "saved title".into(), language: None }]), false).await.unwrap();
+        engine.store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/12".into(), title: "Saved title".into(), romaji: "saved title".into(), language: None, extra: Default::default() }]), false).await.unwrap();
         let origin = engine.sites[0].search_url("q").unwrap().split("/ok").next().unwrap().to_string();
         let page = format!("{origin}/work/12");
 
@@ -2524,7 +2530,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_answers_that_start_words_come_before_the_ones_that_have_the_words_in_the_middle() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         // the first one has `rashou` and `mon` in the middle of its words, and is the first row
         let titles = ["Kimera Shoujo ga Hoshii Mono", "Rashoumon", "rashou mon", "Hoge Rashoumon no Hanashi"];
         let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(n, title)).collect();
@@ -2540,7 +2546,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_spellings_that_are_one_word_are_found_and_the_spelling_of_the_query_comes_first() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         let titles = ["Jinsei o Dainashi", "Jinsei wo Dainashi", "Jinsei Oneesan Dainashi", "Shimbun no Hanashi", "Shinbun no Hanashi"];
         let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(n, title)).collect();
         store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
@@ -2563,7 +2569,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_indexes_answer_as_the_words_are_defined() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         let titles = ["Maid ai", "work (COMIC kairakuten 2018 8)", "COMIC kairakuten 2026 11", "ai no uta", "main maid", "kairakuten (ai)", "tokyo kairakuten", "Maid kairakuten ai", "ai"];
 
         // the same titles on two sites
@@ -2627,7 +2633,7 @@ pub(crate) mod tests {
         // the romaji of the Japanese title is what is searched; one work has the English words, one the Japanese ones, one both
         let japanese = engine.plan("九つの命").unwrap().query;
         assert!(Terms::new(&japanese).matcher().is_some() && Terms::new("Nine Lives").matcher().is_some());
-        let work = |n: usize, romaji: String| NewWork { path: format!("/work/{n}"), title: romaji.clone(), romaji, language: None };
+        let work = |n: usize, romaji: String| NewWork { path: format!("/work/{n}"), title: romaji.clone(), romaji, language: None, extra: Default::default() };
         let works = vec![work(1, "nine lives one".into()), work(2, format!("{japanese} two")), work(3, format!("nine lives {japanese} three")), work(4, "other".into())];
         store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
 
@@ -2667,7 +2673,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_same_address_is_one_result() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None, extra: Default::default() };
 
         // one page saved with and without the slash at the end, and a different page
         store.save("a", "Good", 1, &Ok(vec![work("/work/10/", "alpha one"), work("/work/11", "alpha two")]), false).await.unwrap();
@@ -2685,8 +2691,8 @@ pub(crate) mod tests {
         let (engine, _, store) = setup(&config()).await;
 
         // pages that are not the same page, as different queries find them
-        store.save("a", "Good", 1, &Ok(vec![NewWork { path: "/work/10".into(), title: "alpha beta one".into(), romaji: "alpha beta one".into(), language: None }]), false).await.unwrap();
-        store.save("b", "Good", 2, &Ok(vec![NewWork { path: "/work/11".into(), title: "gamma one".into(), romaji: "gamma one".into(), language: None }]), false).await.unwrap();
+        store.save("a", "Good", 1, &Ok(vec![NewWork { path: "/work/10".into(), title: "alpha beta one".into(), romaji: "alpha beta one".into(), language: None, extra: Default::default() }]), false).await.unwrap();
+        store.save("b", "Good", 2, &Ok(vec![NewWork { path: "/work/11".into(), title: "gamma one".into(), romaji: "gamma one".into(), language: None, extra: Default::default() }]), false).await.unwrap();
 
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("beta alpha") }).await.unwrap();
         assert_eq!(outcome.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["alpha beta one"], "any order");
@@ -2824,7 +2830,7 @@ pub(crate) mod tests {
     async fn a_title_that_has_the_query_in_parentheses_is_not_an_answer() {
         let (engine, _, store) = setup(&config()).await;
 
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         store
             .save(
                 "q",
@@ -2942,7 +2948,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_saved_works_of_a_site_that_is_off_or_excluded_are_in_the_answer() {
         let (engine, _, store) = setup(&SearchConfig { disabled_sites: vec!["good".into()], ..config() }).await;
-        let work = |n: usize| NewWork { path: format!("/work/{n}"), title: format!("saved title {n}"), romaji: format!("saved title {n}"), language: None };
+        let work = |n: usize| NewWork { path: format!("/work/{n}"), title: format!("saved title {n}"), romaji: format!("saved title {n}"), language: None, extra: Default::default() };
         store.save("q", "Good", 1, &Ok(vec![work(1)]), false).await.unwrap();
         store.save("q", "Failing", 1, &Ok(vec![work(2)]), false).await.unwrap();
 
@@ -3005,7 +3011,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_language_of_a_result_is_a_list_and_empty_when_the_title_names_none() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title) };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title), extra: Default::default() };
 
         store.save_crawled("Good", 1, &[work("/work/1", "kanojo [CN,EN,JP,KR]"), work("/work/2", "kanojo plain")], None).await.unwrap();
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
@@ -3019,7 +3025,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_english_title_of_a_result_is_the_title_a_pair_or_a_saved_translation_and_says_where_it_is_from() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title) };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title), extra: Default::default() };
         let row = |english: &str, japanese: &str, source: &str| crate::entity::translation::Model {
             key: crate::hitomi::squash(japanese),
             gallery_id: 0,

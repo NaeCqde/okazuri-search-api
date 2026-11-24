@@ -12,6 +12,7 @@
 
 use crate::query::has_japanese;
 use regex::{Regex, RegexBuilder};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use url::Url;
 
@@ -439,6 +440,95 @@ pub struct Link {
     pub path: String,
     /// The title as the list page writes it.
     pub title: String,
+    /// What else the list page shows of the work (tags, uploader, posted date); empty when the site shows none.
+    pub extra: Extra,
+}
+
+/// What a list page shows of a work besides its title. Every part is optional: a site shows what it shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extra {
+    /// The tags, flat: the namespace of E-Hentai (`female:`) is dropped, the category (`Cosplay`) is a tag, the hashtags of other sites are tags.
+    pub tags: Vec<String>,
+    /// The name of the uploader.
+    pub uploader: Option<String>,
+    /// When the work was posted, in seconds since the epoch (UTC).
+    pub posted_at: Option<i64>,
+    /// The romaji of the uploader and the tags (the uploader first, one line each), made with the title: what a query is matched with.
+    pub romaji: String,
+}
+
+impl Extra {
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.uploader.is_none() && self.posted_at.is_none()
+    }
+
+    /// The text of the uploader (the first line, empty when there is none) and the tags (one per line): what is romanized.
+    pub fn text(&self) -> String {
+        std::iter::once(self.uploader.clone().unwrap_or_default()).chain(self.tags.iter().cloned()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The tags as they are saved (one per line); `None` when there are none.
+    pub fn tags_text(&self) -> Option<String> {
+        (!self.tags.is_empty()).then(|| self.tags.join("\n"))
+    }
+
+    /// The romaji as it is saved; `None` when the list page showed nothing.
+    pub fn romaji_text(&self) -> Option<String> {
+        (!self.is_empty()).then(|| self.romaji.clone())
+    }
+}
+
+/// The works of an E-Hentai list page (the extended view the crawl reads), by gallery id: the category and the tags (flat), the uploader and the
+/// posted date, which the page shows for every row.
+fn ehentai_extras(html: &str) -> HashMap<String, Extra> {
+    static GID: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY: OnceLock<Regex> = OnceLock::new();
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    static UPLOADER: OnceLock<Regex> = OnceLock::new();
+    static POSTED: OnceLock<Regex> = OnceLock::new();
+    let gid = GID.get_or_init(|| Regex::new(r#"/g/(\d+)/"#).unwrap());
+    let category = CATEGORY.get_or_init(|| Regex::new(r#"<div class="cn c[a-z]+"[^>]*>([^<]+)</div>"#).unwrap());
+    let tag = TAG.get_or_init(|| Regex::new(r#"<div class="gt[a-z]*" title="([^"]+)""#).unwrap());
+    let uploader = UPLOADER.get_or_init(|| Regex::new(r#"/uploader/[^"]*">([^<]+)</a>"#).unwrap());
+    let posted = POSTED.get_or_init(|| Regex::new(r#"id="posted_\d+">(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)</div>"#).unwrap());
+    let mut found = HashMap::new();
+
+    for row in html.split("<tr>").skip(1) {
+        let Some(id) = gid.captures(row).map(|c| c[1].to_string()) else { continue };
+        let mut extra = Extra::default();
+
+        if let Some(c) = category.captures(row) {
+            extra.tags.push(decode(c[1].trim()).to_lowercase());
+        }
+        for c in tag.captures_iter(row) {
+            let label = decode(&c[1]);
+            // `female:big breasts` is `big breasts`; a tag that is the same twice (other namespaces) is kept once
+            let name = label.split_once(':').map_or(label.as_str(), |(_, name)| name).trim().to_lowercase();
+
+            if !name.is_empty() && !extra.tags.contains(&name) {
+                extra.tags.push(name);
+            }
+        }
+        extra.uploader = uploader.captures(row).map(|c| decode(c[1].trim())).filter(|name| !name.is_empty());
+        extra.posted_at = posted.captures(row).and_then(|c| {
+            let number = |n: usize| c[n].parse::<i64>().ok();
+            let (year, month, day) = (number(1)?, number(2)?, number(3)?);
+            // days since 1970-01-01 (the civil calendar)
+            let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
+            let era = y.div_euclid(400);
+            let yoe = y - era * 400;
+            let doy = (153 * m + 2) / 5 + day - 1;
+            let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+
+            Some(days * 86400 + number(4)? * 3600 + number(5)? * 60)
+        });
+
+        if !extra.is_empty() {
+            found.insert(id, extra);
+        }
+    }
+
+    found
 }
 
 impl Site {
@@ -591,7 +681,19 @@ impl Site {
                         known.path = path;
                     }
                 }
-                None => links.push(Link { path, title }),
+                None => links.push(Link { path, title, extra: Extra::default() }),
+            }
+        }
+
+        if self.def.name == "EHentai" {
+            let mut extras = ehentai_extras(html);
+
+            for link in &mut links {
+                let id = link.path.split('/').filter(|part| !part.is_empty()).nth(1).unwrap_or_default();
+
+                if let Some(extra) = extras.remove(id) {
+                    link.extra = extra;
+                }
             }
         }
 
@@ -778,7 +880,7 @@ mod tests {
     }
 
     fn link(path: &str, title: &str) -> Link {
-        Link { path: path.into(), title: title.into() }
+        Link { path: path.into(), title: title.into(), extra: Default::default() }
     }
 
     #[test]
@@ -997,5 +1099,18 @@ mod tests {
     fn character_references_are_decoded() {
         assert_eq!(decode("a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x3042;"), "a & b <c> \"d\" 'e' あ");
         assert_eq!(decode("&unknown; stays"), "&unknown; stays");
+    }
+
+    #[test]
+    fn an_ehentai_list_page_gives_the_category_the_tags_the_uploader_and_the_date() {
+        let html = r#"<table><tr><td class="gl1c glcat"><div class="cn cta" onclick="x">Cosplay</div></td><td class="gl2c"><div id="posted_3499941">2025-08-23 13:05</div></td><td class="gl3c glname"><a href="https://e-hentai.org/g/3499941/b977883039/"><div class="glink">[Reiki] To Grow</div><div><div class="gt" title="language:english">english</div><div class="gt" title="female:big ass">f:big ass</div><div class="gtl" title="other:glasses">glasses</div><div class="gt" title="male:big ass">m:big ass</div></div></a></td><td class="gl4c glhide"><div><a href="https://e-hentai.org/uploader/masterreviewer1000">masterreviewer1000</a></div></td></tr></table>"#;
+        let site = Site::new(SITES.iter().find(|d| d.name == "EHentai").unwrap());
+        let links = site.extract("https://e-hentai.org/", html, 10);
+
+        assert_eq!(links.len(), 1);
+        let extra = &links[0].extra;
+        assert_eq!(extra.tags, ["cosplay", "english", "big ass", "glasses"], "flat, the category first, no repeats");
+        assert_eq!(extra.uploader.as_deref(), Some("masterreviewer1000"));
+        assert_eq!(extra.posted_at, Some(1_755_954_300), "2025-08-23 13:05 UTC");
     }
 }

@@ -503,7 +503,7 @@ fn wordpress_links(site: &Site, body: &str) -> std::result::Result<Vec<Link>, St
             let path = site.path_of(post.get("link")?.as_str()?)?;
             let title = decode(post.get("title")?.get("rendered")?.as_str()?).trim().to_string();
 
-            (!title.is_empty()).then_some(Link { path, title })
+            (!title.is_empty()).then_some(Link { path, title, extra: Default::default() })
         })
         .collect())
 }

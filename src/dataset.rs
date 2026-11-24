@@ -131,7 +131,7 @@ mod tests {
     use std::io::Read;
 
     fn work(path: &str, title: &str) -> NewWork {
-        NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string(), language: crate::language::detect(title) }
+        NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string(), language: crate::language::detect(title), extra: Default::default() }
     }
 
     #[tokio::test]

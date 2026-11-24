@@ -146,6 +146,10 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                     language,
                     deleted: false,
                     checked_at: None,
+                    tags: None,
+                    uploader: None,
+                    posted_at: None,
+                    extra_romaji: None,
                 }
             })
             .collect::<Vec<_>>()
@@ -161,7 +165,7 @@ mod tests {
     use crate::store::NewWork;
 
     fn work(path: &str, title: &str) -> NewWork {
-        NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string(), language: crate::language::detect(title) }
+        NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string(), language: crate::language::detect(title), extra: Default::default() }
     }
 
     async fn filled() -> SearchStore {

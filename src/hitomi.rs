@@ -270,7 +270,7 @@ impl Gallery {
             _ => self.title.clone(),
         };
 
-        Link { path: self.path(), title }
+        Link { path: self.path(), title, extra: Default::default() }
     }
 }
 
@@ -574,8 +574,8 @@ mod tests {
         assert_eq!(
             search(&mut site, "kyoudai", 10).await.unwrap(),
             [
-                Link { path: "/galleries/30.html".into(), title: "Kyoudai de Shitara Ikemasen | 姉弟でシたらいけません".into() },
-                Link { path: "/galleries/10.html".into(), title: "Kyoudai Comic".into() },
+                Link { path: "/galleries/30.html".into(), title: "Kyoudai de Shitara Ikemasen | 姉弟でシたらいけません".into(), extra: Default::default() },
+                Link { path: "/galleries/10.html".into(), title: "Kyoudai Comic".into(), extra: Default::default() },
             ]
         );
     }

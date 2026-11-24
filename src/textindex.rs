@@ -58,6 +58,8 @@ pub struct Doc<'a> {
     pub key: &'a str,
     pub romaji: &'a str,
     pub title: &'a str,
+    /// The uploader (lower case romaji; empty when none): searched like the author of the title.
+    pub uploader: &'a str,
 }
 
 fn text(tokenizer: &str) -> TextOptions {
@@ -155,7 +157,7 @@ impl TextIndex {
             self.fields.key => doc.key,
             self.fields.words => doc.romaji,
             self.fields.starts => starts.join(" "),
-            self.fields.author => author_of(doc.title),
+            self.fields.author => format!("{} {}", author_of(doc.title), doc.uploader).trim().to_string(),
             self.fields.rowid => doc.rowid as u64
         )
     }
@@ -333,7 +335,7 @@ mod tests {
 
     fn index(works: &[(i64, &str, &str)]) -> TextIndex {
         let index = TextIndex::in_ram().unwrap();
-        let docs: Vec<Doc> = works.iter().map(|&(rowid, title, romaji)| Doc { rowid, key: romaji, romaji, title }).collect();
+        let docs: Vec<Doc> = works.iter().map(|&(rowid, title, romaji)| Doc { rowid, key: romaji, romaji, title, uploader: "" }).collect();
         index.fill(&docs).unwrap();
         index
     }
@@ -389,7 +391,7 @@ mod tests {
     #[test]
     fn a_work_that_is_replaced_or_gone_is_not_found_by_what_it_had() {
         let index = index(&[(1, "a", "rashoumon")]);
-        index.replace(&[Doc { rowid: 1, key: "other", romaji: "other", title: "a" }], &[]).unwrap();
+        index.replace(&[Doc { rowid: 1, key: "other", romaji: "other", title: "a", uploader: "" }], &[]).unwrap();
         assert!(index.all(&matcher(&["rashou"], &[])).unwrap().is_empty());
         assert_eq!(index.all(&matcher(&["other"], &[])).unwrap(), [1]);
 

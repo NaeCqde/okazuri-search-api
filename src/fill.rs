@@ -210,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn a_round_over_titles_that_are_all_translated_asks_for_nothing() {
         let (store, fill) = translator().await;
-        store.save("q", "A", 100, &Ok(vec![crate::store::NewWork { path: "/g/1/".into(), title: "翻訳済み".into(), romaji: "honyakuzumi".into(), language: None }]), false).await.unwrap();
+        store.save("q", "A", 100, &Ok(vec![crate::store::NewWork { path: "/g/1/".into(), title: "翻訳済み".into(), romaji: "honyakuzumi".into(), language: None, extra: Default::default() }]), false).await.unwrap();
         store.save_translations(&squash("翻訳済み"), "google", "翻訳済み", "ja", 1, &[google("翻訳済み", "Translated")]).await.unwrap();
 
         let round = fill.round(&mut HashSet::new()).await.unwrap();

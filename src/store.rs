@@ -8,7 +8,7 @@
 
 use crate::entity::{crawl_state, listing, search, translation, translation_lookup, work};
 use crate::language;
-use crate::query::outside_key;
+use crate::query::{outside_key, title_key};
 use crate::sites::toggle_slash;
 use crate::textindex::{Doc, TextIndex};
 use crate::utils::Result;
@@ -48,6 +48,8 @@ pub struct NewWork {
     pub romaji: String,
     /// The language, read from the title *with* its flags (`language::detect`).
     pub language: Option<String>,
+    /// The tags, the uploader and the posted date the list page shows (empty when it shows none).
+    pub extra: crate::sites::Extra,
 }
 
 /// A saved work.
@@ -76,13 +78,32 @@ struct IndexedRow {
     title: String,
     title_romaji: String,
     language: Option<String>,
+    extra_romaji: Option<String>,
 }
 
 impl IndexedRow {
-    /// The key of what is outside the parentheses of the romaji (`query::outside_key`): what the search matches.
+    /// What the search matches (`index_key`).
     fn key(&self) -> String {
-        outside_key(&self.title_romaji)
+        index_key(&self.title_romaji, self.extra_romaji.as_deref())
     }
+}
+
+/// What a work is found by: the key of what is outside the parentheses of its romaji (`query::outside_key`), and, after a `|`, the key of its
+/// uploader and tags (a query piece may be in any of them).
+fn index_key(romaji: &str, extra_romaji: Option<&str>) -> String {
+    let mut key = outside_key(romaji);
+
+    if let Some(extra) = extra_romaji.filter(|extra| !extra.is_empty()) {
+        key.push('|');
+        key.push_str(&title_key(&extra.replace('\n', " ")));
+    }
+
+    key
+}
+
+/// The uploader in the romaji of the extra text (its first line, lower case; empty when there is none).
+fn uploader_line(extra_romaji: Option<&str>) -> String {
+    extra_romaji.and_then(|text| text.lines().next()).unwrap_or_default().to_lowercase()
 }
 
 /// A work a search reads, as it is kept: the site is a number (a search of 700,000 works does not hash 700,000 names), and the one thing that
@@ -256,6 +277,19 @@ impl SearchStore {
             db.execute_unprepared("ALTER TABLE works DROP COLUMN title_key").await?;
         }
 
+        // the columns of what a list page shows besides the title (tags, uploader, posted date) are added to a database that has not got them
+        for (column, kind) in [("tags", "TEXT"), ("uploader", "TEXT"), ("posted_at", "INTEGER"), ("extra_romaji", "TEXT")] {
+            let has = db
+                .query_one(Statement::from_sql_and_values(db.get_database_backend(), "SELECT 1 AS x FROM pragma_table_info('works') WHERE name = ?", [column.into()]))
+                .await?
+                .is_some();
+
+            if !has {
+                db.execute_unprepared(&format!("ALTER TABLE works ADD COLUMN {column} {kind}")).await?;
+            }
+        }
+        db.execute_unprepared("DROP TRIGGER IF EXISTS works_queue_update").await?;
+
         // the text index is a directory beside the database (`textindex.rs`): the changes of the works are queued by three triggers, and the
         // index takes them in before it answers (`sync_index`). The FTS5 indexes of the older versions are not kept up to date any more.
         for sql in [
@@ -268,7 +302,7 @@ impl SearchStore {
             "CREATE TABLE IF NOT EXISTS index_queue (seq INTEGER PRIMARY KEY AUTOINCREMENT, row INTEGER NOT NULL)",
             "CREATE TRIGGER IF NOT EXISTS works_queue_insert AFTER INSERT ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
             "CREATE TRIGGER IF NOT EXISTS works_queue_delete AFTER DELETE ON works BEGIN INSERT INTO index_queue(row) VALUES (old.rowid); END",
-            "CREATE TRIGGER IF NOT EXISTS works_queue_update AFTER UPDATE OF title, title_romaji ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
+            "CREATE TRIGGER IF NOT EXISTS works_queue_update AFTER UPDATE OF title, title_romaji, extra_romaji ON works BEGIN INSERT INTO index_queue(row) VALUES (new.rowid); END",
         ] {
             db.execute_unprepared(sql).await?;
         }
@@ -316,17 +350,19 @@ impl SearchStore {
                 .db
                 .query_all(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
-                    "SELECT rowid AS r, title, title_romaji FROM works WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    "SELECT rowid AS r, title, title_romaji, extra_romaji FROM works WHERE rowid > ? ORDER BY rowid LIMIT ?",
                     [after.into(), INDEX_FILL_CHUNK.into()],
                 ))
                 .await?;
             let Some(end) = rows.last() else { break };
             after = end.try_get("", "r")?;
 
-            let rows: Vec<(i64, String, String)> =
-                rows.iter().map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?))).collect::<Result<_>>()?;
-            let keys: Vec<String> = rows.iter().map(|(_, _, romaji)| outside_key(romaji)).collect();
-            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji), key)| Doc { rowid: *rowid, key, romaji, title }).collect();
+            let rows: Vec<(i64, String, String, Option<String>)> = rows
+                .iter()
+                .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "extra_romaji")?)))
+                .collect::<Result<_>>()?;
+            let keys: Vec<(String, String)> = rows.iter().map(|(_, _, romaji, extra)| (index_key(romaji, extra.as_deref()), uploader_line(extra.as_deref()))).collect();
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
             self.text.fill(&docs)?;
             filled += docs.len() as u64;
         }
@@ -380,16 +416,18 @@ impl SearchStore {
                 .db
                 .query_all(Statement::from_sql_and_values(
                     backend,
-                    "SELECT w.rowid AS r, w.title, w.title_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value",
+                    "SELECT w.rowid AS r, w.title, w.title_romaji, w.extra_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value",
                     [serde_json::to_string(&rowids)?.into()],
                 ))
                 .await?;
-            let rows: Vec<(i64, String, String)> =
-                rows.iter().map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?))).collect::<Result<_>>()?;
+            let rows: Vec<(i64, String, String, Option<String>)> = rows
+                .iter()
+                .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "extra_romaji")?)))
+                .collect::<Result<_>>()?;
             let found: HashSet<i64> = rows.iter().map(|row| row.0).collect();
             let gone: Vec<i64> = rowids.iter().copied().filter(|rowid| !found.contains(rowid)).collect();
-            let keys: Vec<String> = rows.iter().map(|(_, _, romaji)| outside_key(romaji)).collect();
-            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji), key)| Doc { rowid: *rowid, key, romaji, title }).collect();
+            let keys: Vec<(String, String)> = rows.iter().map(|(_, _, romaji, extra)| (index_key(romaji, extra.as_deref()), uploader_line(extra.as_deref()))).collect();
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
             self.text.replace(&docs, &gone)?;
         }
 
@@ -629,11 +667,21 @@ impl SearchStore {
                     language: Set(item.language.clone()),
                     deleted: Set(false),
                     checked_at: Set(None),
+                    tags: Set(item.extra.tags_text()),
+                    uploader: Set(item.extra.uploader.clone()),
+                    posted_at: Set(item.extra.posted_at),
+                    extra_romaji: Set(item.extra.romaji_text()),
                 }),
                 // a work whose page is gone is not saved again
                 Some(known) if known.deleted => {}
-                Some(known) if known.title != item.title || known.title_romaji != item.romaji => {
+                Some(known) if known.title != item.title || known.title_romaji != item.romaji || (!item.extra.is_empty() && known.extra_romaji != item.extra.romaji_text()) => {
                     let mut changed = known.clone().into_active_model();
+                    if !item.extra.is_empty() {
+                        changed.tags = Set(item.extra.tags_text());
+                        changed.uploader = Set(item.extra.uploader.clone());
+                        changed.posted_at = Set(item.extra.posted_at);
+                        changed.extra_romaji = Set(item.extra.romaji_text());
+                    }
                     changed.title = Set(item.title.clone());
                     changed.title_romaji = Set(item.romaji.clone());
                     changed.language = Set(item.language.clone());
@@ -1320,7 +1368,7 @@ impl SearchStore {
 
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
-            "SELECT w.rowid AS r, w.website, w.path, w.title, w.title_romaji, w.language FROM json_each(?) j JOIN works w ON w.rowid = j.value ORDER BY j.key",
+            "SELECT w.rowid AS r, w.website, w.path, w.title, w.title_romaji, w.language, w.extra_romaji FROM json_each(?) j JOIN works w ON w.rowid = j.value ORDER BY j.key",
             [serde_json::to_string(rowids)?.into()],
         );
 
@@ -1574,7 +1622,7 @@ mod tests {
     use std::fs;
 
     fn link(path: &str, title: &str) -> NewWork {
-        NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: language::detect(title) }
+        NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: language::detect(title), extra: Default::default() }
     }
 
     fn titles(works: &[Work]) -> Vec<&str> {
@@ -1590,7 +1638,7 @@ mod tests {
         // the columns of the table are all there is
         assert_eq!(
             store.columns_of("works").await.unwrap(),
-            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at"]
+            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at", "tags", "uploader", "posted_at", "extra_romaji"]
         );
 
         let works = store.candidates_owned(&[]).await.unwrap();
@@ -1688,7 +1736,7 @@ mod tests {
     #[tokio::test]
     async fn a_work_whose_page_is_gone_is_removed_and_not_saved_again_by_a_list_the_crawl_or_an_import() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |path: &str| NewWork { path: path.to_string(), title: format!("title {path}"), romaji: format!("title {path}"), language: None };
+        let work = |path: &str| NewWork { path: path.to_string(), title: format!("title {path}"), romaji: format!("title {path}"), language: None, extra: Default::default() };
 
         store.save("q", "Site", 100, &Ok(vec![work("/a"), work("/b")]), false).await.unwrap();
         assert_eq!(store.due_checks("Site", 0, "", 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
@@ -1702,7 +1750,7 @@ mod tests {
         // the list, the crawl and an import all bring /a again: it is left out
         store.save("q2", "Site", 300, &Ok(vec![work("/a"), work("/c")]), false).await.unwrap();
         store.save_crawled("Site", 300, &[work("/a"), work("/d")], None).await.unwrap();
-        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None };
+        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None, tags: None, uploader: None, posted_at: None, extra_romaji: None };
         assert_eq!(store.import_works(vec![gone]).await.unwrap(), 0);
         let mut found = paths(store.candidates_owned(&["title"]).await.unwrap()).await;
         found.sort();
@@ -1971,6 +2019,7 @@ mod tests {
             updated_at: Set(1),
             deleted: Set(false),
             checked_at: Set(None),
+            ..Default::default()
         }
         .insert(&store.db)
         .await
@@ -2101,7 +2150,7 @@ mod tests {
     #[tokio::test]
     async fn a_short_piece_of_letters_is_a_word_of_the_romaji_and_not_a_part_of_one() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into(), language: None, extra: Default::default() };
 
         store
             .save_crawled("A", 1, &[work(1, "AI generated"), work(2, "maid and main"), work(3, "love ai, ai!"), work(4, "kai")], None)
@@ -2120,7 +2169,7 @@ mod tests {
     #[tokio::test]
     async fn the_most_rows_is_a_setting_for_every_word() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |n: usize| NewWork { path: format!("/g/{n}/"), title: "ai item".into(), romaji: "ai item".into(), language: None };
+        let work = |n: usize| NewWork { path: format!("/g/{n}/"), title: "ai item".into(), romaji: "ai item".into(), language: None, extra: Default::default() };
 
         store.save_crawled("A", 1, &(0..10).map(work).collect::<Vec<_>>(), None).await.unwrap();
         assert_eq!(store.candidates_owned(&["item"]).await.unwrap().len(), 10);
@@ -2205,7 +2254,7 @@ mod tests {
         // the database of a version that had no index: the works are there, the index is not (the directory of the index is gone)
         store
             .db
-            .execute_unprepared("INSERT INTO works VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 1, 1, NULL, 0, NULL), ('A', '/g/2/', 'Other', 'other', 2, 2, NULL, 0, NULL)")
+            .execute_unprepared("INSERT INTO works (website, path, title, title_romaji, first_seen, updated_at, language, deleted, checked_at) VALUES ('A', '/g/1/', 'Kyoudai', 'kyoudai', 1, 1, NULL, 0, NULL), ('A', '/g/2/', 'Other', 'other', 2, 2, NULL, 0, NULL)")
             .await
             .unwrap();
         drop(store);
@@ -2221,7 +2270,7 @@ mod tests {
     #[tokio::test]
     async fn relanguage_writes_only_the_works_whose_language_changed() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: language::detect(title) };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: language::detect(title), extra: Default::default() };
 
         store.save_crawled("A", 1, &[work("/1", "x [English]"), work("/2", "plain"), work("/3", "y [中国翻訳]")], None).await.unwrap();
         // the rules were different when these were saved
@@ -2239,7 +2288,7 @@ mod tests {
     async fn relanguage_takes_the_flags_out_of_the_titles_and_keeps_the_language_they_named() {
         let store = SearchStore::in_memory().await.unwrap();
         // saved by a version that kept the flags in the title and in the romaji
-        let old = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: language::detect(title) };
+        let old = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: language::detect(title), extra: Default::default() };
 
         store.save_crawled("A", 1, &[old("/1", "\u{1F1EF}\u{1F1F5} COMIC Shitsurakuten 2026-11"), old("/2", "\u{1F1E8}\u{1F1F3} Title B"), old("/3", "plain")], None).await.unwrap();
 
@@ -2276,8 +2325,8 @@ mod tests {
     #[tokio::test]
     async fn the_translations_of_hitomi_are_made_from_the_titles_that_have_both() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None };
-        let romanized = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None, extra: Default::default() };
+        let romanized = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None, extra: Default::default() };
 
         store
             .save_crawled(
@@ -2313,7 +2362,7 @@ mod tests {
     #[tokio::test]
     async fn words_that_are_common_alone_find_the_few_works_that_have_all_of_them() {
         let store = SearchStore::in_memory().await.unwrap();
-        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into(), language: language::detect(title) };
+        let work = |n: usize, title: &str| NewWork { path: format!("/g/{n}/"), title: title.into(), romaji: title.into(), language: language::detect(title), extra: Default::default() };
         let mut works: Vec<NewWork> = (0..30).map(|n| work(n, &format!("alpha item {n}"))).collect();
         works.extend((30..60).map(|n| work(n, &format!("beta item {n}"))));
         // the oldest work is the only one with both
@@ -2332,5 +2381,40 @@ mod tests {
         // the words that are common together: the newest, up to the most
         assert_eq!(store.candidates_up_to(&["item", "alpha"], 4).await.unwrap().len(), 4);
         assert_eq!(store.candidates_up_to(&["item", "30"], 4).await.unwrap().len(), 1, "a number is a word too");
+    }
+
+    #[tokio::test]
+    async fn a_work_is_found_by_its_tags_and_its_uploader() {
+        use crate::query::Matcher;
+        use crate::sites::Extra;
+
+        let store = SearchStore::in_memory().await.unwrap();
+        let tagged = |path: &str, title: &str, uploader: &str, tags: &[&str]| {
+            let mut work = link(path, title);
+            let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+            work.extra = Extra { romaji: format!("{uploader}\n{}", tags.join("\n")), tags, uploader: Some(uploader.to_string()), posted_at: Some(1_700_000_000) };
+            work
+        };
+
+        store.save("q", "A", 1, &Ok(vec![tagged("/g/1/", "Plain Title", "fini", &["cosplay", "big breasts"]), link("/g/2/", "Another Title")]), false).await.unwrap();
+
+        let rows = store.candidates_owned(&[]).await.unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let by = |query: &str| {
+            let matcher = Matcher { long: query.split(' ').map(str::to_string).collect(), ..Default::default() };
+            let store = &store;
+            async move { store.count_found(&matcher).await.unwrap() }
+        };
+        assert_eq!(by("cosplay").await, 1, "a tag finds the work");
+        assert_eq!(by("fini").await, 1, "the uploader finds the work");
+        assert_eq!(by("plain cosplay").await, 1, "a word of the title and a tag together");
+        assert_eq!(by("another cosplay").await, 0, "a tag of another work does not count");
+
+        let (tags, uploader, posted): (Option<String>, Option<String>, Option<i64>) = {
+            let row = store.db.query_one(Statement::from_string(store.db.get_database_backend(), "SELECT tags, uploader, posted_at FROM works WHERE path = '/g/1/'")).await.unwrap().unwrap();
+            (row.try_get("", "tags").unwrap(), row.try_get("", "uploader").unwrap(), row.try_get("", "posted_at").unwrap())
+        };
+        assert_eq!((tags.as_deref(), uploader.as_deref(), posted), (Some("cosplay\nbig breasts"), Some("fini"), Some(1_700_000_000)));
     }
 }
