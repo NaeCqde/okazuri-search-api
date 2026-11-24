@@ -272,6 +272,9 @@ pub struct Matcher {
     /// The other spellings of a piece (of `long` or `short`) that find the same word: `shinbun` and `shimbun`, `o` and `wo`. The index is asked
     /// for the piece or any of them.
     pub alts: std::collections::BTreeMap<String, Vec<String>>,
+    /// The tags (`tags.id`) that are named as the query says (a piece, or some next to each other), with the boost of a match in thousandths: the
+    /// weight of the tag times the boost of its kind. Filled by the store before it asks the index.
+    pub tag_boosts: Vec<(u64, u32)>,
 }
 
 impl Matcher {
@@ -392,7 +395,7 @@ impl Terms {
             }
         }
 
-        (!long.is_empty() || !short.is_empty()).then_some(Matcher { long, short, alts })
+        (!long.is_empty() || !short.is_empty()).then_some(Matcher { long, short, alts, tag_boosts: Vec::new() })
     }
 
     /// Does the title have every word? `key` is `title_key(title)`.

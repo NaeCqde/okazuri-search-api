@@ -525,8 +525,9 @@ impl Crawler {
 
             for id in ids_of(post) {
                 if let Some(name) = names.get(&(index, id)).filter(|name| !name.is_empty()) {
-                    if !link.extra.tags.contains(name) {
-                        link.extra.tags.push(name.clone());
+                    let tag = crate::sites::Tag::new(name.clone(), crate::sites::TagKind::Tag);
+                    if !link.extra.tags.contains(&tag) {
+                        link.extra.tags.push(tag);
                     }
                 }
             }
@@ -558,7 +559,7 @@ fn wordpress_links(site: &Site, body: &str) -> std::result::Result<Vec<Link>, St
             // `category-fanzine` and `parody-trickcal-revive` of the classes are tags (a number after the name is the id of a term the post only points at)
             for class in post.get("class_list").and_then(|c| c.as_array()).into_iter().flatten().filter_map(|c| c.as_str()) {
                 if let Some(name) = class.strip_prefix("category-").or_else(|| class.strip_prefix("parody-")).filter(|name| !name.chars().all(|c| c.is_ascii_digit())) {
-                    extra.tags.push(name.replace('-', " "));
+                    extra.tags.push(crate::sites::Tag::new(name.replace('-', " "), crate::sites::TagKind::Tag));
                 }
             }
             extra.posted_at = post.get("date").and_then(|d| d.as_str()).and_then(wordpress_time);

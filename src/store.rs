@@ -162,7 +162,15 @@ pub struct SearchStore {
     sync: tokio::sync::Mutex<()>,
     /// The romaji of the tags (`tags.romaji`) by id, kept in memory: the tags are some tens of thousands, and every search reads them.
     tag_romaji: std::sync::Mutex<HashMap<i64, String>>,
+    /// The tags by their key (what a query piece is compared with), with the boost of each in thousandths, and when they were read.
+    tag_keys: std::sync::Mutex<Option<(Instant, HashMap<String, Vec<(u64, u32)>>)>>,
 }
+
+/// How long the tags kept in memory for the boosts are used before they are read again.
+const TAG_KEYS_FOR: Duration = Duration::from_secs(60);
+
+/// How much a match of a tag adds to the score, by kind (`TagKind`: a tag, an author, a circle, a weak tag), before the weight of the tag.
+const KIND_BOOST: [f64; 4] = [1.0, 6.0, 4.0, 0.25];
 
 impl SearchStore {
     pub async fn open(path: &Path) -> Result<Self> {
@@ -210,7 +218,7 @@ impl SearchStore {
             None => db.clone(),
         };
 
-        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default() };
+        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default() };
         store.fill_text_index(dir.as_deref()).await?;
 
         Ok(store)
@@ -229,6 +237,7 @@ impl SearchStore {
         let mut uploaders = schema.create_table_from_entity(uploader::Entity);
         db.execute(backend.build(works.if_not_exists())).await?;
         db.execute(backend.build(tags.if_not_exists())).await?;
+        db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS tags_kind_name ON tags (kind, name)").await?;
         db.execute(backend.build(uploaders.if_not_exists())).await?;
         let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
         db.execute(backend.build(searches.if_not_exists())).await?;
@@ -382,7 +391,7 @@ impl SearchStore {
                 .map(|row| Ok((row.try_get("", "r")?, row.try_get("", "title")?, row.try_get("", "title_romaji")?, row.try_get("", "tags")?, row.try_get("", "uploader_romaji")?)))
                 .collect::<Result<_>>()?;
             let keys = self.keys_of(&rows).await?;
-            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader, tags))| Doc { rowid: *rowid, key, romaji, title, uploader, tags }).collect();
             self.text.fill(&docs)?;
             filled += docs.len() as u64;
         }
@@ -396,6 +405,42 @@ impl SearchStore {
         log::info!("the text index is filled: {filled} works in {} s", started.elapsed().as_secs());
 
         Ok(())
+    }
+
+    /// The matcher with the tags it names (`Matcher::tag_boosts`): the tags whose key is a piece of the query, or some pieces next to each other.
+    /// The tags are read from the table and kept in memory for a minute (a weight that is changed counts after that).
+    async fn with_tag_boosts(&self, matcher: &crate::query::Matcher) -> Result<crate::query::Matcher> {
+        let stale = self.tag_keys.lock().map_err(|_| "the tags are poisoned")?.as_ref().is_none_or(|(at, _)| at.elapsed() > TAG_KEYS_FOR);
+
+        if stale {
+            let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT id, kind, romaji, weight FROM tags")).await?;
+            let mut keys: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
+
+            for row in rows {
+                let (id, kind, romaji, weight): (i64, i64, String, f64) = (row.try_get("", "id")?, row.try_get("", "kind")?, row.try_get("", "romaji")?, row.try_get("", "weight")?);
+                let milli = (KIND_BOOST.get(kind as usize).copied().unwrap_or(1.0) * weight * 1000.0).round().max(0.0) as u32;
+
+                keys.entry(title_key(&romaji)).or_default().push((id as u64, milli));
+            }
+            *self.tag_keys.lock().map_err(|_| "the tags are poisoned")? = Some((Instant::now(), keys));
+        }
+
+        let guard = self.tag_keys.lock().map_err(|_| "the tags are poisoned")?;
+        let Some((_, keys)) = guard.as_ref() else { return Ok(matcher.clone()) };
+        let pieces: Vec<&String> = matcher.long.iter().chain(&matcher.short).collect();
+        let mut boosted = matcher.clone();
+
+        for length in 1..=crate::textindex::MOST_JOINED.min(pieces.len()) {
+            for window in pieces.windows(length) {
+                let joined: String = window.iter().map(|piece| piece.as_str()).collect();
+
+                if let Some(found) = keys.get(&joined) {
+                    boosted.tag_boosts.extend(found.iter().copied());
+                }
+            }
+        }
+
+        Ok(boosted)
     }
 
     /// The romaji of the tags with these ids, in the order of the ids: from memory, and the ones that are not there are read from the table.
@@ -450,10 +495,16 @@ impl SearchStore {
     }
 
     /// What the index has of the works: their keys, and their uploaders (lower case) for the field of the authors.
-    async fn keys_of(&self, rows: &[(i64, String, String, Option<String>, Option<String>)]) -> Result<Vec<(String, String)>> {
+    async fn keys_of(&self, rows: &[(i64, String, String, Option<String>, Option<String>)]) -> Result<Vec<(String, String, Vec<u64>)>> {
         let extras = self.extras_of(&rows.iter().map(|(_, _, _, tags, uploader)| (tags.as_deref(), uploader.as_deref())).collect::<Vec<_>>()).await?;
 
-        Ok(rows.iter().zip(extras).map(|((_, _, romaji, _, uploader), extra)| (index_key(romaji, &extra), uploader.clone().unwrap_or_default().to_lowercase())).collect())
+        Ok(rows
+            .iter()
+            .zip(extras)
+            .map(|((_, _, romaji, tags, uploader), extra)| {
+                (index_key(romaji, &extra), uploader.clone().unwrap_or_default().to_lowercase(), tags.as_deref().into_iter().flat_map(tag_ids_of).map(|id| id as u64).collect())
+            })
+            .collect())
     }
 
     pub async fn count_works(&self) -> Result<u64> {
@@ -505,7 +556,7 @@ impl SearchStore {
             let found: HashSet<i64> = rows.iter().map(|row| row.0).collect();
             let gone: Vec<i64> = rowids.iter().copied().filter(|rowid| !found.contains(rowid)).collect();
             let keys = self.keys_of(&rows).await?;
-            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader))| Doc { rowid: *rowid, key, romaji, title, uploader }).collect();
+            let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader, tags))| Doc { rowid: *rowid, key, romaji, title, uploader, tags }).collect();
             self.text.replace(&docs, &gone)?;
         }
 
@@ -723,12 +774,12 @@ impl SearchStore {
     /// and returns, by the path of a work, the ids of its tags as they are written in `work.tags` (` 12 45 `).
     async fn save_extras(db: &impl ConnectionTrait, website: &str, listed: &[NewWork]) -> Result<HashMap<String, String>> {
         let backend = db.get_database_backend();
-        let mut tags: Vec<(&str, &str)> = Vec::new();
+        let mut tags: Vec<(i64, &str, &str)> = Vec::new();
         let mut accounts: Vec<(&str, &str, &str)> = Vec::new();
 
         for item in listed.iter().filter(|item| !item.extra.is_empty()) {
-            for (place, name) in item.extra.tags.iter().enumerate() {
-                tags.push((name.as_str(), item.extra.romaji.get(place).map_or(name.as_str(), String::as_str)));
+            for (place, tag) in item.extra.tags.iter().enumerate() {
+                tags.push((tag.kind.code(), tag.name.as_str(), item.extra.romaji.get(place).map_or(tag.name.as_str(), String::as_str)));
             }
             if let Some(account) = &item.extra.uploader {
                 accounts.push((account.id.as_str(), account.name.as_str(), item.extra.romaji.get(item.extra.tags.len()).map_or(account.name.as_str(), String::as_str)));
@@ -739,10 +790,10 @@ impl SearchStore {
         }
 
         tags.sort_unstable();
-        tags.dedup_by_key(|(name, _)| *name);
+        tags.dedup_by_key(|(kind, name, _)| (*kind, *name));
         for chunk in tags.chunks(300) {
-            let sql = format!("INSERT OR IGNORE INTO tags (name, romaji, weight) VALUES {}", vec!["(?, ?, 1.0)"; chunk.len()].join(", "));
-            let values: Vec<sea_orm::Value> = chunk.iter().flat_map(|(name, romaji)| [(*name).into(), (*romaji).into()]).collect();
+            let sql = format!("INSERT OR IGNORE INTO tags (kind, name, romaji, weight) VALUES {}", vec!["(?, ?, ?, 1.0)"; chunk.len()].join(", "));
+            let values: Vec<sea_orm::Value> = chunk.iter().flat_map(|(kind, name, romaji)| [(*kind).into(), (*name).into(), (*romaji).into()]).collect();
             db.execute(Statement::from_sql_and_values(backend, sql, values)).await?;
         }
         accounts.sort_unstable();
@@ -756,14 +807,14 @@ impl SearchStore {
             db.execute(Statement::from_sql_and_values(backend, sql, values)).await?;
         }
 
-        let names: Vec<&str> = tags.iter().map(|(name, _)| *name).collect();
-        let mut ids: HashMap<String, i64> = HashMap::new();
+        let names: Vec<&str> = tags.iter().map(|(_, name, _)| *name).collect();
+        let mut ids: HashMap<(i64, String), i64> = HashMap::new();
         for chunk in names.chunks(5_000) {
             let rows = db
-                .query_all(Statement::from_sql_and_values(backend, "SELECT t.id AS id, t.name AS name FROM json_each(?) j JOIN tags t ON t.name = j.value", [serde_json::to_string(chunk)?.into()]))
+                .query_all(Statement::from_sql_and_values(backend, "SELECT t.id AS id, t.kind AS kind, t.name AS name FROM json_each(?) j JOIN tags t ON t.name = j.value", [serde_json::to_string(chunk)?.into()]))
                 .await?;
             for row in rows {
-                ids.insert(row.try_get("", "name")?, row.try_get("", "id")?);
+                ids.insert((row.try_get("", "kind")?, row.try_get("", "name")?), row.try_get("", "id")?);
             }
         }
 
@@ -771,7 +822,7 @@ impl SearchStore {
             .iter()
             .filter(|item| !item.extra.tags.is_empty())
             .map(|item| {
-                let list: Vec<String> = item.extra.tags.iter().filter_map(|name| ids.get(name)).map(i64::to_string).collect();
+                let list: Vec<String> = item.extra.tags.iter().filter_map(|tag| ids.get(&(tag.kind.code(), tag.name.clone()))).map(i64::to_string).collect();
                 (item.path.clone(), format!(" {} ", list.join(" ")))
             })
             .collect())
@@ -1582,13 +1633,17 @@ impl SearchStore {
     /// the piece, and an author that is the query score higher), and the same request is answered in the same order while the works are the same.
     pub async fn top_found(&self, matchers: &[(&crate::query::Matcher, f32)], limit: usize) -> Result<Vec<(String, Candidate)>> {
         self.sync_index().await?;
+        let mut boosted: Vec<(crate::query::Matcher, f32)> = Vec::new();
+        for (matcher, weight) in matchers {
+            boosted.push((self.with_tag_boosts(matcher).await?, *weight));
+        }
         let limit = limit.max(1);
         // the trigrams of a piece may be apart in a title that does not have the piece: a few more than `limit` are read, and more when the
         // check leaves fewer
         let mut read = limit + limit / 4 + 16;
 
         loop {
-            let rowids = self.text.best(matchers, 0, read)?;
+            let rowids = self.text.best(&boosted.iter().map(|(matcher, weight)| (matcher, *weight)).collect::<Vec<_>>(), 0, read)?;
             let exhausted = rowids.len() < read;
             let found: Vec<IndexedRow> =
                 self.load(&rowids).await?.into_iter().filter(|row| matchers.iter().any(|(matcher, _)| matcher.accepts(&row.key(), &row.title_romaji))).collect();
@@ -2534,7 +2589,7 @@ mod tests {
         let tagged = |path: &str, title: &str, uploader: &str, tags: &[&str]| {
             let mut work = link(path, title);
             let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
-            work.extra = Extra { romaji: tags.iter().cloned().chain([uploader.to_string()]).collect(), tags, uploader: Some(crate::sites::Account { id: format!("id-{uploader}"), name: uploader.to_string() }), posted_at: Some(1_700_000_000) };
+            work.extra = Extra { romaji: tags.iter().cloned().chain([uploader.to_string()]).collect(), tags: tags.into_iter().map(|t| crate::sites::Tag::new(t, crate::sites::TagKind::Tag)).collect(), uploader: Some(crate::sites::Account { id: format!("id-{uploader}"), name: uploader.to_string() }), posted_at: Some(1_700_000_000) };
             work
         };
 
@@ -2563,5 +2618,31 @@ mod tests {
         assert_eq!(names, [(1, "big breasts".to_string()), (2, "cosplay".to_string())], "a tag has its own id");
         let account: String = store.db.query_one(Statement::from_string(store.db.get_database_backend(), "SELECT name FROM uploaders WHERE website = 'A' AND id = 'id-fini'")).await.unwrap().unwrap().try_get("", "name").unwrap();
         assert_eq!(account, "fini", "the account is by the site and its id on the site");
+    }
+
+    #[tokio::test]
+    async fn a_tag_that_is_an_author_scores_higher_and_the_weight_is_changeable() {
+        use crate::query::Matcher;
+        use crate::sites::{Extra, Tag, TagKind};
+
+        let store = SearchStore::in_memory().await.unwrap();
+        let with = |path: &str, kind: TagKind| {
+            let mut work = link(path, &format!("Title {path}"));
+            work.extra = Extra { tags: vec![Tag::new("reiki", kind)], romaji: vec!["reiki".into()], ..Default::default() };
+            work
+        };
+
+        // the plain tag is saved first: with the same score it would be first
+        store.save("q", "A", 1, &Ok(vec![with("/g/1/", TagKind::Tag), with("/g/2/", TagKind::Author), with("/g/3/", TagKind::Weak)]), false).await.unwrap();
+        let matcher = Matcher { long: vec!["reiki".into()], ..Default::default() };
+        async fn paths(store: &SearchStore, matcher: &Matcher) -> Vec<String> {
+            store.top_found(&[(matcher, 1.0)], 10).await.unwrap().into_iter().map(|(_, work)| work.path).collect()
+        }
+        assert_eq!(paths(&store, &matcher).await, ["/g/2/", "/g/1/", "/g/3/"], "the author, the tag, the weak tag");
+
+        // the weight of a tag can be changed: the plain tag now counts ten times as much (the memory of the tags is read again after a minute)
+        store.db.execute_unprepared("UPDATE tags SET weight = 10 WHERE kind = 0").await.unwrap();
+        *store.tag_keys.lock().unwrap() = None;
+        assert_eq!(paths(&store, &matcher).await, ["/g/1/", "/g/2/", "/g/3/"]);
     }
 }

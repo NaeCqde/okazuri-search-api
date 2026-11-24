@@ -275,10 +275,20 @@ impl Gallery {
             _ => self.title.clone(),
         };
 
-        let mut tags: Vec<String> = Vec::new();
-        for tag in self.artists.iter().chain(&self.groups).chain(self.kind.iter()).chain(&self.parodies).chain(&self.characters).chain(&self.tags) {
-            if !tags.contains(tag) {
-                tags.push(tag.clone());
+        use crate::sites::{Tag, TagKind};
+
+        let mut tags: Vec<Tag> = Vec::new();
+        let named = |names: &[String], kind: TagKind| names.iter().map(|name| Tag::new(name.clone(), kind)).collect::<Vec<_>>();
+        let all = named(&self.artists, TagKind::Author)
+            .into_iter()
+            .chain(named(&self.groups, TagKind::Circle))
+            .chain(self.kind.iter().map(|kind| Tag::new(kind.clone(), TagKind::Tag)))
+            .chain(named(&self.parodies, TagKind::Tag))
+            .chain(named(&self.characters, TagKind::Tag))
+            .chain(named(&self.tags, TagKind::Tag));
+        for tag in all {
+            if !tags.contains(&tag) {
+                tags.push(tag);
             }
         }
         // Hitomi.La has no uploader: the artists and the circles are tags (the author of a work is not the one who posted it)
@@ -643,7 +653,8 @@ mod tests {
         let body = r#"var galleryinfo = {"title":"T","japanese_title":null,"type":"doujinshi","language":"japanese","artists":[{"artist":"Fini"}],"groups":[{"group":"Circle"}],"parodys":[{"parody":"vocaloid"}],"characters":[{"character":"hatsune miku"}],"tags":[{"tag":"big breasts","female":"1"}],"date":"2022-12-29 19:23:00-06","files":[{},{}]}"#;
         let link = parse_gallery(1, body).unwrap().link();
 
-        assert_eq!(link.extra.tags, ["fini", "circle", "doujinshi", "vocaloid", "hatsune miku", "big breasts"]);
+        let names: Vec<(&str, i64)> = link.extra.tags.iter().map(|tag| (tag.name.as_str(), tag.kind.code())).collect();
+        assert_eq!(names, [("fini", 1), ("circle", 2), ("doujinshi", 0), ("vocaloid", 0), ("hatsune miku", 0), ("big breasts", 0)]);
         assert_eq!(link.extra.uploader, None, "nobody posted it that the site tells");
         assert_eq!(link.extra.posted_at, Some(1_672_363_380), "2022-12-30 01:23 UTC");
     }

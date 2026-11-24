@@ -448,13 +448,45 @@ pub struct Link {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extra {
     /// The tags, flat: the namespace of E-Hentai (`female:`) is dropped, the category (`Cosplay`) is a tag, the hashtags of other sites are tags.
-    pub tags: Vec<String>,
+    pub tags: Vec<Tag>,
     /// The account that posted the work (not its author: the artist and the circle are tags).
     pub uploader: Option<Account>,
     /// When the work was posted, in seconds since the epoch (UTC).
     pub posted_at: Option<i64>,
     /// The romaji of the tags and then of the name of the account (one line each, in this order), made with the title: what a query is matched with.
     pub romaji: Vec<String>,
+}
+
+/// What a tag is (`tags.kind`): the score of a match depends on it (`store.rs`, `KIND_BOOST`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TagKind {
+    #[default]
+    Tag = 0,
+    /// The artist, the author.
+    Author = 1,
+    /// The circle, the group.
+    Circle = 2,
+    /// A tag the site shows as weak (E-Hentai's dotted tags: few votes).
+    Weak = 3,
+}
+
+impl TagKind {
+    pub fn code(self) -> i64 {
+        self as i64
+    }
+}
+
+/// A tag of a work: its name (flat, lower case) and what it is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tag {
+    pub name: String,
+    pub kind: TagKind,
+}
+
+impl Tag {
+    pub fn new(name: impl Into<String>, kind: TagKind) -> Self {
+        Self { name: name.into(), kind }
+    }
 }
 
 /// An account of a site (`entity/uploader.rs`).
@@ -472,7 +504,7 @@ impl Extra {
 
     /// The texts that are romanized: the tags, then the name of the account.
     pub fn texts(&self) -> Vec<String> {
-        self.tags.iter().cloned().chain(self.uploader.iter().map(|account| account.name.clone())).collect()
+        self.tags.iter().map(|tag| tag.name.clone()).chain(self.uploader.iter().map(|account| account.name.clone())).collect()
     }
 }
 
@@ -497,7 +529,7 @@ fn ehentai_extras(html: &str) -> HashMap<String, Extra> {
     static POSTED: OnceLock<Regex> = OnceLock::new();
     let gid = GID.get_or_init(|| Regex::new(r#"/g/(\d+)/"#).unwrap());
     let category = CATEGORY.get_or_init(|| Regex::new(r#"<div class="cn c[a-z]+"[^>]*>([^<]+)</div>"#).unwrap());
-    let tag = TAG.get_or_init(|| Regex::new(r#"<div class="gt[a-z]*" title="([^"]+)""#).unwrap());
+    let tag = TAG.get_or_init(|| Regex::new(r#"<div class="(gt[a-z]*)" title="([^"]+)""#).unwrap());
     let uploader = UPLOADER.get_or_init(|| Regex::new(r#"/uploader/([^"/]+)">([^<]+)</a>"#).unwrap());
     let posted = POSTED.get_or_init(|| Regex::new(r#"id="posted_\d+">(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)</div>"#).unwrap());
     let mut found = HashMap::new();
@@ -507,15 +539,23 @@ fn ehentai_extras(html: &str) -> HashMap<String, Extra> {
         let mut extra = Extra::default();
 
         if let Some(c) = category.captures(row) {
-            extra.tags.push(decode(c[1].trim()).to_lowercase());
+            extra.tags.push(Tag::new(decode(c[1].trim()).to_lowercase(), TagKind::Tag));
         }
         for c in tag.captures_iter(row) {
-            let label = decode(&c[1]);
-            // `female:big breasts` is `big breasts`; a tag that is the same twice (other namespaces) is kept once
-            let name = label.split_once(':').map_or(label.as_str(), |(_, name)| name).trim().to_lowercase();
+            let label = decode(&c[2]);
+            // `female:big breasts` is `big breasts`; a tag that is the same twice (other namespaces) is kept once. `artist:` and `group:` say what
+            // the tag is, and a dotted tag (class `gtl`: few votes) is a weak one.
+            let (space, name) = label.split_once(':').unwrap_or(("", label.as_str()));
+            let kind = match space {
+                "artist" => TagKind::Author,
+                "group" => TagKind::Circle,
+                _ if &c[1] == "gtl" => TagKind::Weak,
+                _ => TagKind::Tag,
+            };
+            let tag = Tag::new(name.trim().to_lowercase(), kind);
 
-            if !name.is_empty() && !extra.tags.contains(&name) {
-                extra.tags.push(name);
+            if !tag.name.is_empty() && !extra.tags.contains(&tag) {
+                extra.tags.push(tag);
             }
         }
         extra.uploader = uploader.captures(row).map(|c| Account { id: c[1].to_string(), name: decode(c[2].trim()) }).filter(|account| !account.name.is_empty());
@@ -1105,13 +1145,14 @@ mod tests {
 
     #[test]
     fn an_ehentai_list_page_gives_the_category_the_tags_the_uploader_and_the_date() {
-        let html = r#"<table><tr><td class="gl1c glcat"><div class="cn cta" onclick="x">Cosplay</div></td><td class="gl2c"><div id="posted_3499941">2025-08-23 13:05</div></td><td class="gl3c glname"><a href="https://e-hentai.org/g/3499941/b977883039/"><div class="glink">[Reiki] To Grow</div><div><div class="gt" title="language:english">english</div><div class="gt" title="female:big ass">f:big ass</div><div class="gtl" title="other:glasses">glasses</div><div class="gt" title="male:big ass">m:big ass</div></div></a></td><td class="gl4c glhide"><div><a href="https://e-hentai.org/uploader/masterreviewer1000">masterreviewer1000</a></div></td></tr></table>"#;
+        let html = r#"<table><tr><td class="gl1c glcat"><div class="cn cta" onclick="x">Cosplay</div></td><td class="gl2c"><div id="posted_3499941">2025-08-23 13:05</div></td><td class="gl3c glname"><a href="https://e-hentai.org/g/3499941/b977883039/"><div class="glink">[Reiki] To Grow</div><div><div class="gt" title="language:english">english</div><div class="gt" title="female:big ass">f:big ass</div><div class="gtl" title="other:glasses">glasses</div><div class="gt" title="male:big ass">m:big ass</div><div class="gt" title="artist:reiki">reiki</div></div></a></td><td class="gl4c glhide"><div><a href="https://e-hentai.org/uploader/masterreviewer1000">masterreviewer1000</a></div></td></tr></table>"#;
         let site = Site::new(SITES.iter().find(|d| d.name == "EHentai").unwrap());
         let links = site.extract("https://e-hentai.org/", html, 10);
 
         assert_eq!(links.len(), 1);
         let extra = &links[0].extra;
-        assert_eq!(extra.tags, ["cosplay", "english", "big ass", "glasses"], "flat, the category first, no repeats");
+        let names: Vec<(&str, TagKind)> = extra.tags.iter().map(|tag| (tag.name.as_str(), tag.kind)).collect();
+        assert_eq!(names, [("cosplay", TagKind::Tag), ("english", TagKind::Tag), ("big ass", TagKind::Tag), ("glasses", TagKind::Weak), ("reiki", TagKind::Author)], "flat, the category first, no repeats");
         assert_eq!(extra.uploader, Some(Account { id: "masterreviewer1000".into(), name: "masterreviewer1000".into() }));
         assert_eq!(extra.posted_at, Some(1_755_954_300), "2025-08-23 13:05 UTC");
     }

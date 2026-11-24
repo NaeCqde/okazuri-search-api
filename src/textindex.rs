@@ -34,7 +34,7 @@ const AUTHOR_BOOST: f32 = 8.0;
 /// What the score of the spelling of the query is multiplied by, against the other spellings of the same word.
 const OWN_SPELLING_BOOST: f32 = 1.5;
 /// The most words of a query that are joined as one word of a title (`rashou mon` is `rashoumon`).
-const MOST_JOINED: usize = 4;
+pub const MOST_JOINED: usize = 4;
 
 #[derive(Clone, Copy)]
 struct Fields {
@@ -42,6 +42,7 @@ struct Fields {
     words: Field,
     starts: Field,
     author: Field,
+    tag_ids: Field,
     rowid: Field,
 }
 
@@ -60,6 +61,8 @@ pub struct Doc<'a> {
     pub title: &'a str,
     /// The uploader (lower case romaji; empty when none): searched like the author of the title.
     pub uploader: &'a str,
+    /// The ids of its tags (`tags.id`).
+    pub tags: &'a [u64],
 }
 
 fn text(tokenizer: &str) -> TextOptions {
@@ -73,6 +76,7 @@ fn schema() -> (Schema, Fields) {
         words: builder.add_text_field("words", text("word")),
         starts: builder.add_text_field("starts", text("blank")),
         author: builder.add_text_field("author", text("ng3")),
+        tag_ids: builder.add_u64_field("tag_ids", INDEXED),
         rowid: builder.add_u64_field("rowid", INDEXED | FAST),
     };
 
@@ -153,13 +157,18 @@ impl TextIndex {
     fn document(&self, doc: &Doc) -> tantivy::TantivyDocument {
         let starts: Vec<String> = words_of(doc.romaji).flat_map(|word| starts_of(&word)).collect();
 
-        doc!(
+        let mut document = doc!(
             self.fields.key => doc.key,
             self.fields.words => doc.romaji,
             self.fields.starts => starts.join(" "),
             self.fields.author => format!("{} {}", author_of(doc.title), doc.uploader).trim().to_string(),
             self.fields.rowid => doc.rowid as u64
-        )
+        );
+        for id in doc.tags {
+            document.add_u64(self.fields.tag_ids, *id);
+        }
+
+        document
     }
 
     /// Puts the works in the index in place of the ones that have the same row numbers (`docs`), and takes out the works of `gone`. The
@@ -273,6 +282,11 @@ impl TextIndex {
             boost.push((Occur::Should, Box::new(BoostQuery::new(Box::new(BooleanQuery::new(author)), AUTHOR_BOOST))));
         }
 
+        // the tags that the query names: a match adds the boost of the tag (its weight and its kind)
+        for &(id, milli) in &matcher.tag_boosts {
+            boost.push((Occur::Should, Box::new(BoostQuery::new(Box::new(TermQuery::new(Term::from_field_u64(self.fields.tag_ids, id), IndexRecordOption::Basic)), milli as f32 / 1000.0))));
+        }
+
         must.extend(boost);
 
         Ok(Box::new(BooleanQuery::new(must)))
@@ -335,7 +349,7 @@ mod tests {
 
     fn index(works: &[(i64, &str, &str)]) -> TextIndex {
         let index = TextIndex::in_ram().unwrap();
-        let docs: Vec<Doc> = works.iter().map(|&(rowid, title, romaji)| Doc { rowid, key: romaji, romaji, title, uploader: "" }).collect();
+        let docs: Vec<Doc> = works.iter().map(|&(rowid, title, romaji)| Doc { rowid, key: romaji, romaji, title, uploader: "", tags: &[] }).collect();
         index.fill(&docs).unwrap();
         index
     }
@@ -391,7 +405,7 @@ mod tests {
     #[test]
     fn a_work_that_is_replaced_or_gone_is_not_found_by_what_it_had() {
         let index = index(&[(1, "a", "rashoumon")]);
-        index.replace(&[Doc { rowid: 1, key: "other", romaji: "other", title: "a", uploader: "" }], &[]).unwrap();
+        index.replace(&[Doc { rowid: 1, key: "other", romaji: "other", title: "a", uploader: "", tags: &[] }], &[]).unwrap();
         assert!(index.all(&matcher(&["rashou"], &[])).unwrap().is_empty());
         assert_eq!(index.all(&matcher(&["other"], &[])).unwrap(), [1]);
 
