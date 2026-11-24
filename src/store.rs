@@ -1514,6 +1514,54 @@ impl SearchStore {
             .await?)
     }
 
+    /// Every tag by id: (name, kind). The tags are some tens of thousands.
+    pub async fn tag_table(&self) -> Result<HashMap<i64, (String, i64)>> {
+        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT id, name, kind FROM tags")).await?;
+
+        rows.iter().map(|row| Ok((row.try_get("", "id")?, (row.try_get("", "name")?, row.try_get("", "kind")?)))).collect()
+    }
+
+    /// Every account by site and id: its name.
+    pub async fn uploader_table(&self) -> Result<HashMap<(String, String), String>> {
+        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT website, id, name FROM uploaders")).await?;
+
+        rows.iter().map(|row| Ok(((row.try_get("", "website")?, row.try_get("", "id")?), row.try_get("", "name")?))).collect()
+    }
+
+    /// Writes the tags, the account and the posted date of works that are saved already (an import of works that came with them): the tags and
+    /// accounts are saved when they are new, and the three columns of the work are set. Works with nothing of it are left as they are.
+    pub async fn import_extras(&self, website: &str, works: &[NewWork]) -> Result<()> {
+        let with: Vec<NewWork> = works.iter().filter(|work| !work.extra.is_empty()).cloned().collect();
+        if with.is_empty() {
+            return Ok(());
+        }
+
+        let transaction = self.db.begin().await?;
+        let tags = Self::save_extras(&transaction, website, &with).await?;
+
+        for work in &with {
+            transaction
+                .execute(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "UPDATE works SET tags = ?, uploader = ?, posted_at = ? WHERE website = ? AND path = ? AND (tags IS NOT ? OR uploader IS NOT ? OR posted_at IS NOT ?)",
+                    [
+                        tags.get(&work.path).cloned().into(),
+                        work.extra.uploader.as_ref().map(|account| account.id.clone()).into(),
+                        work.extra.posted_at.into(),
+                        website.into(),
+                        work.path.as_str().into(),
+                        tags.get(&work.path).cloned().into(),
+                        work.extra.uploader.as_ref().map(|account| account.id.clone()).into(),
+                        work.extra.posted_at.into(),
+                    ],
+                ))
+                .await?;
+        }
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
     /// Writes a new romaji for works (the title, `first_seen` and `updated_at` stay as they are: the order of the
     /// results does not change), and forgets that the queries which listed them were searched, so the next search
     /// (the prefetch is one) asks those sites again. Returns how many searches were forgotten.

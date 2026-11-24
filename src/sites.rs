@@ -474,6 +474,16 @@ impl TagKind {
     pub fn code(self) -> i64 {
         self as i64
     }
+
+    /// The kind of a code (`tags.kind`); a code that is not known is a plain tag.
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            1 => Self::Author,
+            2 => Self::Circle,
+            3 => Self::Weak,
+            _ => Self::Tag,
+        }
+    }
 }
 
 /// A tag of a work: its name (flat, lower case) and what it is.

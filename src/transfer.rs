@@ -5,16 +5,19 @@
 //! brotli. A line has only what the sites gave (the site, the path of the page, the title) and when the work was saved; the romaji, the key
 //! and the language of the title are made again when the file is read, with the rules of the program that reads it.
 //!
-//! A work that is saved already is left as it is (the shards do not overlap, and a work does not change when it is read again).
+//! A work that is saved already is left as it is (the shards do not overlap, and a work does not change when it is read again), except that
+//! its tags, account and posted date are set when the file has them (a database filled before the tags were read). The tags go by name and kind,
+//! the ids are the ids of one database; a file of an older version has none.
 //! The queries and the translations are not moved: only the works, which is what the crawl made.
 
 use crate::entity::work;
 use crate::query::romaji;
 use crate::romanizer::Romanizer;
-use crate::store::SearchStore;
+use crate::sites::{Account, Extra, Tag, TagKind};
+use crate::store::{NewWork, SearchStore};
 use crate::utils::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -38,11 +41,34 @@ struct Line {
     /// The language (the flags are taken out of the titles, so it is sent along).
     #[serde(skip_serializing_if = "Option::is_none")]
     language: Option<String>,
+    /// The tags by name (the ids are the ids of one database), with their kind (`sites::TagKind`). A file of an older version has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<(String, i64)>,
+    /// The account that posted the work: its id on the site and its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uploader: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    posted_at: Option<i64>,
 }
 
-impl From<work::Model> for Line {
-    fn from(row: work::Model) -> Self {
-        Self { website: row.website, path: row.path, title: row.title, first_seen: row.first_seen, updated_at: row.updated_at, language: row.language }
+/// The tags and the accounts of a database, to write the names in place of the ids.
+struct Names {
+    tags: HashMap<i64, (String, i64)>,
+    uploaders: HashMap<(String, String), String>,
+}
+
+impl Line {
+    fn new(row: work::Model, names: &Names) -> Self {
+        let tags = row
+            .tags
+            .as_deref()
+            .into_iter()
+            .flat_map(str::split_whitespace)
+            .filter_map(|id| names.tags.get(&id.parse::<i64>().ok()?).cloned())
+            .collect();
+        let uploader = row.uploader.as_ref().map(|id| (id.clone(), names.uploaders.get(&(row.website.clone(), id.clone())).cloned().unwrap_or_else(|| id.clone())));
+
+        Self { website: row.website, path: row.path, title: row.title, first_seen: row.first_seen, updated_at: row.updated_at, language: row.language, tags, uploader, posted_at: row.posted_at }
     }
 }
 
@@ -65,6 +91,7 @@ pub async fn export(store: &SearchStore, out: &Path, sites: &[String], since: i6
     let mut moved = Moved::default();
     let mut after = None;
     let mut allowed: Option<(String, bool)> = None;
+    let names = Names { tags: store.tag_table().await?, uploaders: store.uploader_table().await? };
 
     loop {
         let page = store.works_after(after.as_ref(), PAGE).await?;
@@ -83,7 +110,7 @@ pub async fn export(store: &SearchStore, out: &Path, sites: &[String], since: i6
                 moved.sites.insert(row.website.clone());
             }
             moved.works += 1;
-            serde_json::to_writer(&mut writer, &Line::from(row))?;
+            serde_json::to_writer(&mut writer, &Line::new(row, &names))?;
             writer.write_all(b"\n")?;
         }
     }
@@ -124,17 +151,30 @@ pub async fn import(store: &SearchStore, file: &Path, romanizer: &Arc<Romanizer>
     Ok(moved)
 }
 
-/// Makes the romaji and the key of the titles (CPU work, so on a thread of its own) and writes the works.
+/// Makes the romaji and the key of the titles (CPU work, so on a thread of its own) and writes the works, and the tags and accounts that came
+/// with them.
 async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>) -> Result<usize> {
     let romanizer = romanizer.clone();
-    let works = tokio::task::spawn_blocking(move || {
-        lines
+    let (works, mut extras) = tokio::task::spawn_blocking(move || {
+        let mut extras: Vec<(String, NewWork)> = Vec::new();
+        let works = lines
             .into_iter()
             .map(|line| {
                 // the language is read from the title with its flags; the title is kept without them
                 let language = crate::language::detect(&line.title).or(line.language);
                 let title = crate::language::strip_flags(&line.title);
                 let converted = romaji(&title, &romanizer).unwrap_or_else(|_| title.clone());
+
+                if !line.tags.is_empty() || line.uploader.is_some() || line.posted_at.is_some() {
+                    let mut extra = Extra {
+                        tags: line.tags.iter().map(|(name, kind)| Tag::new(name.clone(), TagKind::from_code(*kind))).collect(),
+                        uploader: line.uploader.as_ref().map(|(id, name)| Account { id: id.clone(), name: name.clone() }),
+                        posted_at: line.posted_at,
+                        romaji: Vec::new(),
+                    };
+                    extra.romaji = extra.texts().iter().map(|text| romaji(text, &romanizer).unwrap_or_else(|_| text.clone())).collect();
+                    extras.push((line.website.clone(), NewWork { path: line.path.clone(), title: String::new(), romaji: String::new(), language: None, extra }));
+                }
 
                 work::Model {
                     website: line.website,
@@ -151,17 +191,27 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                     posted_at: None,
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+
+        (works, extras)
     })
     .await?;
 
-    store.import_works(works).await
+    let new = store.import_works(works).await?;
+
+    // the works that are saved already get the tags too (a database that was filled before the tags were read)
+    extras.sort_by(|a, b| a.0.cmp(&b.0));
+    for group in extras.chunk_by(|a, b| a.0 == b.0) {
+        let works: Vec<NewWork> = group.iter().map(|(_, work)| work.clone()).collect();
+        store.import_extras(&group[0].0, &works).await?;
+    }
+
+    Ok(new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::NewWork;
 
     fn work(path: &str, title: &str) -> NewWork {
         NewWork { path: path.to_string(), title: title.to_string(), romaji: title.to_string(), language: crate::language::detect(title), extra: Default::default() }
@@ -227,5 +277,44 @@ mod tests {
         assert!(import(&SearchStore::in_memory().await.unwrap(), &file, &crate::testing::romanizer_arc()).await.is_err());
 
         let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn tags_uploaders_and_dates_go_through_the_file_by_name_and_fill_works_that_are_saved() {
+        let mut tagged = work("/a/1", "Alpha one");
+        tagged.extra = Extra {
+            tags: vec![Tag::new("cosplay", TagKind::Tag), Tag::new("fini", TagKind::Author)],
+            uploader: Some(Account { id: "u1".into(), name: "Uploader One".into() }),
+            posted_at: Some(1_700_000_000),
+            romaji: vec!["cosplay".into(), "fini".into(), "uploader one".into()],
+        };
+        let from = SearchStore::in_memory().await.unwrap();
+        from.save_crawled("A", 100, &[tagged, work("/a/2", "Alpha two")], None).await.unwrap();
+        let file = scratch("tags.jsonl.br");
+        export(&from, &file, &[], 0).await.unwrap();
+
+        // a database that has the works already, with no tags: the import fills them
+        let to = SearchStore::in_memory().await.unwrap();
+        to.save_crawled("A", 50, &[work("/a/1", "Alpha one")], None).await.unwrap();
+        let imported = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();
+        assert_eq!((imported.works, imported.new), (2, 1));
+
+        let rows = to.works_after(None, 10).await.unwrap();
+        let one = rows.iter().find(|w| w.path == "/a/1").unwrap();
+        assert!(one.tags.is_some(), "the tags are set on the work that was saved");
+        assert_eq!((one.uploader.as_deref(), one.posted_at), (Some("u1"), Some(1_700_000_000)));
+        assert!(rows.iter().find(|w| w.path == "/a/2").unwrap().tags.is_none());
+
+        // and goes out again with the names, so the file of the second database says the same
+        let again = scratch("tags2.jsonl.br");
+        export(&to, &again, &[], 0).await.unwrap();
+        let third = SearchStore::in_memory().await.unwrap();
+        import(&third, &again, &crate::testing::romanizer_arc()).await.unwrap();
+        let names: Vec<(String, i64)> = third.tag_table().await.unwrap().into_values().collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&("fini".to_string(), 1)));
+
+        let _ = std::fs::remove_file(file);
+        let _ = std::fs::remove_file(again);
     }
 }
