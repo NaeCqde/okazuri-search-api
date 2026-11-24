@@ -1325,14 +1325,14 @@ impl SearchStore {
         Ok(crawl_state::Entity::find().order_by_asc(crawl_state::Column::Website).all(&self.reader).await?)
     }
 
-    /// The SQL of the row numbers of the newest works that a `Matcher` finds, the newest first, with a `LIMIT ?` to bind after its values. With
-    /// pieces and short words, the rows of the pieces are walked from the newest and each is asked of the index of words by its row number: it
-    /// stops at the `limit`th row, and the list of a word that most titles have (`no`) is not built (the join of the two lists of `rowids`
-    /// takes seconds for it).
-    fn newest_rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+    /// The SQL of the row numbers of the works that a `Matcher` finds, the smallest row number first (the first added first), with a `LIMIT ?`
+    /// to bind after its values. With pieces and short words, the rows of the pieces are walked in that order and each is asked of the index of
+    /// words by its row number: it stops at the `limit`th row, and the list of a word that most titles have (`no`) is not built (the join of
+    /// the two lists of `rowids` takes seconds for it). The indexes give the rows in this order as they are, so it is also the fastest.
+    fn first_rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
         match Self::match_texts(matcher) {
             (Some(long), Some(short)) => (
-                "SELECT r FROM (SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ? ORDER BY rowid DESC) f \
+                "SELECT r FROM (SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ? ORDER BY rowid) f \
                  WHERE EXISTS (SELECT 1 FROM works_words WHERE works_words MATCH ? AND rowid = f.r) LIMIT ?"
                     .to_string(),
                 vec![long.into(), short.into()],
@@ -1340,23 +1340,24 @@ impl SearchStore {
             _ => {
                 let (sql, values) = Self::rowids(matcher);
 
-                (format!("SELECT r FROM ({sql}) ORDER BY r DESC LIMIT ?"), values)
+                (format!("SELECT r FROM ({sql}) ORDER BY r LIMIT ?"), values)
             }
         }
     }
 
-    /// The `limit` works that `matcher` finds, the last added first: (site, work). The order is the order of the rows, so the same request
-    /// is answered in the same order every time.
+    /// The `limit` works that `matcher` finds, the smallest row number first: (site, work). The order is the one of the rows (the first added
+    /// first), whatever the site, so the same request is answered in the same order every time. The order of the answer is this one only:
+    /// whoever asks sorts the answer as they like.
     pub async fn top_found(&self, matcher: &crate::query::Matcher, limit: usize) -> Result<Vec<(String, Candidate)>> {
         use sea_orm::FromQueryResult;
 
-        let (sql, mut values) = Self::newest_rowids(matcher);
+        let (sql, mut values) = Self::first_rowids(matcher);
         values.push((limit as i64).into());
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
             format!(
                 "SELECT w.website, w.path, w.title, w.title_romaji, w.title_key, w.language FROM works w \
-                 JOIN ({sql}) x ON w.rowid = x.r ORDER BY x.r DESC"
+                 JOIN ({sql}) x ON w.rowid = x.r ORDER BY x.r"
             ),
             values,
         );

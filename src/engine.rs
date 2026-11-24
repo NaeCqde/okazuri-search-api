@@ -951,7 +951,7 @@ impl Engine {
     }
 
     /// The works of the answer by reading the saved rows that have the words one by one (a word that is a number, a short piece that is not
-    /// letters): the matching works as places in their candidates, in the order of the answer, once each address.
+    /// letters): the matching works as places in their candidates, in the order of the answer (the smallest row number first), once each address.
     async fn scanned_items(&self, terms: &Terms, fetched: &Fetched) -> Result<(Arc<Candidates>, Vec<Item>)> {
         let candidates = self.store.candidates(&terms.prefilters()).await?;
 
@@ -965,7 +965,8 @@ impl Engine {
         let nothing_is_new = fetched.new.is_empty();
         let mut items: Vec<Item> = Vec::new();
 
-        for (index, work) in candidates.works.iter().enumerate() {
+        // the candidates are the newest rows first: the answer is in the order of the indexes, the smallest row number first
+        for (index, work) in candidates.works.iter().enumerate().rev() {
             let Some(site) = site_of[work.site as usize] else { continue };
 
             // the name has to be in the title outside its parentheses ("work (COMIC kairakuten 2018 8)" is a work of the issue)
@@ -975,10 +976,6 @@ impl Engine {
                 items.push(Item { set: 0, index: index as u32, site: site as u16, is_new });
             }
         }
-
-        // the sites in their order; in a site, the works seen last come first (the order of the database)
-        let rank: Vec<usize> = self.sites.iter().map(|site| self.order.get(site.def.name).copied().unwrap_or(usize::MAX)).collect();
-        items.sort_by_key(|item| rank[item.site as usize]);
 
         let origins: Vec<String> = self.sites.iter().map(|site| site.def.origin.to_lowercase()).collect();
         let items = dedupe_items(&candidates.works, &origins, items);
@@ -1006,8 +1003,8 @@ impl Engine {
         Ok((total, sites))
     }
 
-    /// The works of the answer from the indexes of the database (nothing is counted): the last added first, whatever the site (one read; the
-    /// same request has the same order every time), `request.limit` works and one more, which tells whether the answer goes on. `after` is
+    /// The works of the answer from the indexes of the database (nothing is counted): the smallest row number first (the first added first),
+    /// whatever the site (one read; the same request has the same order every time), `request.limit` works and one more, which tells whether the answer goes on. `after` is
     /// an earlier search of the same request: its works are among those it finds again, so that many more are read. Returns the head as
     /// candidates and places, and how many rows were read.
     async fn indexed_items(
@@ -1993,8 +1990,8 @@ pub(crate) mod tests {
         assert_eq!(requests(&hits), (1, 1, 1));
 
         let found: Vec<_> = outcome.results.iter().map(|h| (h.website.as_str(), h.is_legal, h.path.as_str(), h.title.as_str())).collect();
-        assert_eq!(found, [("Good", true, "/work/1", "COMIC ExE one"), ("Good", true, "/work/2", "COMIC ExE two")]);
-        assert_eq!(outcome.results[0].url, "http://127.0.0.1/work/1", "the address is the origin and the path");
+        assert_eq!(found, [("Good", true, "/work/2", "COMIC ExE two"), ("Good", true, "/work/1", "COMIC ExE one")], "the smallest row number first");
+        assert_eq!(outcome.results[0].url, "http://127.0.0.1/work/2", "the address is the origin and the path");
         assert_eq!((outcome.results.len(), outcome.has_more), (2, false));
 
         let report = |name: &str| outcome.sites.iter().find(|s| s.website == name).unwrap().clone();
@@ -2322,14 +2319,16 @@ pub(crate) mod tests {
         assert!(outcome.translation_ja.is_none());
     }
 
-    /// The saved works the way the words are defined, row by row: the last added first, whatever the site. A word of 3 characters or more is in
+    /// The saved works the way the words are defined, row by row: the smallest row number first, whatever the site. A word of 3 characters or more is in
     /// the key of what is outside the parentheses of the title; a shorter one is a word of the whole romaji.
     async fn expected_titles(engine: &Arc<Engine>, query: &str) -> Vec<String> {
         let words: Vec<String> = Terms::new(&engine.plan(query).unwrap().query).keys().into_iter().map(str::to_string).collect();
+        // (the candidates are the newest first)
         let works = engine.store.candidates_owned(&[]).await.unwrap();
 
         works
             .iter()
+            .rev()
             .filter(|w| {
                 words.iter().all(|word| {
                     if word.chars().count() >= 3 {
@@ -2380,9 +2379,9 @@ pub(crate) mod tests {
             assert_eq!(head.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>(), expected[..expected.len().min(3)], "{query}");
         }
 
-        // the last added work is the first, whatever its site, and the same request has the same order every time
+        // the work with the smallest row number is the first, whatever its site, and the same request has the same order every time
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
-        assert_eq!(outcome.results[0].path, "/work/102", "the first of the list of the page is the last added (a list is saved newest first, and the second site is saved last)");
+        assert_eq!(outcome.results[0].path, "/work/7", "the first of the list of the page is the first added (a list is saved newest first, and the first site is saved first)");
         let again = engine.search(&Request { live: Live::Off, ..Request::new("kairakuten") }).await.unwrap();
         assert_eq!(outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>(), again.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>());
     }
@@ -2413,12 +2412,12 @@ pub(crate) mod tests {
 
         let titles = |outcome: &Outcome| outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
         let whole = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
-        // the English title's works (the first of the list of the page is the last added), and then the works of the Japanese title that are not in the answer yet
-        assert_eq!(titles(&whole), ["/work/1", "/work/3", "/work/2"]);
+        // the English title's works (the smallest row number first), and then the works of the Japanese title that are not in the answer yet
+        assert_eq!(titles(&whole), ["/work/3", "/work/1", "/work/2"]);
         assert_eq!(whole.results.len(), 3, "the work of both titles is in the answer once");
 
         // a page that is cut inside the first title, and one that is cut at its end: the page says that the answer goes on
-        for (limit, expected) in [(1, vec!["/work/1"]), (2, vec!["/work/1", "/work/3"])] {
+        for (limit, expected) in [(1, vec!["/work/3"]), (2, vec!["/work/3", "/work/1"])] {
             let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
             assert_eq!((titles(&page), page.has_more), (expected.into_iter().map(String::from).collect::<Vec<_>>(), true), "limit {limit}");
         }
@@ -2455,9 +2454,9 @@ pub(crate) mod tests {
         let none = engine.search(&Request { live: Live::Off, ..Request::new("alpha gamma") }).await.unwrap();
         assert_eq!((none.has_more, none.results.len()), (false, 0));
 
-        // a word alone finds the titles of any query, the last seen first
+        // a word alone finds the titles of any query, the smallest row number first
         let one = engine.search(&Request { live: Live::Off, ..Request::new("ONE") }).await.unwrap();
-        assert_eq!(one.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["gamma one", "alpha beta one"]);
+        assert_eq!(one.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["alpha beta one", "gamma one"]);
     }
 
     #[tokio::test]
@@ -2470,7 +2469,7 @@ pub(crate) mod tests {
         assert_eq!(outcome.terms, ["kairakuten"]);
         // the site finds Japanese titles: it was asked what was written, then the romaji (the last answer is kept)
         assert_eq!(outcome.sites[0].queries, ["快楽天", "kairakuten"]);
-        assert_eq!(outcome.results[0].title, "kairakuten one");
+        assert_eq!(outcome.results[0].title, "kairakuten two");
         assert_eq!(requests(&hits).0, 2);
 
         // the same query written in romaji is the same search
@@ -2706,10 +2705,10 @@ pub(crate) mod tests {
         store.save("q", "Good", 1, &Ok(vec![work(1)]), false).await.unwrap();
         store.save("q", "Failing", 1, &Ok(vec![work(2)]), false).await.unwrap();
 
-        // the site is off in the config (it is not asked), and what is saved of it is in the answer, after the works of the sites that are asked
+        // the site is off in the config (it is not asked), and what is saved of it is in the answer (the smallest row number first, whatever the site)
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("saved") }).await.unwrap();
         assert_eq!(outcome.results.len(), 2);
-        assert_eq!(outcome.results.iter().map(|hit| hit.website.as_str()).collect::<Vec<_>>(), ["Failing", "Good"]);
+        assert_eq!(outcome.results.iter().map(|hit| hit.website.as_str()).collect::<Vec<_>>(), ["Good", "Failing"]);
         assert!(outcome.sites.iter().any(|site| (site.website.as_str(), site.status) == ("Good", "disabled")), "{:?}", outcome.sites);
 
         // the request excludes it: it is not asked, and what is saved of it is still in the answer
