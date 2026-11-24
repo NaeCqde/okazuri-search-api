@@ -194,16 +194,84 @@ fn stripped(digits: &str) -> &str {
     if stripped.is_empty() { "0" } else { stripped }
 }
 
+/// The same word in the spellings that the sites mix up, written one way: `wo` as `o` (the particle), and `n` before `b`, `m` or `p` as `m`
+/// (`shinbun` and `shimbun`). Long vowels (`kou` and `ko`) are not: they are different words too often (`koi`, `koui`).
+fn alike_spelling(word: &str) -> String {
+    let word = word.replace("wo", "o");
+    let chars: Vec<char> = word.chars().collect();
+
+    chars
+        .iter()
+        .enumerate()
+        .map(|(at, &c)| if c == 'n' && chars.get(at + 1).is_some_and(|next| matches!(next, 'b' | 'm' | 'p')) { 'm' } else { c })
+        .collect()
+}
+
+/// The other spellings of a word of a query that find the same word in a title (at most 7): `o` for `wo` and the other way, and for the longer
+/// words `wo` as `o`, and `n` and `m` before `b`, `m` or `p` the other way round. `alike_spelling` is the same rule, applied to both sides.
+fn spelling_variants(key: &str) -> Vec<String> {
+    if key == "o" {
+        return vec!["wo".to_string()];
+    }
+
+    if key == "wo" {
+        return vec!["o".to_string()];
+    }
+
+    // the places where a spelling can be the other: (byte place, length of the part, what it becomes)
+    let chars: Vec<(usize, char)> = key.char_indices().collect();
+    let mut places: Vec<(usize, usize, &str)> = Vec::new();
+
+    for (at, &(position, c)) in chars.iter().enumerate() {
+        let next = chars.get(at + 1).map(|&(_, next)| next);
+
+        match (c, next) {
+            ('w', Some('o')) => places.push((position, 2, "o")),
+            ('n', Some('b' | 'm' | 'p')) => places.push((position, 1, "m")),
+            ('m', Some('b' | 'm' | 'p')) => places.push((position, 1, "n")),
+            _ => {}
+        }
+    }
+
+    // every choice of places, when there are few of them; one place at a time otherwise
+    let places = &places[..places.len().min(3)];
+    let mut variants: Vec<String> = Vec::new();
+
+    for choice in 1..(1u32 << places.len()) {
+        let mut text = String::new();
+        let mut at = 0;
+
+        for (index, &(position, length, becomes)) in places.iter().enumerate() {
+            if choice & (1 << index) != 0 {
+                text.push_str(&key[at..position]);
+                text.push_str(becomes);
+                at = position + length;
+            }
+        }
+
+        text.push_str(&key[at..]);
+
+        if text != key && !variants.contains(&text) {
+            variants.push(text);
+        }
+    }
+
+    variants
+}
+
 fn strip_zeros(digits: &str) -> String {
     stripped(digits).to_string()
 }
 
 /// The words that the indexes of the database answer: a work matches when its key has every piece of `long`, and every piece of `short` is a
 /// word of its romaji.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Matcher {
     pub long: Vec<String>,
     pub short: Vec<String>,
+    /// The other spellings of a piece (of `long` or `short`) that find the same word: `shinbun` and `shimbun`, `o` and `wo`. The index is asked
+    /// for the piece or any of them.
+    pub alts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// The most words of a query that are joined as one word of a title (`rashou mon` is `Rashoumon`).
@@ -214,6 +282,8 @@ struct Term {
     key: String,
     /// A word that is a number alone (`07`): it is also found as the number 7 in `2026年7月号`.
     number: Option<String>,
+    /// The other spellings of the word (`spelling_variants`); none for a number.
+    alts: Vec<String>,
 }
 
 /// The words of a query. A title matches when it matches every one of them (AND), in any order.
@@ -233,7 +303,9 @@ impl Terms {
 
                 let number = key.chars().all(|c| c.is_ascii_digit()).then(|| strip_zeros(&key));
 
-                Some(Term { key, number })
+                let alts = if number.is_none() { spelling_variants(&key) } else { Vec::new() };
+
+                Some(Term { key, number, alts })
             })
             .collect();
 
@@ -254,7 +326,7 @@ impl Terms {
     pub fn prefilters(&self) -> Vec<&str> {
         let mut words: Vec<&str> = Vec::new();
 
-        for term in self.0.iter().filter(|term| term.number.is_none()) {
+        for term in self.0.iter().filter(|term| term.number.is_none() && term.alts.is_empty()) {
             if !words.contains(&term.key.as_str()) {
                 words.push(term.key.as_str());
             }
@@ -272,18 +344,34 @@ impl Terms {
         }
 
         let (mut long, mut short) = (Vec::new(), Vec::new());
+        let mut alts = std::collections::BTreeMap::new();
 
-        for word in self.prefilters() {
+        for term in &self.0 {
+            let word = term.key.as_str();
+
+            if long.iter().chain(short.iter()).any(|known| known == word) {
+                continue;
+            }
+
             if word.chars().count() >= 3 {
                 long.push(word.to_string());
+                // the trigram index has no key for a piece of less than 3 characters
+                let others: Vec<String> = term.alts.iter().filter(|alt| alt.chars().count() >= 3).cloned().collect();
+                if !others.is_empty() {
+                    alts.insert(word.to_string(), others);
+                }
             } else if word.chars().all(|c| c.is_ascii_alphanumeric()) {
                 short.push(word.to_string());
+                let others: Vec<String> = term.alts.iter().filter(|alt| alt.chars().all(|c| c.is_ascii_alphanumeric())).cloned().collect();
+                if !others.is_empty() {
+                    alts.insert(word.to_string(), others);
+                }
             } else {
                 return None;
             }
         }
 
-        (!long.is_empty() || !short.is_empty()).then_some(Matcher { long, short })
+        (!long.is_empty() || !short.is_empty()).then_some(Matcher { long, short, alts })
     }
 
     /// Does the title have every word? `key` is `title_key(title)`.
@@ -298,23 +386,40 @@ impl Terms {
         self.0.iter().all(|term| match &term.number {
             // a number is a number of the title, not a few digits of a longer one (6 is not in 2026)
             Some(number) => has_number(folded.get_or_insert_with(|| fold(title)), number),
-            None => key.contains(&term.key),
+            None => key.contains(&term.key) || term.alts.iter().any(|alt| key.contains(alt)),
         })
     }
 
-    /// Is the title a good answer: do the words of the query start words of the title, rather than only be somewhere in the middle of one?
-    /// The words of the title are all its words (a short word may be in parentheses: the candidates are the ones that match). A word of the query starts a word of the title (`rashou` starts `Rashoumon`),
-    /// or the words of the query that are next to each other, written together, start one (`rashou mon` is `rashoumon`: a title writes
-    /// `Rashoumon` or `Rashou Mon`). A word of 1 or 2 letters is a word of the title (`o` is not the start of `oneesan`). The words that are
-    /// numbers are left out (they are matched by value). `kimerashoujo ga hoshii mono` has `rashou` and `mon` in it, and is no good answer.
+    /// How good an answer the title is, 0 the best: 0 when the words of the query start words of the title (`rashou` starts `Rashoumon`), or the words
+    /// next to each other, written together, do (`rashou mon` is `rashoumon`: a title writes `Rashoumon` or `Rashou Mon`); 1 when they do once the
+    /// spellings that are one word are made alike (`wo` and `o`, `shinbun` and `shimbun`); 2 for the others (`kimerashoujo ga hoshii mono` has
+    /// `rashou` and `mon` in the middle of its words). The words of the title are all its words (a short word may be in parentheses: the candidates
+    /// are the ones that match). A word of 1 or 2 letters is a word of the title (`o` is not the start of `oneesan`). The words that are numbers are
+    /// left out (they are matched by value).
+    pub fn answer_tier(&self, title: &str) -> u8 {
+        if self.starts_words(title, &|word| word.to_string()) {
+            0
+        } else if self.starts_words(title, &alike_spelling) {
+            1
+        } else {
+            2
+        }
+    }
+
+    #[cfg(test)]
     pub fn is_good_answer(&self, title: &str) -> bool {
-        let words: Vec<&Term> = self.0.iter().filter(|term| term.number.is_none()).collect();
+        self.answer_tier(title) == 0
+    }
+
+    fn starts_words(&self, title: &str, spell: &dyn Fn(&str) -> String) -> bool {
+        let words: Vec<String> = self.0.iter().filter(|term| term.number.is_none()).map(|term| spell(&term.key)).collect();
 
         if words.is_empty() {
             return true;
         }
 
-        let title_words: Vec<String> = title.split(|c: char| !c.is_alphanumeric()).map(title_key).filter(|word| !word.is_empty()).collect();
+        let title_words: Vec<String> =
+            title.split(|c: char| !c.is_alphanumeric()).map(title_key).filter(|word| !word.is_empty()).map(|word| spell(&word)).collect();
         let all: String = title_words.concat();
         let mut starts = Vec::with_capacity(title_words.len());
         let mut at = 0;
@@ -342,9 +447,8 @@ impl Terms {
         for end in 1..=words.len() {
             for begin in end.saturating_sub(MOST_JOINED_WORDS)..end {
                 if reached[begin] {
-                    let joined: String = words[begin..end].iter().map(|term| term.key.as_str()).collect();
-
-                    let whole_end = words[end - 1].key.chars().count() <= 2;
+                    let joined: String = words[begin..end].concat();
+                    let whole_end = words[end - 1].chars().count() <= 2;
 
                     if starts_a_word(&joined, whole_end) {
                         reached[end] = true;
@@ -547,6 +651,36 @@ mod tests {
         // the numbers are not looked at
         assert!(Terms::new("comic 2026").is_good_answer("COMIC Kairakuten 2026"));
         assert!(Terms::new("2026").is_good_answer("anything"));
+    }
+
+    #[test]
+    fn the_spellings_that_are_one_word_find_each_other() {
+        assert_eq!(spelling_variants("o"), ["wo"]);
+        assert_eq!(spelling_variants("wo"), ["o"]);
+        assert_eq!(spelling_variants("shinbun"), ["shimbun"]);
+        assert_eq!(spelling_variants("shimbun"), ["shinbun"]);
+        assert_eq!(spelling_variants("kowoiru"), ["kooiru"]);
+        assert!(spelling_variants("kairakuten").is_empty());
+        // long vowels are not one word: koi and koui
+        assert!(spelling_variants("koui").is_empty());
+        assert_eq!(alike_spelling("shinbun"), alike_spelling("shimbun"));
+        assert_eq!(alike_spelling("jinsei"), "jinsei");
+
+        let terms = Terms::new("jinsei wo shinbun");
+        assert!(terms.matches("Jinsei o Shimbun", &title_key("Jinsei o Shimbun")) || terms.matches("x", "jinseishimbun"));
+        let matcher = terms.matcher().unwrap();
+        assert_eq!(matcher.alts.get("shinbun"), Some(&vec!["shimbun".to_string()]));
+        assert_eq!(matcher.alts.get("wo"), Some(&vec!["o".to_string()]));
+    }
+
+    #[test]
+    fn an_answer_in_the_spelling_of_the_query_comes_before_one_in_the_other_spelling() {
+        let terms = Terms::new("jinsei wo dainashi");
+
+        assert_eq!(terms.answer_tier("Jinsei wo Dainashi"), 0);
+        assert_eq!(terms.answer_tier("Jinsei o Dainashi"), 1);
+        assert_eq!(terms.answer_tier("Kimerajinsei oneesan dainashi"), 2);
+        assert_eq!(Terms::new("shimbun").answer_tier("Shinbun no Hanashi"), 1);
     }
 
     #[test]

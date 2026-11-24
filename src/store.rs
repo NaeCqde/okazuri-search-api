@@ -1237,13 +1237,18 @@ impl SearchStore {
     /// shorter words (the index of words).
     fn match_texts(matcher: &crate::query::Matcher) -> (Option<String>, Option<String>) {
         let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
+        // a piece, or any of its other spellings
+        let piece_text = |piece: &String| match matcher.alts.get(piece) {
+            Some(alts) if !alts.is_empty() => format!("({})", std::iter::once(piece).chain(alts).map(|text| quote(text)).collect::<Vec<_>>().join(" OR ")),
+            _ => quote(piece),
+        };
         let long = (!matcher.long.is_empty()).then(|| {
-            let pieces = matcher.long.iter().map(|piece| quote(piece)).collect::<Vec<_>>().join(" AND ");
+            let pieces = matcher.long.iter().map(piece_text).collect::<Vec<_>>().join(" AND ");
 
             format!("title_key : ({pieces})")
         });
         let short = (!matcher.short.is_empty()).then(|| {
-            let words = matcher.short.iter().map(|word| quote(word)).collect::<Vec<_>>().join(" AND ");
+            let words = matcher.short.iter().map(piece_text).collect::<Vec<_>>().join(" AND ");
 
             format!("title_romaji : ({words})")
         });
@@ -2107,7 +2112,7 @@ mod tests {
         assert_eq!(works.iter().find(|w| w.path == "/g/1/").unwrap().title_key, "one", "the key is what is outside the parentheses");
 
         // the index has the new keys and the site: the work whose title has the words only in its parentheses is not found
-        let matcher = crate::query::Matcher { long: vec!["comic".into()], short: Vec::new() };
+        let matcher = crate::query::Matcher { long: vec!["comic".into()], ..Default::default() };
         assert_eq!(store.count_found(&matcher).await.unwrap(), 1);
         assert_eq!(store.count_found_by_site(&matcher).await.unwrap(), [("Site".to_string(), 1)]);
         let top = store.top_found(&matcher, 5).await.unwrap();

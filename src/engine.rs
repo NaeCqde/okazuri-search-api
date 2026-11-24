@@ -982,7 +982,7 @@ impl Engine {
 
         let origins: Vec<String> = self.sites.iter().map(|site| site.def.origin.to_lowercase()).collect();
         let items = dedupe_items(&candidates.works, &origins, items);
-        let items = rank_first(items, self.config.rank_window, |item| terms.is_good_answer(&candidates.works[item.index as usize].title_romaji));
+        let items = rank_first(items, self.config.rank_window, |item| terms.answer_tier(&candidates.works[item.index as usize].title_romaji));
 
         Ok((candidates, items))
     }
@@ -1033,7 +1033,7 @@ impl Engine {
             // the first `rank_window` works are read and put in order (the good answers first); the answer needs only `left + spare` of them
             let wanted = left + spare;
             let found = self.store.top_found(matcher, wanted.max(self.config.rank_window)).await?;
-            let found = rank_first(found, self.config.rank_window, |(_, row)| terms.is_good_answer(&row.title_romaji));
+            let found = rank_first(found, self.config.rank_window, |(_, row)| terms.answer_tier(&row.title_romaji));
 
             for (name, mut row) in found.into_iter().take(wanted) {
                 // the work of a site that is not in the list (it was removed from the code) is not in the answer
@@ -1745,9 +1745,9 @@ impl crate::hitomi::Fetch for HitomiFetch<'_> {
 
 /// One hit for each address: the same page saved twice (`/g/1/` and `/g/1`, two sites that answer with the same address) is
 /// one result. The first one (the order of the answer) stays, and is new when any of them is.
-/// The first `window` of `rows` with the good ones first (each group in its order); the rows after the window stay where they are, so the order of a
-/// page deep in the answer does not change with the size of the page. `window` 0 leaves the rows as they are.
-fn rank_first<T>(mut rows: Vec<T>, window: usize, good: impl Fn(&T) -> bool) -> Vec<T> {
+/// The first `window` of `rows` with the best ones first (`tier`, 0 the best; each tier in its order); the rows after the window stay where they are,
+/// so the order of a page deep in the answer does not change with the size of the page. `window` 0 leaves the rows as they are.
+fn rank_first<T>(mut rows: Vec<T>, window: usize, tier: impl Fn(&T) -> u8) -> Vec<T> {
     let window = window.min(rows.len());
 
     if window == 0 {
@@ -1755,11 +1755,10 @@ fn rank_first<T>(mut rows: Vec<T>, window: usize, good: impl Fn(&T) -> bool) -> 
     }
 
     let tail = rows.split_off(window);
-    let (mut head, bad): (Vec<T>, Vec<T>) = rows.into_iter().partition(|row| good(row));
 
-    head.extend(bad);
-    head.extend(tail);
-    head
+    rows.sort_by_cached_key(|row| tier(row));
+    rows.extend(tail);
+    rows
 }
 
 fn dedupe_items<'a>(candidates: &'a [Candidate], origins: &'a [String], items: Vec<Item>) -> Vec<Item> {
@@ -2418,6 +2417,29 @@ pub(crate) mod tests {
         let engine = Engine::with_sites(sites::all(), &SearchConfig { rank_window: 0, ..config() }, engine.store.clone(), engine.romanizer.clone());
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("rashou mon") }).await.unwrap();
         assert_ne!(found(outcome).last().map(String::as_str), Some("Kimera Shoujo ga Hoshii Mono"), "the rows are in their own order");
+    }
+
+    #[tokio::test]
+    async fn the_spellings_that_are_one_word_are_found_and_the_spelling_of_the_query_comes_first() {
+        let (engine, _, store) = setup(&config()).await;
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let titles = ["Jinsei o Dainashi", "Jinsei wo Dainashi", "Jinsei Oneesan Dainashi", "Shimbun no Hanashi", "Shinbun no Hanashi"];
+        let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(n, title)).collect();
+        store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
+
+        let found = |outcome: Outcome| outcome.results.iter().map(|hit| hit.title.clone()).collect::<Vec<_>>();
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("jinsei wo dainashi") }).await.unwrap();
+        let wo = found(outcome);
+        assert_eq!(wo.len(), 2, "o and wo, not the oneesan: {wo:?}");
+        assert_eq!(wo[0], "Jinsei wo Dainashi");
+
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("jinsei o dainashi") }).await.unwrap();
+        let o = found(outcome);
+        assert_eq!((o.len(), o[0].as_str()), (2, "Jinsei o Dainashi"));
+
+        let outcome = engine.search(&Request { live: Live::Off, ..Request::new("shinbun") }).await.unwrap();
+        let shinbun = found(outcome);
+        assert_eq!((shinbun.len(), shinbun[0].as_str()), (2, "Shinbun no Hanashi"));
     }
 
     #[tokio::test]
