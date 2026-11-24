@@ -29,6 +29,8 @@ use tokio::sync::{Mutex, Semaphore};
 /// never after more than the longest wait.
 /// An English text with fewer letters (squashed: no spaces or symbols) is not translated with the titles of Hitomi.La.
 const MIN_ENGLISH_KEY_CHARS: usize = 4;
+/// What the score of the works of the other title (the translation of the query) is multiplied by: a work that has the query itself comes first.
+const OTHER_TITLE_WEIGHT: f32 = 0.5;
 /// A Japanese text of no space and this many letters or less is one word (`is_one_word`).
 const ONE_WORD_JAPANESE_CHARS: usize = 5;
 const DEFAULT_RETRY_WAIT_SECS: u64 = 5;
@@ -75,6 +77,14 @@ struct Item {
     /// The index of its site (`Engine::sites`).
     site: u16,
     is_new: bool,
+}
+
+/// The other title of a request.
+struct OtherTitle {
+    text: String,
+    translated: Translated,
+    /// The other title is in Japanese (the query is not).
+    japanese: bool,
 }
 
 /// What the search before this one asked: the indexes (and which words), or the rows one by one.
@@ -798,13 +808,71 @@ impl Engine {
     /// `search` with every work in `items`: the works of the English (or Japanese) title are in it, once.
     async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Merged> {
         let mut laps = crate::utils::Laps::new();
-        let first = self.search_one(request, None).await?;
+
+        // the indexes answer a query and its other title as one search: the works of either, the best score first (a work that has both is the
+        // best, then the ones that have the query, then the ones that have only the other title)
+        if let Some(other) = self.other_title(request).await {
+            laps.lap("other title");
+
+            if self.indexable(request.query) && self.indexable(&other.text) {
+                let first = self.search_one(request, None, Some(&other.text)).await?;
+                laps.lap("search of both titles");
+                let mut merged = Merged { sets: vec![first.set], items: first.items, indexed: first.indexed, meta: first.meta };
+                if other.japanese {
+                    merged.meta.translation_ja = Some(other.translated);
+                } else {
+                    merged.meta.translation = Some(other.translated);
+                }
+                text_log!(info, "timing of the search of {:?} and its other title: {laps}", request.query; "timing of the search of both titles: {laps}");
+
+                return Ok(merged);
+            }
+        }
+
+        let first = self.search_one(request, None, None).await?;
         laps.lap("first search");
         let merged = Merged { sets: vec![first.set], items: first.items, indexed: first.indexed, meta: first.meta };
         let merged = self.search_all_more(request, merged, &mut laps).await;
         text_log!(info, "timing of the two searches of {:?}: {laps}", request.query; "timing of the two searches: {laps}");
 
         merged
+    }
+
+    /// Can the indexes answer the text (it has words of 3 characters or more, or letters)?
+    fn indexable(&self, text: &str) -> bool {
+        let Ok(plan) = self.plan(text) else { return false };
+
+        Terms::new(&plan.words).matcher().is_some() && !self.sites.iter().any(|site| site.def.name.chars().count() < 3)
+    }
+
+    /// The other title of a request: the Japanese title of a query that is not in Japanese, the English title of one that is. None when the
+    /// request does not translate, or the translation is the query itself.
+    async fn other_title(self: &Arc<Self>, request: &Request<'_>) -> Option<OtherTitle> {
+        if request.translator == Translator::None {
+            return None;
+        }
+
+        // a query without Japanese: its Japanese title is searched too (the same as the English title of a query in Japanese)
+        let (found, japanese) = if !crate::query::has_japanese(request.query) {
+            if !request.query.chars().any(|c| c.is_ascii_alphabetic()) {
+                return None;
+            }
+
+            let found = self.japanese_of(request.query, request.translator, request.live).await?;
+
+            (Translated { text: found.japanese.trim().to_string(), source: found.source }, true)
+        } else {
+            // a failure leaves the English search out, not the search
+            let found = self.english_of(request.query, request.translator, request.live).await?;
+
+            (Translated { text: found.english.trim().to_string(), source: found.source }, false)
+        };
+
+        if found.text.is_empty() || crate::hitomi::squash(&found.text) == crate::hitomi::squash(request.query) {
+            return None;
+        }
+
+        Some(OtherTitle { text: found.text.clone(), translated: found, japanese })
     }
 
     /// The search of the other title of a request (`search_all` does it for a query that is not in Japanese, and for one that is): the
@@ -815,7 +883,7 @@ impl Engine {
             indexed: merged.indexed,
             items: merged.items.len(),
         };
-        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after)).await {
+        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after), None).await {
             Ok(more) => {
                 // a work that is in the answer already (the same address) is not in it twice
                 let known: HashSet<(&str, &str)> = merged.items.iter().map(|item| self.address_of(&merged.sets, item)).collect();
@@ -849,50 +917,20 @@ impl Engine {
         (self.sites[item.site as usize].def.origin, sets[item.set as usize].works[item.index as usize].path.as_str())
     }
 
-    /// The rest of `search_all`: the other title is looked for, and searched.
+    /// The rest of `search_all` when the indexes cannot answer the query and its other title as one: the other title is searched, and its works are put
+    /// after the answer.
     async fn search_all_more(self: &Arc<Self>, request: &Request<'_>, mut merged: Merged, laps: &mut crate::utils::Laps) -> Result<Merged> {
-        if request.translator == Translator::None {
-            return Ok(merged);
-        }
+        let Some(other) = self.other_title(request).await else { return Ok(merged) };
+        laps.lap("other title");
 
-        // a query without Japanese: its Japanese title is searched too (the same as the English title of a query in Japanese)
-        if !crate::query::has_japanese(request.query) {
-            if !request.query.chars().any(|c| c.is_ascii_alphabetic()) {
-                return Ok(merged);
-            }
-
-            let found = self.japanese_of(request.query, request.translator, request.live).await;
-            laps.lap("japanese title");
-            let Some(found) = found else { return Ok(merged) };
-            let text = found.japanese.trim().to_string();
-
-            if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
-                return Ok(merged);
-            }
-
-            let searched = self.search_title(request, &text, &mut merged).await;
-            laps.lap("search of the Japanese title");
-            if searched {
-                merged.meta.translation_ja = Some(Translated { text, source: found.source });
-            }
-
-            return Ok(merged);
-        }
-
-        // the English title: its works are in the answer too. A failure leaves the English search out, not the search
-        let english = self.english_of(request.query, request.translator, request.live).await;
-        laps.lap("english title");
-        let Some(english) = english else { return Ok(merged) };
-        let text = english.english.trim().to_string();
-
-        if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
-            return Ok(merged);
-        }
-
-        let searched = self.search_title(request, &text, &mut merged).await;
-        laps.lap("search of the English title");
+        let searched = self.search_title(request, &other.text, &mut merged).await;
+        laps.lap("search of the other title");
         if searched {
-            merged.meta.translation = Some(Translated { text, source: english.source });
+            if other.japanese {
+                merged.meta.translation_ja = Some(other.translated);
+            } else {
+                merged.meta.translation = Some(other.translated);
+            }
         }
 
         Ok(merged)
@@ -900,7 +938,7 @@ impl Engine {
 
     /// The search of one query (`search` does it for the English title too). The works are places in the candidates (`items`); `meta.results`
     /// is empty.
-    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched>) -> Result<Lite> {
+    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched>, other: Option<&str>) -> Result<Lite> {
         let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.words);
@@ -925,6 +963,18 @@ impl Engine {
             Live::Force => self.fetch_with(request.query, true, exclude).await?,
         };
 
+        // the sites are asked for the other title too
+        let fetched = match (other, request.live) {
+            (Some(text), Live::Diff | Live::Force) => {
+                let mut fetched = fetched;
+                let more = self.fetch_with(text, request.live == Live::Force, exclude).await?;
+                fetched.asked.extend(more.asked);
+                fetched.new.extend(more.new);
+                fetched
+            }
+            _ => fetched,
+        };
+
         laps.lap("sites asked");
 
         // the indexes answer a search whose words they know (counts and the head of the answer in milliseconds); any other is read row by row.
@@ -938,9 +988,19 @@ impl Engine {
         if matcher.is_none() && after.as_ref().is_some_and(|after| after.indexed) {
             return Err("the indexes cannot answer the other title".into());
         }
+        // the other title as one search with the query (`search_all` checked that the indexes answer it)
+        let other_matcher = match other {
+            Some(text) => Some(Terms::new(&self.plan(text)?.words).matcher().ok_or("the indexes cannot answer the other title")?),
+            None => None,
+        };
 
         let (candidates, items, indexed, rows) = match &matcher {
-            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched).await?,
+            Some(matcher) => {
+                let mut matchers = vec![(matcher, 1.0_f32)];
+                matchers.extend(other_matcher.as_ref().map(|other| (other, OTHER_TITLE_WEIGHT)));
+
+                self.indexed_items(request, &matchers, after.as_ref(), &fetched).await?
+            }
             None => {
                 let (candidates, items) = self.scanned_items(&terms, &fetched).await?;
                 laps.lap("candidates and match");
@@ -1053,7 +1113,7 @@ impl Engine {
     async fn indexed_items(
         &self,
         request: &Request<'_>,
-        matcher: &crate::query::Matcher,
+        matchers: &[(&crate::query::Matcher, f32)],
         after: Option<&Searched>,
         fetched: &Fetched,
     ) -> Result<(Arc<Candidates>, Vec<Item>, bool, usize)> {
@@ -1070,7 +1130,7 @@ impl Engine {
             // the works of the earlier search that this one finds again are among the rows, so that many more are read
             // the index gives the best answers first (by score); the answer needs only `left + spare` of them
             let wanted = left + spare;
-            let found = self.store.top_found(matcher, wanted).await?;
+            let found = self.store.top_found(matchers, wanted).await?;
 
             for (name, mut row) in found.into_iter().take(wanted) {
                 // the work of a site that is not in the list (it was removed from the code) is not in the answer
@@ -2573,12 +2633,12 @@ pub(crate) mod tests {
 
         let titles = |outcome: &Outcome| outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
         let whole = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
-        // the English title's works (the best score first), and then the works of the Japanese title that are not in the answer yet
-        assert_eq!(titles(&whole), ["/work/1", "/work/3", "/work/2"]);
+        // one search of both titles: the work that has both first, then the work that has the query, then the one that has only the other title
+        assert_eq!(titles(&whole), ["/work/3", "/work/1", "/work/2"]);
         assert_eq!(whole.results.len(), 3, "the work of both titles is in the answer once");
 
         // a page that is cut inside the first title, and one that is cut at its end: the page says that the answer goes on
-        for (limit, expected) in [(1, vec!["/work/1"]), (2, vec!["/work/1", "/work/3"])] {
+        for (limit, expected) in [(1, vec!["/work/3"]), (2, vec!["/work/3", "/work/1"])] {
             let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
             assert_eq!((titles(&page), page.has_more), (expected.into_iter().map(String::from).collect::<Vec<_>>(), true), "limit {limit}");
         }

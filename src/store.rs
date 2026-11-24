@@ -1390,7 +1390,7 @@ impl SearchStore {
 
     /// The `limit` works that `matcher` finds, the best answer first: (site, work). The index scores them (a short title, a word that starts with
     /// the piece, and an author that is the query score higher), and the same request is answered in the same order while the works are the same.
-    pub async fn top_found(&self, matcher: &crate::query::Matcher, limit: usize) -> Result<Vec<(String, Candidate)>> {
+    pub async fn top_found(&self, matchers: &[(&crate::query::Matcher, f32)], limit: usize) -> Result<Vec<(String, Candidate)>> {
         self.sync_index().await?;
         let limit = limit.max(1);
         // the trigrams of a piece may be apart in a title that does not have the piece: a few more than `limit` are read, and more when the
@@ -1398,9 +1398,10 @@ impl SearchStore {
         let mut read = limit + limit / 4 + 16;
 
         loop {
-            let rowids = self.text.best(matcher, 0, read)?;
+            let rowids = self.text.best(matchers, 0, read)?;
             let exhausted = rowids.len() < read;
-            let found: Vec<IndexedRow> = self.load(&rowids).await?.into_iter().filter(|row| matcher.accepts(&row.key(), &row.title_romaji)).collect();
+            let found: Vec<IndexedRow> =
+                self.load(&rowids).await?.into_iter().filter(|row| matchers.iter().any(|(matcher, _)| matcher.accepts(&row.key(), &row.title_romaji))).collect();
 
             if found.len() >= limit || exhausted {
                 return Ok(found
@@ -2183,7 +2184,7 @@ mod tests {
         let matcher = crate::query::Matcher { long: vec!["comic".into()], ..Default::default() };
         assert_eq!(store.count_found(&matcher).await.unwrap(), 1);
         assert_eq!(store.count_found_by_site(&matcher).await.unwrap(), [("Site".to_string(), 1)]);
-        let top = store.top_found(&matcher, 5).await.unwrap();
+        let top = store.top_found(&[(&matcher, 1.0)], 5).await.unwrap();
         assert_eq!(top.iter().map(|(site, w)| (site.as_str(), w.path.as_str())).collect::<Vec<_>>(), [("Site", "/g/2/")]);
 
         // opened again, nothing is made again
