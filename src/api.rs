@@ -771,9 +771,10 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(json["query"], "COMIC ExE");
         assert_eq!(json["results"][0]["website"], "Good");
         assert_eq!(json["results"][0]["is_legal"], true);
-        assert_eq!(json["results"][0]["title"], "COMIC ExE one");
-        assert_eq!(json["results"][0]["path"], "/work/1");
-        assert_eq!(json["results"][0]["url"], "http://127.0.0.1/work/1");
+        // the smallest row number first (a list is saved newest first, so the last of the list has it)
+        assert_eq!(json["results"][0]["title"], "COMIC ExE two");
+        assert_eq!(json["results"][0]["path"], "/work/2");
+        assert_eq!(json["results"][0]["url"], "http://127.0.0.1/work/2");
         assert_eq!(json["terms"], serde_json::json!(["comic", "exe"]));
         assert_eq!((json["results"].as_array().unwrap().len(), &json["has_more"]), (2, &serde_json::json!(false)));
         assert!(json.get("total").is_none(), "a search does not count");
@@ -811,8 +812,8 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(json["input"], "チート");
         assert_eq!(json["query"], "cheat", "the romaji is the query: no hentai or anything else is added");
         assert_eq!(json["terms"], serde_json::json!(["cheat"]));
-        assert_eq!(json["results"][0]["title"], "cheat one", "the sites were asked the romaji, and the titles are matched with it");
-        assert_eq!(json["results"][0]["title_romaji"], "cheat one");
+        assert_eq!(json["results"][0]["title"], "cheat two", "the sites were asked the romaji, and the titles are matched with it");
+        assert_eq!(json["results"][0]["title_romaji"], "cheat two");
         assert_eq!(json["sites"][0]["queries"], serde_json::json!(["チート", "cheat"]), "a site that finds Japanese titles is asked both");
         assert_eq!(hits.ok.load(std::sync::atomic::Ordering::SeqCst), 2);
 
