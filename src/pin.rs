@@ -1,4 +1,4 @@
-//! Keeping the pages of the database file in memory (`[search] pin_db`).
+//! Keeping the pages of a database file in memory (`[search] pin_db` for `db_path`, `[search] pin_index_db` for `index_db_path`).
 //!
 //! The file is mapped and the map is locked (`mlock`): the system never takes its pages out of the page cache, so a search does not wait for
 //! the disk, however much memory the other programs of the machine want. It is what `vmtouch -l search.db` does, built in. Only the main file is
@@ -83,7 +83,7 @@ pub async fn run(path: PathBuf) {
         .await;
 
         let Ok((back, result)) = moved else {
-            log::warn!("pin_db: the task that locks the file stopped");
+            log::warn!("pin: the task that locks {} stopped", path.display());
             return;
         };
         pinned = back;
@@ -91,14 +91,14 @@ pub async fn run(path: PathBuf) {
         match result {
             Ok(Some(len)) => {
                 warned = None;
-                log::info!("pin_db: {} MiB of {} are locked in memory", len / (1024 * 1024), path.display());
+                log::info!("pin: {} MiB of {} are locked in memory", len / (1024 * 1024), path.display());
             }
             Ok(None) => {}
             Err(e) => {
                 let message = e.to_string();
                 if warned.as_deref() != Some(message.as_str()) {
                     log::warn!(
-                        "pin_db: cannot lock {} in memory ({message}); the right to lock memory is needed (Docker: cap_add IPC_LOCK and ulimits memlock -1)",
+                        "pin: cannot lock {} in memory ({message}); the right to lock memory is needed (Docker: cap_add IPC_LOCK and ulimits memlock -1)",
                         path.display()
                     );
                     warned = Some(message);
@@ -112,7 +112,7 @@ pub async fn run(path: PathBuf) {
 
 #[cfg(not(unix))]
 pub async fn run(path: PathBuf) {
-    log::warn!("pin_db: {} cannot be locked in memory on this system, only Unix can", path.display());
+    log::warn!("pin: {} cannot be locked in memory on this system, only Unix can", path.display());
 }
 
 #[cfg(test)]

@@ -104,7 +104,26 @@ impl std::ops::Deref for Candidates {
     }
 }
 
+/// The names of the two FTS5 indexes of the titles: in the file of the search database (`works_fts`, `works_words`, content in the table `works`), or in
+/// the file of the index (`[search] index_db_path`), attached as `idx` (`idx.works_fts`, `idx.works_words`; they keep the text of the titles themselves).
+#[derive(Clone, Copy)]
+struct IndexNames {
+    /// The name in a `FROM` (with the schema `idx.` when the index is in its own file) and the name of the table itself (the column that `MATCH` is
+    /// applied to).
+    fts: &'static str,
+    fts_match: &'static str,
+    words: &'static str,
+    words_match: &'static str,
+    /// The index is in its own file.
+    separate: bool,
+}
+
+const LEGACY_INDEX: IndexNames = IndexNames { fts: "works_fts", fts_match: "works_fts", words: "works_words", words_match: "works_words", separate: false };
+// (the names are not the ones of the tables of the file of the works: a trigger of a connection finds the table of the other file by its name alone)
+const SEPARATE_INDEX: IndexNames = IndexNames { fts: "idx.ix_keys", fts_match: "ix_keys", words: "idx.ix_words", words_match: "ix_words", separate: true };
+
 pub struct SearchStore {
+    names: IndexNames,
     db: DatabaseConnection,
     /// Read-only connections, several: a search does not wait for a write (or for the long read of the verification) of the one connection
     /// of `db` (the database is in WAL mode, so a read does not block a write either). The same connection as `db` for a database in memory.
@@ -113,9 +132,66 @@ pub struct SearchStore {
     max_candidates: std::sync::atomic::AtomicU64,
 }
 
+/// `ATTACH` of the file of the indexes as `idx` (the text of the path is quoted for SQL).
+fn attach_statement(index: &Path) -> String {
+    format!("ATTACH DATABASE '{}' AS idx", index.to_string_lossy().replace('\'', "''"))
+}
+
+/// The two indexes of the titles in the attached file: they keep the text of the titles themselves (the table `works` is in the other file). Their names
+/// are not the ones of the indexes of the old layout (`works_fts`): the triggers name them without the schema (SQLite does not allow a qualified name
+/// in a trigger), and the name has to be the one of one table only.
+fn index_schema() -> [&'static str; 2] {
+    [
+        "CREATE VIRTUAL TABLE IF NOT EXISTS idx.ix_keys USING fts5(title_key, website, tokenize='trigram')",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS idx.ix_words USING fts5(title_romaji, website, tokenize='unicode61')",
+    ]
+}
+
+/// The temporary triggers of a connection that writes: what is written to the table `works` is written to the indexes in the other file (a trigger of
+/// the file itself cannot write into another file, a temporary one can).
+fn index_triggers() -> [&'static str; 3] {
+    [
+        "CREATE TEMP TRIGGER IF NOT EXISTS idx_works_insert AFTER INSERT ON works BEGIN
+            INSERT INTO ix_keys(rowid, title_key, website) VALUES (new.rowid, new.title_key, new.website);
+            INSERT INTO ix_words(rowid, title_romaji, website) VALUES (new.rowid, new.title_romaji, new.website);
+        END",
+        "CREATE TEMP TRIGGER IF NOT EXISTS idx_works_delete AFTER DELETE ON works BEGIN
+            DELETE FROM ix_keys WHERE rowid = old.rowid;
+            DELETE FROM ix_words WHERE rowid = old.rowid;
+        END",
+        "CREATE TEMP TRIGGER IF NOT EXISTS idx_works_update AFTER UPDATE OF title_key, title_romaji, website ON works BEGIN
+            DELETE FROM ix_keys WHERE rowid = old.rowid;
+            DELETE FROM ix_words WHERE rowid = old.rowid;
+            INSERT INTO ix_keys(rowid, title_key, website) VALUES (new.rowid, new.title_key, new.website);
+            INSERT INTO ix_words(rowid, title_romaji, website) VALUES (new.rowid, new.title_romaji, new.website);
+        END",
+    ]
+}
+
+/// How many row numbers of `works` one step of the filling of the index covers (one transaction).
+const INDEX_FILL_CHUNK: i64 = 50_000;
+
 impl SearchStore {
+    /// Opens the database of the settings: `[search] db_path`, and the index in its own file when `[search] index_db_path` is set.
+    pub async fn open_configured(config: &crate::config::SearchConfig) -> Result<Self> {
+        let index = (!config.index_db_path.as_os_str().is_empty()).then_some(config.index_db_path.as_path());
+
+        Self::open_with(&config.db_path, index).await
+    }
+
+    #[cfg(test)]
     pub async fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, None).await
+    }
+
+    /// `index`: the file of the indexes of the titles (made if it is not there). The index is attached to every connection, and three temporary
+    /// triggers of the connection that writes keep it up to date (a trigger of the file cannot write into another file; a temporary one can).
+    /// It is filled from the works when it has fewer or more of them than the table (the first time, or after a copy that is old).
+    pub async fn open_with(path: &Path, index: Option<&Path>) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        if let Some(parent) = index.and_then(|index| index.parent()).filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent).await.map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
 
@@ -126,41 +202,70 @@ impl SearchStore {
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(10));
 
-        let readers = SqlitePoolOptions::new()
-            .max_connections(READERS)
-            .idle_timeout(None)
-            .max_lifetime(None)
-            .connect_lazy_with(options.clone().create_if_missing(false).read_only(true));
+        let mut readers = SqlitePoolOptions::new().max_connections(READERS).idle_timeout(None).max_lifetime(None);
+        if let Some(index) = index {
+            let attach = attach_statement(index);
+            readers = readers.after_connect(move |connection, _| {
+                let attach = attach.clone();
+                Box::pin(async move {
+                    sea_orm::sqlx::query(&attach).execute(&mut *connection).await?;
+                    Ok(())
+                })
+            });
+        }
+        let readers = readers.connect_lazy_with(options.clone().create_if_missing(false).read_only(true));
 
-        Self::init(options, Some(readers)).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
+        Self::init(options, Some(readers), index)
+            .await
+            .map_err(|e| format!("cannot open {}: {e}", path.display()).into())
     }
 
     #[cfg(test)]
     pub async fn in_memory() -> Result<Self> {
-        Self::init(SqliteConnectOptions::new().in_memory(true), None).await
+        Self::init(SqliteConnectOptions::new().in_memory(true), None, None).await
     }
 
-    async fn init(options: SqliteConnectOptions, readers: Option<sea_orm::sqlx::SqlitePool>) -> Result<Self> {
+    async fn init(options: SqliteConnectOptions, readers: Option<sea_orm::sqlx::SqlitePool>, index: Option<&Path>) -> Result<Self> {
         // one connection: the writes go one after the other, as the engine's tasks come
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .idle_timeout(None)
-            .max_lifetime(None)
-            .connect_with(options)
-            .await?;
+        let mut pool = SqlitePoolOptions::new().max_connections(1).idle_timeout(None).max_lifetime(None);
+        if let Some(index) = index {
+            // every connection that is made (also one that replaces a broken one) has the index attached and its triggers
+            let attach = attach_statement(index);
+            pool = pool.after_connect(move |connection, _| {
+                let attach = attach.clone();
+                Box::pin(async move {
+                    sea_orm::sqlx::query(&attach).execute(&mut *connection).await?;
+                    for sql in index_schema() {
+                        sea_orm::sqlx::query(sql).execute(&mut *connection).await?;
+                    }
+                    // the triggers need the table `works`, which a new database does not have yet (`init` makes them then)
+                    let has_works: Option<i64> = sea_orm::sqlx::query_scalar("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'works'")
+                        .fetch_optional(&mut *connection)
+                        .await?;
+                    if has_works.is_some() {
+                        for sql in index_triggers() {
+                            sea_orm::sqlx::query(sql).execute(&mut *connection).await?;
+                        }
+                    }
+                    Ok(())
+                })
+            });
+        }
+        let pool = pool.connect_with(options).await?;
         let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        let names = if index.is_some() { SEPARATE_INDEX } else { LEGACY_INDEX };
 
-        Self::create_tables(&db).await?;
+        Self::create_tables(&db, names).await?;
 
         let reader = match readers {
             Some(pool) => SqlxSqliteConnector::from_sqlx_sqlite_pool(pool),
             None => db.clone(),
         };
 
-        Ok(Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
+        Ok(Self { names, db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES) })
     }
 
-    async fn create_tables(db: &DatabaseConnection) -> Result<()> {
+    async fn create_tables(db: &DatabaseConnection, names: IndexNames) -> Result<()> {
         let backend = db.get_database_backend();
         let schema = Schema::new(backend);
 
@@ -194,12 +299,12 @@ impl SearchStore {
             .to_owned();
         db.execute(backend.build(&by_japanese)).await?;
 
-        Self::create_word_index(db).await
+        Self::create_word_index(db, names).await
     }
 
     /// The two indexes of the titles, made again when the database has the old ones (`user_version` 0): the key of a work is then the key of
     /// what is outside its parentheses (`query::outside_key`), as the search matches it, and both indexes have the name of the site.
-    async fn create_word_index(db: &DatabaseConnection) -> Result<()> {
+    async fn create_word_index(db: &DatabaseConnection, names: IndexNames) -> Result<()> {
         let backend = db.get_database_backend();
         let version: i64 = db
             .query_one(Statement::from_string(backend, "PRAGMA user_version"))
@@ -223,6 +328,18 @@ impl SearchStore {
             }
 
             Self::rewrite_keys(db).await?;
+        }
+
+        if names.separate {
+            // the indexes are in their own file: the triggers (temporary ones) and the schema are made now that the table `works` is there, and the
+            // index is made to have the works the table has
+            for sql in index_schema().iter().chain(index_triggers().iter()) {
+                db.execute_unprepared(sql).await?;
+            }
+            Self::repair_index(db).await?;
+            db.execute_unprepared(&format!("PRAGMA user_version = {INDEX_VERSION}")).await?;
+
+            return Ok(());
         }
 
         // the index of the title keys: FTS5 with the trigram tokenizer, which finds the works whose key has a piece of text in it (3
@@ -275,6 +392,69 @@ impl SearchStore {
         if works != indexed {
             log::info!("{name}: indexing {works} works ({indexed} were indexed)");
             db.execute_unprepared(&format!("INSERT INTO {name}({name}) VALUES ('rebuild')")).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Makes the indexes of the other file have the works of the table: the works that they lack are added, and the rows of the works that are gone are
+    /// taken out. Done a step of `INDEX_FILL_CHUNK` row numbers at a time (a transaction each), and only for the index whose number of works is not the one
+    /// of the table. The first time (an empty index) it reads the whole table.
+    async fn repair_index(db: &DatabaseConnection) -> Result<()> {
+        let backend = db.get_database_backend();
+        let count = |sql: String| async move {
+            let row = db.query_one(Statement::from_string(backend, sql)).await?.ok_or("no count")?;
+            Result::Ok(row.try_get::<i64>("", "n")?)
+        };
+        // the number of works and the sum of their row numbers: another work of the same number (one added, one deleted) is not the same set
+        let works = count("SELECT count(*) AS n FROM main.works".to_string()).await?;
+        let works_sum = count("SELECT coalesce(sum(rowid), 0) AS n FROM main.works".to_string()).await?;
+
+        for (table, column) in [("ix_keys", "title_key"), ("ix_words", "title_romaji")] {
+            let indexed = count(format!("SELECT count(*) AS n FROM idx.{table}_docsize")).await?;
+            let indexed_sum = count(format!("SELECT coalesce(sum(id), 0) AS n FROM idx.{table}_docsize")).await?;
+
+            if indexed == works && indexed_sum == works_sum {
+                continue;
+            }
+
+            let last = count("SELECT coalesce(max(rowid), 0) AS n FROM main.works".to_string()).await?.max(count(format!("SELECT coalesce(max(id), 0) AS n FROM idx.{table}_docsize")).await?);
+            log::info!("idx.{table}: {indexed} works are indexed, the table has {works}: filling the index (row numbers up to {last})");
+
+            let mut from = 0_i64;
+            while from <= last {
+                let to = from + INDEX_FILL_CHUNK;
+                let transaction = db.begin().await?;
+
+                transaction
+                    .execute(Statement::from_sql_and_values(
+                        backend,
+                        format!(
+                            "INSERT INTO idx.{table}(rowid, {column}, website) SELECT rowid, {column}, website FROM main.works WHERE rowid >= ?1 AND rowid < ?2 \
+                             AND rowid NOT IN (SELECT id FROM idx.{table}_docsize WHERE id >= ?1 AND id < ?2)"
+                        ),
+                        [from.into(), to.into()],
+                    ))
+                    .await?;
+                transaction
+                    .execute(Statement::from_sql_and_values(
+                        backend,
+                        format!(
+                            "DELETE FROM idx.{table} WHERE rowid IN (SELECT id FROM idx.{table}_docsize WHERE id >= ?1 AND id < ?2 \
+                             AND id NOT IN (SELECT rowid FROM main.works WHERE rowid >= ?1 AND rowid < ?2))"
+                        ),
+                        [from.into(), to.into()],
+                    ))
+                    .await?;
+                transaction.commit().await?;
+
+                if (from / INDEX_FILL_CHUNK) % 20 == 19 {
+                    log::info!("idx.{table}: filled up to the row number {to} of {last}");
+                }
+                from = to;
+            }
+
+            log::info!("idx.{table}: filled");
         }
 
         Ok(())
@@ -1258,26 +1438,29 @@ impl SearchStore {
 
     /// The SQL of the row numbers of the works that a `Matcher` finds through the indexes (every site: the works of a site are told apart
     /// after the rows are read, a site in the query makes the index walk the long list of its works). All the rows, for a count.
-    fn rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+    fn rowids(&self, matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+        let (fts, words) = (self.names.fts, self.names.words);
+        let (fts_match, words_match) = (self.names.fts_match, self.names.words_match);
         let (long, short) = Self::match_texts(matcher);
 
         match (long, short) {
             (Some(long), Some(short)) => (
                 // both sets are made once and joined (a `rowid IN (SELECT ... FROM works_words ...)` asks the index again for every row of the other one)
-                "WITH f AS MATERIALIZED (SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ?), \
-                 w AS MATERIALIZED (SELECT rowid AS r FROM works_words WHERE works_words MATCH ?) SELECT r FROM f JOIN w USING (r)"
-                    .to_string(),
+                format!(
+                    "WITH f AS MATERIALIZED (SELECT rowid AS r FROM {fts} WHERE {fts_match} MATCH ?), \
+                     w AS MATERIALIZED (SELECT rowid AS r FROM {words} WHERE {words_match} MATCH ?) SELECT r FROM f JOIN w USING (r)"
+                ),
                 vec![long.into(), short.into()],
             ),
-            (Some(long), None) => ("SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ?".to_string(), vec![long.into()]),
-            (None, Some(short)) => ("SELECT rowid AS r FROM works_words WHERE works_words MATCH ?".to_string(), vec![short.into()]),
+            (Some(long), None) => (format!("SELECT rowid AS r FROM {fts} WHERE {fts_match} MATCH ?"), vec![long.into()]),
+            (None, Some(short)) => (format!("SELECT rowid AS r FROM {words} WHERE {words_match} MATCH ?"), vec![short.into()]),
             (None, None) => ("SELECT rowid AS r FROM works WHERE 0".to_string(), Vec::new()),
         }
     }
 
     /// How many works `matcher` finds in the indexes (the `count` command: a search does not count).
     pub async fn count_found(&self, matcher: &crate::query::Matcher) -> Result<usize> {
-        let (sql, values) = Self::rowids(matcher);
+        let (sql, values) = self.rowids(matcher);
         let row = self
             .reader
             .query_one(Statement::from_sql_and_values(self.reader.get_database_backend(), format!("SELECT count(*) AS n FROM ({sql})"), values))
@@ -1289,7 +1472,7 @@ impl SearchStore {
 
     /// How many works of each site `matcher` finds in the indexes: (site, works), the sites with none left out (the `count` command).
     pub async fn count_found_by_site(&self, matcher: &crate::query::Matcher) -> Result<Vec<(String, usize)>> {
-        let (sql, values) = Self::rowids(matcher);
+        let (sql, values) = self.rowids(matcher);
         let rows = self
             .reader
             .query_all(Statement::from_sql_and_values(
@@ -1334,20 +1517,95 @@ impl SearchStore {
     /// to bind after its values. With pieces and short words, the rows of the pieces are walked in that order and each is asked of the index of
     /// words by its row number: it stops at the `limit`th row, and the list of a word that most titles have (`no`) is not built (the join of
     /// the two lists of `rowids` takes seconds for it). The indexes give the rows in this order as they are, so it is also the fastest.
-    fn first_rowids(matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+    fn first_rowids(&self, matcher: &crate::query::Matcher) -> (String, Vec<sea_orm::Value>) {
+        let (fts, words) = (self.names.fts, self.names.words);
+        let (fts_match, words_match) = (self.names.fts_match, self.names.words_match);
+
         match Self::match_texts(matcher) {
             (Some(long), Some(short)) => (
-                "SELECT r FROM (SELECT rowid AS r FROM works_fts WHERE works_fts MATCH ? ORDER BY rowid) f \
-                 WHERE EXISTS (SELECT 1 FROM works_words WHERE works_words MATCH ? AND rowid = f.r) LIMIT ?"
-                    .to_string(),
+                format!(
+                    "SELECT r FROM (SELECT rowid AS r FROM {fts} WHERE {fts_match} MATCH ? ORDER BY rowid) f \
+                     WHERE EXISTS (SELECT 1 FROM {words} WHERE {words_match} MATCH ? AND rowid = f.r) LIMIT ?"
+                ),
                 vec![long.into(), short.into()],
             ),
             _ => {
-                let (sql, values) = Self::rowids(matcher);
+                let (sql, values) = self.rowids(matcher);
 
                 (format!("SELECT r FROM ({sql}) ORDER BY r LIMIT ?"), values)
             }
         }
+    }
+
+    /// The `wanted` works that `matcher` finds, the smallest row number first, except that the first `window` of them are put in order by how good they
+    /// are (`tier`, 0 the best; each tier in the order of the rows): (site, work). `tier` is given the romaji of a title. Only the row numbers and the romaji
+    /// of the `window` rows are read from the indexes (in their own file when `[search] index_db_path` is set, which is the file that is kept in memory);
+    /// the table of the works is read for the `wanted` rows only. `window` 0: no such order.
+    pub async fn top_found_ranked(
+        &self,
+        matcher: &crate::query::Matcher,
+        wanted: usize,
+        window: usize,
+        tier: &(dyn Fn(&str) -> u8 + Sync),
+    ) -> Result<Vec<(String, Candidate)>> {
+        use sea_orm::FromQueryResult;
+
+        if window == 0 {
+            return self.top_found(matcher, wanted).await;
+        }
+
+        let read = wanted.max(window);
+        let (sql, mut values) = self.first_rowids(matcher);
+        values.push((read as i64).into());
+        let words = self.names.words;
+        let rows = self
+            .reader
+            .query_all(Statement::from_sql_and_values(
+                self.reader.get_database_backend(),
+                format!("SELECT x.r AS r, w.title_romaji AS romaji FROM ({sql}) x LEFT JOIN {words} w ON w.rowid = x.r ORDER BY x.r"),
+                values,
+            ))
+            .await?;
+        let mut found: Vec<(i64, String)> = Vec::with_capacity(rows.len());
+
+        for row in &rows {
+            found.push((row.try_get("", "r")?, row.try_get::<Option<String>>("", "romaji")?.unwrap_or_default()));
+        }
+
+        // the first `window` rows by their tier, the others after them as they are
+        let tail = found.split_off(window.min(found.len()));
+        found.sort_by_cached_key(|(_, romaji)| tier(romaji));
+        found.extend(tail);
+        found.truncate(wanted);
+
+        if found.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(Debug, sea_orm::FromQueryResult)]
+        struct RankedRow {
+            r: i64,
+            website: String,
+            path: String,
+            title: String,
+            title_romaji: String,
+            title_key: String,
+            language: Option<String>,
+        }
+
+        let marks = vec!["?"; found.len()].join(",");
+        let statement = Statement::from_sql_and_values(
+            self.reader.get_database_backend(),
+            format!("SELECT rowid AS r, website, path, title, title_romaji, title_key, language FROM works WHERE rowid IN ({marks})"),
+            found.iter().map(|(r, _)| sea_orm::Value::from(*r)),
+        );
+        let mut by_row: HashMap<i64, RankedRow> = RankedRow::find_by_statement(statement).all(&self.reader).await?.into_iter().map(|row| (row.r, row)).collect();
+
+        Ok(found
+            .iter()
+            .filter_map(|(r, _)| by_row.remove(r))
+            .map(|row| (row.website, Candidate { site: 0, path: row.path, title: row.title, title_romaji: row.title_romaji, title_key: row.title_key, language: row.language }))
+            .collect())
     }
 
     /// The `limit` works that `matcher` finds, the smallest row number first: (site, work). The order is the one of the rows (the first added
@@ -1356,7 +1614,7 @@ impl SearchStore {
     pub async fn top_found(&self, matcher: &crate::query::Matcher, limit: usize) -> Result<Vec<(String, Candidate)>> {
         use sea_orm::FromQueryResult;
 
-        let (sql, mut values) = Self::first_rowids(matcher);
+        let (sql, mut values) = self.first_rowids(matcher);
         values.push((limit as i64).into());
         let statement = Statement::from_sql_and_values(
             self.reader.get_database_backend(),
@@ -1394,7 +1652,7 @@ impl SearchStore {
     fn candidates_statement(&self, parts: &[&str], most: u64, columns: &str) -> Statement {
         use sea_orm::Value;
 
-        let mut filters: Vec<&str> = Vec::new();
+        let mut filters: Vec<String> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
 
         // the index is made of pieces of 3 characters: a shorter piece can only be looked for in the rows the others leave
@@ -1405,17 +1663,17 @@ impl SearchStore {
             // gigabytes, row by row, for a piece that many works have)
             let phrases = long.iter().map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(" AND ");
 
-            filters.push("rowid IN (SELECT rowid FROM works_fts WHERE works_fts MATCH ?)");
+            filters.push(format!("rowid IN (SELECT rowid FROM {} WHERE {} MATCH ?)", self.names.fts, self.names.fts_match));
             values.push(phrases.into());
         }
         // a short piece of letters and digits is a word (`ai` is not `maid`): the works that have it are found in the word index. Any other
         // short piece (Japanese, a symbol) is looked for in the works the others leave (in all the works when there is no other)
         for part in short {
             if part.chars().all(|c| c.is_ascii_alphanumeric()) {
-                filters.push("rowid IN (SELECT rowid FROM works_words WHERE works_words MATCH ?)");
+                filters.push(format!("rowid IN (SELECT rowid FROM {} WHERE {} MATCH ?)", self.names.words, self.names.words_match));
                 values.push(format!("\"{part}\"").into());
             } else {
-                filters.push("instr(title_key, ?) > 0");
+                filters.push("instr(title_key, ?) > 0".to_string());
                 values.push(part.into());
             }
         }
@@ -1977,6 +2235,79 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
     }
+    async fn found_paths(store: &SearchStore, long: &[&str], short: &[&str]) -> Vec<String> {
+        let matcher = crate::query::Matcher { long: long.iter().map(|w| w.to_string()).collect(), short: short.iter().map(|w| w.to_string()).collect(), ..Default::default() };
+
+        store.top_found(&matcher, 100).await.unwrap().into_iter().map(|(_, candidate)| candidate.path).collect()
+    }
+
+    #[tokio::test]
+    async fn the_indexes_in_their_own_file_follow_the_table_and_are_filled_when_they_lag() {
+        let dir = std::env::temp_dir().join(format!("okazuri-index-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (path, index) = (dir.join("search.db"), dir.join("index.db"));
+
+        let store = SearchStore::open_with(&path, Some(&index)).await.unwrap();
+        store.save("q", "A", 1, &Ok(vec![link("/1", "Rashoumon"), link("/2", "Kimera Shoujo ga Hoshii Mono")]), false).await.unwrap();
+        assert_eq!(found_paths(&store, &["rashoumon"], &[]).await, ["/1"]);
+        assert_eq!(found_paths(&store, &["shoujo"], &[]).await, ["/2"]);
+        assert_eq!(found_paths(&store, &[], &["mono"]).await, ["/2"], "the index of words");
+
+        // a title that changes, and a work that is deleted, are followed
+        store.save("q", "A", 1, &Ok(vec![link("/1", "Totally Another Hanashi")]), false).await.unwrap();
+        assert_eq!(found_paths(&store, &["rashoumon"], &[]).await, Vec::<String>::new());
+        assert_eq!(found_paths(&store, &["hanashi"], &[]).await, ["/1"]);
+        store.db.execute_unprepared("DELETE FROM works WHERE path = '/2'").await.unwrap();
+        assert_eq!(found_paths(&store, &["shoujo"], &[]).await, Vec::<String>::new());
+
+        // the indexes are not in the file of the table
+        let count: i64 = store.db.query_one(Statement::from_string(store.db.get_database_backend(), "SELECT count(*) AS n FROM sqlite_master WHERE name LIKE 'ix_%'")).await.unwrap().unwrap().try_get("", "n").unwrap();
+        assert_eq!(count, 0);
+        drop(store);
+
+        // works written while the indexes were not there (another program, an older version) are found after the next opening, and the rows of
+        // works that are gone are taken out
+        let plain = SearchStore::open(&path).await.unwrap();
+        plain.save("q", "A", 1, &Ok(vec![link("/1", "Totally Another Hanashi"), link("/3", "Third Work")]), false).await.unwrap();
+        plain.db.execute_unprepared("DELETE FROM works WHERE path = '/1'").await.unwrap();
+        drop(plain);
+
+        let again = SearchStore::open_with(&path, Some(&index)).await.unwrap();
+        assert_eq!(found_paths(&again, &["third"], &[]).await, ["/3"]);
+        assert_eq!(found_paths(&again, &["hanashi"], &[]).await, Vec::<String>::new(), "a work that is gone is not found");
+        drop(again);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_works_that_start_the_answer_are_put_in_order_from_the_indexes() {
+        let dir = std::env::temp_dir().join(format!("okazuri-index-rank-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        for index in [None, Some(dir.join("index.db"))] {
+            let store = SearchStore::open_with(&dir.join(if index.is_some() { "a.db" } else { "b.db" }), index.as_deref()).await.unwrap();
+            store.save("q", "A", 1, &Ok(vec![link("/1", "Kimera Shoujo ga Hoshii Mono"), link("/2", "Rashoumon"), link("/3", "Rashou Mon")]), false).await.unwrap();
+            let matcher = crate::query::Matcher { long: vec!["rashou".into(), "mon".into()], ..Default::default() };
+            let tier = |romaji: &str| u8::from(romaji.contains("Kimera"));
+            let ranked = store.top_found_ranked(&matcher, 10, 100, &tier).await.unwrap();
+
+            // a window of 0 keeps the order of the rows; the window puts the one that is not good last, the others stay in the order of the rows
+            let plain = store.top_found_ranked(&matcher, 10, 0, &tier).await.unwrap();
+            let rows: Vec<&str> = plain.iter().map(|(_, c)| c.path.as_str()).collect();
+            let mut expected = rows.clone();
+            expected.sort_by_key(|path| u8::from(*path == "/1"));
+            assert_eq!(ranked.iter().map(|(_, c)| c.path.as_str()).collect::<Vec<_>>(), expected);
+            assert_eq!(expected.last(), Some(&"/1"));
+            assert_eq!(ranked.iter().find(|(_, c)| c.path == "/2").unwrap().1.title, "Rashoumon", "the row itself is read from the table");
+            // fewer wanted than found
+            assert_eq!(store.top_found_ranked(&matcher, 1, 100, &tier).await.unwrap().len(), 1);
+            drop(store);
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// What `instr` says: the works (the newest first) whose key has the piece.
     async fn by_instr(store: &SearchStore, part: &str, most: usize) -> Vec<String> {
         store.candidates_owned(&[]).await.unwrap().into_iter().filter(|w| w.title_key.contains(part)).take(most).map(|w| w.path).collect()

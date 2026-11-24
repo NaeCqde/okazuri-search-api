@@ -1030,12 +1030,11 @@ impl Engine {
 
         if left > 0 {
             // the works of the earlier search that this one finds again are among the rows, so that many more are read
-            // the first `rank_window` works are read and put in order (the good answers first); the answer needs only `left + spare` of them
+            // the first `rank_window` works are put in order (the good answers first); the answer needs only `left + spare` of them
             let wanted = left + spare;
-            let found = self.store.top_found(matcher, wanted.max(self.config.rank_window)).await?;
-            let found = rank_first(found, self.config.rank_window, |(_, row)| terms.answer_tier(&row.title_romaji));
+            let found = self.store.top_found_ranked(matcher, wanted, self.config.rank_window, &|romaji| terms.answer_tier(romaji)).await?;
 
-            for (name, mut row) in found.into_iter().take(wanted) {
+            for (name, mut row) in found {
                 // the work of a site that is not in the list (it was removed from the code) is not in the answer
                 let Some(index) = self.site_named(&name) else { continue };
                 let place = match websites.iter().position(|known| *known == name) {

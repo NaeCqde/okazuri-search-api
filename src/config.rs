@@ -77,6 +77,10 @@ pub struct SearchConfig {
     pub enabled: bool,
     /// The SQLite file with the results of the searches (made if it is not there).
     pub db_path: PathBuf,
+    /// The file of the indexes of the titles (the trigram index of the keys and the index of the words), apart from `db_path` (made and filled from it if it is
+    /// not there or lags behind). Empty: the indexes are in `db_path`, as before. With a file of their own the indexes (about 3 GB for 9 million works) can be kept
+    /// in memory (`pin_index_db`) while the table of the works (`db_path`, much of it read once for a search) is not.
+    pub index_db_path: PathBuf,
     /// A search younger than this is answered from the database, without asking the sites.
     pub ttl_hours: u64,
     /// A site that failed is not asked the same query again before this.
@@ -111,6 +115,9 @@ pub struct SearchConfig {
     /// its pages out of the page cache, and a search never waits for the disk. Needs the right to lock that much memory (in Docker:
     /// `cap_add: IPC_LOCK` and `ulimits: memlock: -1`); without it the server only warns and goes on. The file is locked again when it grows.
     pub pin_db: bool,
+    /// Keep the pages of the file of the indexes (`index_db_path`) in memory, the way `pin_db` does for `db_path`. The two are set apart: the file of the indexes
+    /// is the one that a search reads most.
+    pub pin_index_db: bool,
     /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
     pub try_unsupported: bool,
     /// The bridge of Google Translate: not a key of `[search]`, it is `[translation]` (`open_engine` copies it here).
@@ -129,6 +136,7 @@ impl Default for SearchConfig {
         Self {
             enabled: false,
             db_path: PathBuf::from("search.db"),
+            index_db_path: PathBuf::new(),
             ttl_hours: 24 * 30,
             retry_failed_minutes: 60,
             max_query_chars: 300,
@@ -143,6 +151,7 @@ impl Default for SearchConfig {
             disabled_sites: Vec::new(),
             skip_crawled: false,
             pin_db: false,
+            pin_index_db: false,
             try_unsupported: false,
             google_bridge_url: String::new(),
             google_bridge_token: String::new(),
