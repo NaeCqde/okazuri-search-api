@@ -274,6 +274,27 @@ pub struct Matcher {
     pub alts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+impl Matcher {
+    /// Does a work have what the index found it by? Every piece of `long` (or one of its other spellings) is in the key, and every word of
+    /// `short` (or one of its other spellings) is a word of the romaji. The trigram index has the trigrams of a piece with no position: a title
+    /// that has them apart is found by it and not accepted here.
+    pub fn accepts(&self, key: &str, romaji: &str) -> bool {
+        let has = |piece: &String| std::iter::once(piece).chain(self.alts.get(piece).into_iter().flatten()).any(|text| key.contains(text.as_str()));
+
+        if !self.long.iter().all(has) {
+            return false;
+        }
+
+        if self.short.is_empty() {
+            return true;
+        }
+
+        let words: Vec<String> = romaji.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).map(str::to_lowercase).collect();
+
+        self.short.iter().all(|word| std::iter::once(word).chain(self.alts.get(word).into_iter().flatten()).any(|text| words.iter().any(|known| known == text)))
+    }
+}
+
 /// The most words of a query that are joined as one word of a title (`rashou mon` is `Rashoumon`).
 const MOST_JOINED_WORDS: usize = 4;
 

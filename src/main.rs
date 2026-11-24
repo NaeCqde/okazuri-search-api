@@ -31,6 +31,7 @@ mod romaji;
 mod romanizer;
 mod sites;
 mod store;
+mod textindex;
 #[cfg(test)]
 mod testing;
 mod titles;
