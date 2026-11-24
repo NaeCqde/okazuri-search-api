@@ -129,12 +129,30 @@ async fn token(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: L
     Ok(token)
 }
 
+/// The text as it is sent to Google Translate. A text with no white space and with dots (`FapHouse.NuCosplay.25.02.28.Maid.in.a.Room`, the
+/// name of a torrent) is taken for an address: the answer is a link to translate the page, with no translation in it. The dots are spaces
+/// then. Only what is sent changes: the title and the key of the translation are the ones that were asked.
+fn sent_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('.') && !text.contains(char::is_whitespace) {
+        let spaced = text.replace('.', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // a text of dots only has nothing else to send
+        if !spaced.is_empty() {
+            return std::borrow::Cow::Owned(spaced);
+        }
+    }
+
+    std::borrow::Cow::Borrowed(text)
+}
+
 /// Asks Google Translate. With a bridge, the request is the one that the page made (the browser only made its token, and its own
 /// request was held back), sent from here; without one it is the request of this program, which has no token and gets the answer of
 /// the classic model.
 pub async fn translate(client: &reqwest::Client, bridge: Bridge<'_>, text: &str, from: Lang, to: Lang) -> Result<String, String> {
     // without a bridge the classic model is the answer that is asked for
     let attempts = if bridge.url.is_empty() { 1 } else { ATTEMPTS };
+    let sent = sent_text(text);
+    let text = sent.as_ref();
     let mut answer = ask(client, bridge, text, from, to).await?;
 
     for attempt in 2..=attempts {
@@ -188,6 +206,15 @@ mod tests {
             request("姉弟", Lang::Japanese, Lang::English),
             r#"[[["MkEWBc","[[\"姉弟\",\"ja\",\"en\",1,null,1],[]]",null,"generic"]]]"#
         );
+    }
+
+    #[test]
+    fn a_text_of_dots_with_no_space_is_sent_with_spaces_and_any_other_text_as_it_is() {
+        assert_eq!(sent_text("FapHouse.NuCosplay.25.02.28.藤野りん.Horny.Maid.in.a.Hotel.Room"), "FapHouse NuCosplay 25 02 28 藤野りん Horny Maid in a Hotel Room");
+        assert_eq!(sent_text("a..b."), "a b");
+        assert_eq!(sent_text("Ver.1.0 の話"), "Ver.1.0 の話", "a text with a space is a text");
+        assert_eq!(sent_text("姉弟"), "姉弟");
+        assert_eq!(sent_text("..."), "...", "nothing else to send");
     }
 
     /// Asks Google Translate (the network): `cargo test -- --ignored`.
