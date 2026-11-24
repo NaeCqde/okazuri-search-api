@@ -14,8 +14,6 @@ pub struct Model {
     pub title: String,
     /// Its romaji: what a query (which is always romaji) is matched with.
     pub title_romaji: String,
-    /// The romaji as it is compared (case, width and white space folded), to narrow a search in SQL.
-    pub title_key: String,
     pub first_seen: i64,
     pub updated_at: i64,
     /// The language the title says the work is in (`language.rs`): a two-letter code; NULL when the title says none.

@@ -2155,7 +2155,7 @@ pub(crate) mod tests {
         assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
         let saved = store.candidates_owned(&[]).await.unwrap();
         let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
-        assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
+        assert_eq!((one.title_romaji.as_str(), crate::query::outside_key(&one.title_romaji).as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
         assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
         assert!(!store.states("q2").await.unwrap().is_empty(), "the other one stays");
 
@@ -2451,7 +2451,7 @@ pub(crate) mod tests {
             .filter(|w| {
                 words.iter().all(|word| {
                     if word.chars().count() >= 3 {
-                        w.title_key.contains(word.as_str())
+                        crate::query::outside_key(&w.title_romaji).contains(word.as_str())
                     } else {
                         w.title_romaji.split(|c: char| !c.is_ascii_alphanumeric()).any(|piece| piece == word)
                     }

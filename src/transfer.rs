@@ -139,7 +139,6 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                 work::Model {
                     website: line.website,
                     path: line.path,
-                    title_key: crate::query::outside_key(&converted),
                     title_romaji: converted,
                     title,
                     first_seen: line.first_seen,
