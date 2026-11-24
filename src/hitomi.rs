@@ -276,13 +276,13 @@ impl Gallery {
         };
 
         let mut tags: Vec<String> = Vec::new();
-        for tag in self.kind.iter().chain(&self.parodies).chain(&self.characters).chain(&self.tags) {
+        for tag in self.artists.iter().chain(&self.groups).chain(self.kind.iter()).chain(&self.parodies).chain(&self.characters).chain(&self.tags) {
             if !tags.contains(tag) {
                 tags.push(tag.clone());
             }
         }
-        let creators: Vec<&str> = self.artists.iter().chain(&self.groups).map(String::as_str).collect();
-        let extra = crate::sites::Extra { tags, uploader: (!creators.is_empty()).then(|| { let name = creators.join(" "); crate::sites::Account { id: name.clone(), name } }), posted_at: self.posted_at, romaji: Vec::new() };
+        // Hitomi.La has no uploader: the artists and the circles are tags (the author of a work is not the one who posted it)
+        let extra = crate::sites::Extra { tags, uploader: None, posted_at: self.posted_at, romaji: Vec::new() };
 
         Link { path: self.path(), title, extra }
     }
@@ -643,8 +643,8 @@ mod tests {
         let body = r#"var galleryinfo = {"title":"T","japanese_title":null,"type":"doujinshi","language":"japanese","artists":[{"artist":"Fini"}],"groups":[{"group":"Circle"}],"parodys":[{"parody":"vocaloid"}],"characters":[{"character":"hatsune miku"}],"tags":[{"tag":"big breasts","female":"1"}],"date":"2022-12-29 19:23:00-06","files":[{},{}]}"#;
         let link = parse_gallery(1, body).unwrap().link();
 
-        assert_eq!(link.extra.tags, ["doujinshi", "vocaloid", "hatsune miku", "big breasts"]);
-        assert_eq!(link.extra.uploader.map(|account| account.name), Some("fini circle".to_string()));
+        assert_eq!(link.extra.tags, ["fini", "circle", "doujinshi", "vocaloid", "hatsune miku", "big breasts"]);
+        assert_eq!(link.extra.uploader, None, "nobody posted it that the site tells");
         assert_eq!(link.extra.posted_at, Some(1_672_363_380), "2022-12-30 01:23 UTC");
     }
 }

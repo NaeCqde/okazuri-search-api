@@ -449,7 +449,7 @@ pub struct Link {
 pub struct Extra {
     /// The tags, flat: the namespace of E-Hentai (`female:`) is dropped, the category (`Cosplay`) is a tag, the hashtags of other sites are tags.
     pub tags: Vec<String>,
-    /// The account that posted the work.
+    /// The account that posted the work (not its author: the artist and the circle are tags).
     pub uploader: Option<Account>,
     /// When the work was posted, in seconds since the epoch (UTC).
     pub posted_at: Option<i64>,
