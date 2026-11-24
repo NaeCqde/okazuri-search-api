@@ -792,7 +792,8 @@ impl Engine {
                 true
             }
             Err(e) => {
-                text_log!(warn, "cannot search the title {text:?} of {:?}: {e}", request.query; "cannot search the other title of a query: {e}");
+                // not a failure: the other title is left out when the indexes cannot answer it (a word that is a number...), so it is an info line: `[log] queries = errors` keeps the query out of it
+                text_log!(info, "cannot search the title {text:?} of {:?}: {e}", request.query; "cannot search the other title of a query: {e}");
 
                 false
             }
