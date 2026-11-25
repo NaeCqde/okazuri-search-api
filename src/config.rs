@@ -18,8 +18,27 @@ pub struct Config {
     pub translation: TranslationConfig,
     pub crawl: CrawlConfig,
     pub distribute: DistributeConfig,
+    pub cloudflare: CloudflareConfig,
     pub cron: CronConfig,
     pub log: LogConfig,
+}
+
+/// The sites behind a Cloudflare challenge (`cloudflare.rs`): with `enabled` they are read like the others, with the cookie, the User-Agent and the proxy that
+/// the server at `api` gives.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CloudflareConfig {
+    pub enabled: bool,
+    /// The address of the server of the cookies: it is asked `GET {api}?url=https://site` and answers `{"cookie": "...", "user_agent": "...", "proxy": null}`.
+    pub api: String,
+    /// How long an answer is kept, in minutes.
+    pub cache_minutes: u64,
+}
+
+impl Default for CloudflareConfig {
+    fn default() -> Self {
+        Self { enabled: false, api: String::new(), cache_minutes: 30 }
+    }
 }
 
 /// Which log lines have what a person searched for, or what it was translated to.
@@ -115,8 +134,9 @@ pub struct SearchConfig {
     /// its pages out of the page cache, and a search never waits for the disk. Needs the right to lock that much memory (in Docker:
     /// `cap_add: IPC_LOCK` and `ulimits: memlock: -1`); without it the server only warns and goes on. The file is locked again when it grows.
     pub pin_db: bool,
-    /// Also try the sites that cannot be searched with a plain request (a Cloudflare challenge ...).
-    pub try_unsupported: bool,
+    /// `[cloudflare]`, which the engine reads with the settings of the search (`open_engine` copies it here).
+    #[serde(skip)]
+    pub cloudflare: CloudflareConfig,
     /// The bridge of Google Translate: not a key of `[search]`, it is `[translation]` (`open_engine` copies it here).
     /// The address of `tools/google-translate-bridge` (a Chrome that makes the token of Google Translate), such as
     /// `http://100.64.0.1:8130`. Empty: Google Translate is asked without the token, which gets the answer of the classic
@@ -148,7 +168,7 @@ impl Default for SearchConfig {
             disabled_sites: Vec::new(),
             skip_crawled: false,
             pin_db: false,
-            try_unsupported: false,
+            cloudflare: CloudflareConfig::default(),
             google_bridge_url: String::new(),
             google_bridge_token: String::new(),
         }

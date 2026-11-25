@@ -526,6 +526,10 @@ async fn open_engine(config: &Config, romanizer: Arc<Romanizer>) -> Result<Arc<E
     let mut search = config.search.clone();
     search.google_bridge_url = config.translation.google_bridge_url.clone();
     search.google_bridge_token = config.translation.google_bridge_token.clone();
+    search.cloudflare = config.cloudflare.clone();
+    if config.cloudflare.enabled && config.cloudflare.api.trim().is_empty() {
+        return Err("[cloudflare] enabled = true needs api (the address of the server that gives the cookies)".into());
+    }
 
     Ok(Engine::new(&search, Arc::new(store), romanizer))
 }

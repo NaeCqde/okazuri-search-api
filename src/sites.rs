@@ -8,7 +8,7 @@
 //! path of the work's page (no scheme or domain). No image, and no address of an image.
 //!
 //! Not every site can be searched with a plain HTTP request. `Support` says why, and the engine
-//! leaves those sites out unless `[search] try_unsupported = true`.
+//! leaves those sites out (the ones behind a Cloudflare challenge are read when `[cloudflare]` is on, `cloudflare.rs`).
 
 use crate::query::has_japanese;
 use regex::{Regex, RegexBuilder};
