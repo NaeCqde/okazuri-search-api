@@ -67,8 +67,8 @@ max_candidates = 800000
 rank_window = 2000
 # How much a query that names a tag adds to the score, by kind (the weight of the tag in the `tags` table counts too).
 # tag_boost = { tag = 1.0, author = 6.0, circle = 4.0, weak = 0.25 }
-# Sites that are left out (the names of GET /okazuri/sites): not asked by a search or the prefetch, not walked by [crawl], not checked by [verify]. What
-# is saved of them is still in the answer, after the works of the other sites. (A request leaves a site out of what it asks with `exclude`.) The demo
+# Sites that are left out (the names of GET /okazuri/sites): not asked by a search or the prefetch. What is saved of them is still in the answer,
+# after the works of the other sites. The crawl and the verification have a list of their own ([crawl] disabled_sites). (A request leaves a site out of what it asks with `exclude`.) The demo
 # server leaves out these three.
 disabled_sites = ["177Picyy", "R18Best", "EHentai"]
 # A site whose whole list the crawl has read is answered from the database and is not asked live (live=force still asks it). The
@@ -176,6 +176,8 @@ schedule = "17 * * * *"
 utc_offset = "UTC"
 # Sites to crawl (empty: all that have a list).
 sites = []
+# Sites that the crawl and the verification leave out (the names of GET /okazuri/sites). The searches have a list of their own: [search] disabled_sites.
+disabled_sites = []
 # k/N: this machine reads the pages whose number leaves k when divided by N. Run N machines with 0/N ... N-1/N, then `export` on each and
 # `import` the files on the server. Lists that go one page to the next (RokuHentai, E-Hentai) are read by 0/N only.
 shard = "0/1"
@@ -196,18 +198,20 @@ retry_minutes = 5
 # Sukebei, AsmHentai, HentaiEra, Wnacg), once in `interval_days`, and marking the works whose page is gone (`works.deleted`, with no title: no search
 # finds them). The sites still list such a work, so a list, the crawl or an import does not save it again. A site is asked one page every
 # `interval_days / works` (900 000 works in 30 days: a page every 2.9 s), never closer than the delay of the site.
-[verify]
+[crawl.verify]
 enabled = false
 # Empty: every site of that list.
 sites = []
+# Sites that are left out of the verification, besides [crawl] disabled_sites.
+disabled_sites = []
 interval_days = 30
 # A site is never asked two pages closer than this, so a site with more works than interval_days allows is looked at over more days.
 min_pause_ms = 5000
 
 # Handing the reading of the sites to other machines (dist.rs). The host (the server that keeps the database) cuts the crawl and the
-# verification into jobs; each worker (a machine with an IP address of its own, with [crawl] and [verify] on and its own small database)
+# verification into jobs; each worker (a machine with an IP address of its own, with [crawl] and [crawl.verify] on and its own small database)
 # asks the sites and gives the pages back. The first walk of a list whose pages are numbered is cut in jobs of `job_pages` pages that the workers take as they are free
-# (up to `workers` * 2 jobs are given out at a time, and the pages that are read are kept as ranges), so workers can come and go at any time, and each worker waits the delay of the site on its own. The host needs the same [crawl] / [verify] settings as always; a worker needs `host` and `token`.
+# (up to `workers` * 2 jobs are given out at a time, and the pages that are read are kept as ranges), so workers can come and go at any time, and each worker waits the delay of the site on its own. The host needs the same [crawl] / [crawl.verify] settings as always; a worker needs `host` and `token`.
 [distribute]
 role = "off"                       # off, host or worker
 token = ""                         # the same on the host and its workers

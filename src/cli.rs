@@ -572,8 +572,8 @@ impl Background {
             return Err("[crawl] needs [search] enabled = true".into());
         }
 
-        if config.verify.enabled && !config.search.enabled {
-            return Err("[verify] needs [search] enabled = true".into());
+        if config.crawl.verify.enabled && !config.search.enabled {
+            return Err("[crawl.verify] needs [search] enabled = true".into());
         }
 
         if config.translation.fill.enabled && !config.search.enabled {
@@ -584,7 +584,7 @@ impl Background {
             d1,
             prefetch: config.magazine.prefetch.enabled,
             crawl: config.crawl.enabled,
-            verify: config.verify.enabled,
+            verify: config.crawl.verify.enabled,
             fill: config.translation.fill.enabled,
         })
     }
@@ -653,7 +653,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         on_off(config.magazine.enabled),
         on_off(config.magazine.prefetch.enabled),
         on_off(config.crawl.enabled),
-        on_off(config.verify.enabled),
+        on_off(config.crawl.verify.enabled),
         on_off(config.translation.fill.enabled),
         on_off(scheduler.is_some()),
     );
@@ -675,7 +675,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     if let (true, Some(engine)) = (background.crawl, engine.clone()) {
         // checked here, with the engine: a site that is not known or a shard that is wrong stops the server before it listens
         let mut crawler = Crawler::new(engine.clone(), config.crawl.clone())?;
-        let mut verifier = if background.verify { Some(Verifier::new(engine.clone(), config.verify.clone())?) } else { None };
+        let mut verifier = if background.verify { Some(Verifier::new(engine.clone(), config.crawl.verify.clone(), &config.crawl.disabled_sites)?) } else { None };
 
         if let Some(hub) = &hub {
             crawler = crawler.with_hub(hub.clone(), config.distribute.workers * 2, config.distribute.job_pages, config.distribute.job_seconds);
@@ -702,7 +702,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
             }
         }
     } else if let (true, Some(engine)) = (background.verify, engine.clone()) {
-        let mut verifier = Verifier::new(engine.clone(), config.verify.clone())?;
+        let mut verifier = Verifier::new(engine.clone(), config.crawl.verify.clone(), &config.crawl.disabled_sites)?;
         if let Some(hub) = &hub {
             verifier = verifier.with_hub(hub.clone(), config.distribute.workers);
         }
