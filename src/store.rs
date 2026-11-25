@@ -169,6 +169,9 @@ pub struct SearchStore {
     tag_keys: std::sync::Mutex<Option<(Instant, HashMap<String, Vec<(u64, u32)>>)>>,
     /// The boost of a match by the kind of the tag (`[search] tag_boost`).
     kind_boost: std::sync::Mutex<[f64; 4]>,
+    /// The text index is kept (false when the environment says `OKAZURI_TEXT_INDEX=off`: a machine that only crawls does not answer searches, so it neither fills
+    /// the index at start nor takes in the queue; the works are exported to the server that answers).
+    index_on: bool,
 }
 
 /// How long the tags kept in memory for the boosts are used before they are read again.
@@ -223,7 +226,7 @@ impl SearchStore {
             None => db.clone(),
         };
 
-        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default(), kind_boost: std::sync::Mutex::new(KIND_BOOST) };
+        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default(), kind_boost: std::sync::Mutex::new(KIND_BOOST), index_on: std::env::var("OKAZURI_TEXT_INDEX").map_or(true, |value| value != "off") };
         store.fill_text_index(dir.as_deref()).await?;
 
         Ok(store)
@@ -358,6 +361,10 @@ impl SearchStore {
     /// Fills the text index from the table when it is not complete (it has not the marker file, or has not as many works as the table) and takes
     /// in the changes that were queued: it takes a few minutes for ten million works, and a search waits for it.
     async fn fill_text_index(&self, dir: Option<&Path>) -> Result<()> {
+        if !self.index_on {
+            log::info!("OKAZURI_TEXT_INDEX=off: the text index is not kept (this process crawls, it does not answer searches)");
+            return Ok(());
+        }
         let marker = dir.map(|dir| dir.join("filled"));
         self.sync_index().await?;
         let works = self.count_works().await?;
@@ -526,6 +533,9 @@ impl SearchStore {
     /// Takes the changes of the works that were queued since the last time into the text index (a search does this first, and it costs a
     /// look at an empty table when nothing was written).
     pub async fn sync_index(&self) -> Result<()> {
+        if !self.index_on {
+            return Ok(());
+        }
         let pending = self.reader.query_one(Statement::from_string(self.reader.get_database_backend(), "SELECT 1 AS x FROM index_queue LIMIT 1")).await?;
         if pending.is_none() {
             return Ok(());
