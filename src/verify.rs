@@ -25,7 +25,7 @@ pub struct Verifier {
 }
 
 /// Every site that has a rule, by name.
-const NAMES: &[&str] = &["RokuHentai", "DLsite", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg"];
+const NAMES: &[&str] = &["RokuHentai", "DLsite", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy"];
 
 impl Verifier {
     /// An unknown site, or one whose pages do not tell, is an error.
@@ -39,7 +39,7 @@ impl Verifier {
             };
             let index = engine.site_named(known).ok_or_else(|| format!("[crawl.verify] sites: {known} is not one of the sites of this program"))?;
             let rule = gone_rule(known).ok_or_else(|| format!("[crawl.verify] sites: no rule for {known}"))?;
-            if disabled.iter().chain(&config.disabled_sites).any(|off| off.eq_ignore_ascii_case(known)) {
+            if disabled.iter().any(|off| off.eq_ignore_ascii_case(known)) {
                 log::info!("verify: {known} is in [crawl] disabled_sites, left out");
                 continue;
             }

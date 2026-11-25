@@ -335,8 +335,6 @@ pub struct VerifyConfig {
     pub enabled: bool,
     /// The sites to look at, by name; empty is every site whose pages say that a work is gone (`engine::gone_rule`).
     pub sites: Vec<String>,
-    /// The sites that are left out of the verification, besides the ones of `[crawl] disabled_sites`.
-    pub disabled_sites: Vec<String>,
     /// Every page is looked at once in this many days: a site is asked one page every `days / works` (the works of a site that are saved
     /// now), never closer than the delay of the site.
     pub interval_days: u64,
@@ -346,7 +344,7 @@ pub struct VerifyConfig {
 
 impl Default for VerifyConfig {
     fn default() -> Self {
-        Self { enabled: false, sites: Vec::new(), disabled_sites: Vec::new(), interval_days: 30, min_pause_ms: 5000 }
+        Self { enabled: false, sites: Vec::new(), interval_days: 30, min_pause_ms: 5000 }
     }
 }
 
@@ -469,14 +467,14 @@ mod tests {
     #[test]
     fn the_verification_is_under_the_crawl_and_the_sites_left_out_are_listed_apart_from_the_searches() {
         let config: Config = toml::from_str(
-            "[search]\ndisabled_sites = [\"A\"]\n[crawl]\nenabled = true\ndisabled_sites = [\"B\"]\n[crawl.verify]\nenabled = true\ndisabled_sites = [\"C\"]\ninterval_days = 7\n",
+            "[search]\ndisabled_sites = [\"A\"]\n[crawl]\nenabled = true\ndisabled_sites = [\"B\"]\n[crawl.verify]\nenabled = true\ninterval_days = 7\n",
         )
         .unwrap();
 
         assert_eq!(config.search.disabled_sites, ["A"]);
         assert_eq!(config.crawl.disabled_sites, ["B"]);
         assert!(config.crawl.enabled && config.crawl.verify.enabled);
-        assert_eq!((config.crawl.verify.disabled_sites.as_slice(), config.crawl.verify.interval_days), (["C".to_string()].as_slice(), 7));
+        assert_eq!(config.crawl.verify.interval_days, 7);
     }
 
     #[test]
