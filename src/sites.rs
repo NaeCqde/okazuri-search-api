@@ -433,7 +433,7 @@ pub struct Site {
 }
 
 /// A result of a list page: all that is kept of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Link {
     /// The path of the work's page, without the scheme and the domain (`/fanzine/mo4102658/`), and with
     /// the parameters of the query string that name the work.
@@ -445,7 +445,7 @@ pub struct Link {
 }
 
 /// What a list page shows of a work besides its title. Every part is optional: a site shows what it shows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Extra {
     /// The tags, flat: the namespace of E-Hentai (`female:`) is dropped, the category (`Cosplay`) is a tag, the hashtags of other sites are tags.
     pub tags: Vec<Tag>,
@@ -458,7 +458,7 @@ pub struct Extra {
 }
 
 /// What a tag is (`tags.kind`): the score of a match depends on it (`store.rs`, `KIND_BOOST`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum TagKind {
     #[default]
     Tag = 0,
@@ -487,7 +487,7 @@ impl TagKind {
 }
 
 /// A tag of a work: its name (flat, lower case) and what it is.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Tag {
     pub name: String,
     pub kind: TagKind,
@@ -500,7 +500,7 @@ impl Tag {
 }
 
 /// An account of a site (`entity/uploader.rs`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     /// The id on the site.
     pub id: String,

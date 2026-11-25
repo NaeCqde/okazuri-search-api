@@ -14,6 +14,7 @@ mod api;
 mod cli;
 mod config;
 mod crawl;
+mod dist;
 mod cron;
 mod d1;
 mod dataset;
