@@ -18,6 +18,7 @@ pub struct Config {
     pub translation: TranslationConfig,
     pub crawl: CrawlConfig,
     pub verify: VerifyConfig,
+    pub distribute: DistributeConfig,
     pub cron: CronConfig,
     pub log: LogConfig,
 }
@@ -246,6 +247,27 @@ impl Default for PrefetchConfig {
             max_queries_per_round: 0,
             round_interval_minutes: 60,
         }
+    }
+}
+
+/// Handing the work of the crawl and of the verification to other machines (`dist.rs`): the host (the server that keeps the database) cuts the
+/// reading of the pages into jobs, and the workers (machines with their own IP addresses) ask the sites and give the pages back. Off unless `role` is set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DistributeConfig {
+    /// `off`, `host` or `worker`.
+    pub role: String,
+    /// The secret that a worker sends (`Authorization: Bearer`). The host has no job routes without it.
+    pub token: String,
+    /// Of a worker: the address of the host (`http://100.67.47.81:8010`).
+    pub host: String,
+    /// Of the host: how many workers there are; each site is read in as many parts at the same time.
+    pub workers: usize,
+}
+
+impl Default for DistributeConfig {
+    fn default() -> Self {
+        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3 }
     }
 }
 

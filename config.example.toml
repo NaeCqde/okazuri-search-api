@@ -203,3 +203,13 @@ sites = []
 interval_days = 30
 # A site is never asked two pages closer than this, so a site with more works than interval_days allows is looked at over more days.
 min_pause_ms = 5000
+
+# Handing the reading of the sites to other machines (dist.rs). The host (the server that keeps the database) cuts the crawl and the
+# verification into jobs; each worker (a machine with an IP address of its own, with [crawl] and [verify] on and its own small database)
+# asks the sites and gives the pages back. A site is read in `workers` parts at the same time, and each worker waits the delay of the site
+# on its own. The host needs the same [crawl] / [verify] settings as always; a worker needs `host` and `token`.
+[distribute]
+role = "off"                       # off, host or worker
+token = ""                         # the same on the host and its workers
+host = ""                          # of a worker: http://<address of the host>:<its port>
+workers = 3                        # of the host: how many workers there are

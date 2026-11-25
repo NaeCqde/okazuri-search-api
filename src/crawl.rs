@@ -58,6 +58,10 @@ pub fn sources() -> Vec<(&'static str, Source)> {
         ("HentaiEnvy", pages("https://hentaienvy.com/?page={n}")),
         ("RokuHentai", Source::Cards("https://rokuhentai.com/_search?sort=recent".to_string())),
         ("EHentai", Source::GalleryIds("https://e-hentai.org/".to_string())),
+        ("R18Best", Source::WordPress("https://r18.best/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
+        ("177Picyy", Source::WordPress("https://www.177picyy.com/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
+        // the site lists only what a search finds: every hiragana is searched, and a work has some of them in its title
+        ("同人の森", Source::Lists("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん".chars().map(|kana| format!("https://doujinnomori.com/comics/free-search?keyword={kana}&page={{n}}")).collect())),
         // the list stops after 417 pages of 120, so it is cut by price (the newest first in each part)
         ("FANZA", Source::Lists(fanza_lists())),
         ("JComic", Source::Lists(JCOMIC_CATEGORIES.iter().map(|category| format!("https://jcomic.net/cat/{category}/{{n}}")).collect())),
@@ -156,10 +160,21 @@ const STEP_RETRY_SECS: [u64; 4] = [5, 20, 60, 120];
 const MOST_LINKS: usize = 1000;
 
 /// One page of a list: its works, and where the next page is (None: the list ended).
-#[derive(Debug, PartialEq, Eq)]
-struct Step {
-    links: Vec<Link>,
-    next: Option<String>,
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Step {
+    pub links: Vec<Link>,
+    pub next: Option<String>,
+}
+
+/// One part of the walk of a site: the pages of this shard, the ids of E-Hentai of this part, and the name its state is saved under (`crawls`).
+/// A server on its own has one part, the whole list; the host of workers (`[distribute]`) cuts a site in as many parts as there are workers.
+#[derive(Debug, Clone)]
+struct Lane {
+    shard: (u64, u64),
+    ids: (Option<u64>, Option<u64>),
+    key: String,
+    /// The part that reads the newest pages again once the list was read (the others stop when their part is read).
+    refresher: bool,
 }
 
 /// `lo-hi` of `[crawl] gallery_ids`: (`lo`, `hi`), each one empty or an id.
@@ -222,6 +237,8 @@ pub struct Crawler {
     names_loaded: std::sync::Mutex<HashSet<usize>>,
     /// What is learned of the numbers of the tags of AsmHentai and HentaiEra, by the index of the site.
     learners: std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<Learner>>>>,
+    /// The host of workers (`[distribute]`): the pages are read by the workers.
+    hub: Option<(Arc<crate::dist::Hub>, usize)>,
 }
 
 /// How many pages of tags (`/tag/big-breasts/`) are read for each page of the list while a number that works carry has no name.
@@ -273,30 +290,78 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default() })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None })
     }
 
-    /// Walks every site, each in a task of its own, for as long as the server runs.
+    /// The pages of the sites are read by the workers of this host, `workers` of them (each site is read in as many parts at the same time).
+    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, workers: usize) -> Self {
+        self.hub = Some((hub, workers.max(1)));
+        self
+    }
+
+    /// The names of the sites that this crawl reads.
+    pub fn site_names(&self) -> Vec<&'static str> {
+        self.sources.iter().map(|(index, _)| self.engine.site(*index).def.name).collect()
+    }
+
+    /// The part of the walk that this server reads, for each site: the whole of it, or (with workers) as many parts as there are workers.
+    fn lanes(&self, source: &Source, name: &str) -> Vec<Lane> {
+        let whole = Lane { shard: self.shard, ids: self.ids, key: name.to_string(), refresher: true };
+        let Some((_, workers)) = &self.hub else { return vec![whole] };
+        let workers = *workers as u64;
+
+        if workers < 2 {
+            return vec![Lane { shard: (0, 1), ..whole }];
+        }
+        let part = |k: u64, shard: (u64, u64), ids: (Option<u64>, Option<u64>)| Lane { shard, ids, key: format!("{name}#{k}/{workers}"), refresher: k == 0 };
+
+        match source {
+            // the pages follow one another (the cursor is the address of the next one): one part
+            Source::Cards(_) => vec![Lane { shard: (0, 1), ..whole }],
+            // the ids are cut in ranges, and one more part reads from the newest page down to the range (and reads the newest pages again)
+            Source::GalleryIds(_) => match self.ids {
+                (lo, Some(hi)) => {
+                    let lo = lo.unwrap_or(0);
+                    let size = (hi.saturating_sub(lo) + 1).div_ceil(workers);
+                    let mut lanes: Vec<Lane> = (0..workers).map(|k| part(k + 1, (0, 1), (if k == 0 { Some(lo).filter(|lo| *lo > 0) } else { Some(lo + k * size - 1) }, Some((lo + (k + 1) * size - 1).min(hi))))).collect();
+                    lanes.push(Lane { shard: (0, 1), ids: (Some(hi), None), key: name.to_string(), refresher: true });
+                    for lane in lanes.iter_mut().take(workers as usize) {
+                        lane.refresher = false;
+                    }
+                    lanes
+                }
+                _ => vec![Lane { shard: (0, 1), ..whole }],
+            },
+            _ => (0..workers).map(|k| part(k, (k, workers), self.ids)).collect(),
+        }
+    }
+
+    /// Walks every site, each in a task of its own (each part of it, with workers), for as long as the server runs.
     pub async fn run(self: Arc<Self>) {
         let mut tasks = JoinSet::new();
 
         log::info!("crawl: {} sites, shard {}/{}", self.sources.len(), self.shard.0, self.shard.1);
 
         for place in 0..self.sources.len() {
-            tasks.spawn(self.clone().run_site(place));
+            let (index, source) = &self.sources[place];
+            let name = self.engine.site(*index).def.name;
+
+            for lane in self.lanes(source, name) {
+                tasks.spawn(self.clone().run_site(place, lane));
+            }
         }
         while tasks.join_next().await.is_some() {}
     }
 
-    async fn run_site(self: Arc<Self>, place: usize) {
+    async fn run_site(self: Arc<Self>, place: usize, lane: Lane) {
         let (index, source) = &self.sources[place];
         let name = self.engine.site(*index).def.name;
 
         // a list that is read with the cursor of the page before cannot be shared: the first machine reads it
         // (the ids of E-Hentai can be cut into ranges instead: `gallery_ids`)
-        let ranged = matches!(source, Source::GalleryIds(_)) && self.ids != (None, None);
+        let ranged = matches!(source, Source::GalleryIds(_)) && lane.ids != (None, None);
 
-        if matches!(source, Source::Cards(_) | Source::GalleryIds(_)) && self.shard.0 != 0 && !ranged {
+        if matches!(source, Source::Cards(_) | Source::GalleryIds(_)) && lane.shard.0 != 0 && !ranged {
             log::info!("crawl {name}: the pages follow one another, so shard 0 reads this site");
             return;
         }
@@ -304,7 +369,7 @@ impl Crawler {
         let retry = Duration::from_secs(self.config.retry_minutes.max(1) * 60);
 
         loop {
-            let done = match self.engine.store().crawl_state(name).await {
+            let done = match self.engine.store().crawl_state(&lane.key).await {
                 Ok(state) => state.is_some_and(|row| row.done),
                 Err(e) => {
                     log::warn!("crawl {name}: {e}");
@@ -314,8 +379,13 @@ impl Crawler {
             };
 
             // a machine that reads the ids below `hi` has read its range: the newest pages are read again by the machine with no `hi`
-            if done && ranged && self.ids.1.is_some() {
+            if done && ranged && lane.ids.1.is_some() {
                 log::info!("crawl {name}: the ids {} are read", self.config.gallery_ids);
+                return;
+            }
+            // a part of a site that is read by workers: only one part reads the newest pages again
+            if done && !lane.refresher {
+                log::info!("crawl {}: this part is read", lane.key);
                 return;
             }
 
@@ -323,11 +393,11 @@ impl Crawler {
                 self.wait_for_schedule().await;
             }
 
-            match self.walk(*index, source).await {
+            match self.walk_lane(*index, source, &lane).await {
                 Ok(walk) => {
                     if walk.finished {
                         log::info!("crawl {name}: the list is read to its end ({} new works in the last walk)", walk.new);
-                        if ranged && self.ids.1.is_some() {
+                        if (ranged && lane.ids.1.is_some()) || !lane.refresher {
                             return;
                         }
                     } else if done {
@@ -357,10 +427,17 @@ impl Crawler {
 
     /// One walk of a site: the rest of the first walk when it is not done, the newest pages again when it is. Stops at the first
     /// error (what was saved stays saved, and the cursor with it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn walk(&self, index: usize, source: &Source) -> std::result::Result<Walk, String> {
+        let name = self.engine.site(index).def.name;
+
+        self.walk_lane(index, source, &Lane { shard: self.shard, ids: self.ids, key: name.to_string(), refresher: true }).await
+    }
+
+    async fn walk_lane(&self, index: usize, source: &Source, lane: &Lane) -> std::result::Result<Walk, String> {
         let site = self.engine.site(index);
         let name = site.def.name;
-        let state = self.engine.store().crawl_state(name).await.map_err(|e| e.to_string())?;
+        let state = self.engine.store().crawl_state(&lane.key).await.map_err(|e| e.to_string())?;
         let first = !state.as_ref().is_some_and(|row| row.done);
         let cursor = if first { state.map(|row| row.cursor).unwrap_or_default() } else { String::new() };
         let mut walk = Walk::default();
@@ -368,14 +445,14 @@ impl Crawler {
         // a first walk that is taken up again: the list moved while it was stopped (new works are on the first pages, and what was
         // read is further down than the cursor says), so the newest pages are read again up to a page that is known, as every later
         // walk does, and then the walk goes on from its cursor
-        if first && !cursor.is_empty() && self.ids.1.is_none() {
-            let caught_up = self.pages(index, source, String::new(), (0, 1), false).await?;
+        if first && !cursor.is_empty() && lane.ids.1.is_none() && lane.refresher {
+            let caught_up = self.pages(index, source, String::new(), (0, 1), false, lane).await?;
             log::info!("crawl {name}: {} pages read again from the newest, {} new works, before the walk goes on", caught_up.pages, caught_up.new);
             walk.pages += caught_up.pages;
             walk.new += caught_up.new;
         }
 
-        let rest = self.pages(index, source, cursor, if first { self.shard } else { (0, 1) }, first).await?;
+        let rest = self.pages(index, source, cursor, if first { lane.shard } else { (0, 1) }, first, lane).await?;
         walk.pages += rest.pages;
         walk.new += rest.new;
         walk.finished = rest.finished;
@@ -385,7 +462,7 @@ impl Crawler {
 
     /// Reads pages from `cursor`. A first walk (`first`) goes to the end of the list and saves where it is after each page; any
     /// other stops at the first page with nothing new in it (or after `refresh_pages`) and leaves the saved place as it is.
-    async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool) -> std::result::Result<Walk, String> {
+    async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool, lane: &Lane) -> std::result::Result<Walk, String> {
         let name = self.engine.site(index).def.name;
         let mut walk = Walk::default();
         let mut idle = 0;
@@ -393,7 +470,7 @@ impl Crawler {
         let leading_empty = if name == "DLsite" && cursor.is_empty() { EMPTY_PAGES_AT_START } else { 0 };
 
         loop {
-            let step = self.step_again(index, source, &cursor, shard).await?;
+            let step = self.step_again(index, source, &cursor, shard, lane.ids).await?;
             let mut next = step.next.clone();
             let listed = step.links.len();
             if next.is_none() && matches!(source, Source::Pages(_)) && walk.pages < leading_empty {
@@ -406,7 +483,7 @@ impl Crawler {
             }
             let finished = next.is_none();
             let position = if first { Some((next.as_deref().unwrap_or(""), finished)) } else { None };
-            let new = self.engine.store().save_crawled(name, unix_now(), &works, position).await.map_err(|e| e.to_string())?;
+            let new = self.engine.store().save_crawled_in(&lane.key, name, unix_now(), &works, position).await.map_err(|e| e.to_string())?;
 
             walk.pages += 1;
             walk.new += new;
@@ -431,11 +508,32 @@ impl Crawler {
 
     /// `step`, asked again after a short wait when it fails (the sites answer 502, 504 and broken bodies now and then), so a walk does
     /// not wait `retry_minutes` for every one of them. A ban of the address is not asked again.
-    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64)) -> std::result::Result<Step, String> {
+    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>)) -> std::result::Result<Step, String> {
+        // the host of workers: a worker reads the page (and tries again as a server on its own does)
+        if let Some((hub, _)) = &self.hub {
+            let job = crate::dist::Job::Step { cursor: cursor.to_string(), shard, ids };
+
+            return match hub.submit(self.engine.site(index).def.name, job).await? {
+                crate::dist::Done::Step(step) => step,
+                _ => Err("a worker answered with something that is not a page".to_string()),
+            };
+        }
+
+        self.step_retried(index, source, cursor, shard, ids).await
+    }
+
+    /// What a worker does with a job: the page of a site of this crawl, by the name of the site.
+    pub async fn step_local(&self, site: &str, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>)) -> std::result::Result<Step, String> {
+        let Some((index, source)) = self.sources.iter().find(|(index, _)| self.engine.site(*index).def.name == site) else { return Err(format!("{site} is not read by this worker")) };
+
+        self.step_retried(*index, source, cursor, shard, ids).await
+    }
+
+    async fn step_retried(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>)) -> std::result::Result<Step, String> {
         let mut waits = STEP_RETRY_SECS.iter();
 
         loop {
-            match self.step(index, source, cursor, shard).await {
+            match self.step(index, source, cursor, shard, ids).await {
                 Err(e) if !e.contains("banned") => match waits.next() {
                     Some(secs) => {
                         log::debug!("crawl {}: {e}, again in {secs} s", self.engine.site(index).def.name);
@@ -449,7 +547,7 @@ impl Crawler {
     }
 
     /// The page of the list at `cursor` (empty: the first), and where the next one is.
-    async fn step(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64)) -> std::result::Result<Step, String> {
+    async fn step(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>)) -> std::result::Result<Step, String> {
         let site = self.engine.site(index);
 
         match source {
@@ -500,7 +598,7 @@ impl Crawler {
             }
             Source::GalleryIds(first) => {
                 // a machine of a range starts under its `hi` (`?next=` lists the galleries with a smaller id)
-                let url = match (cursor.is_empty(), self.ids.1) {
+                let url = match (cursor.is_empty(), ids.1) {
                     (true, Some(hi)) => format!("{first}?next={}", hi + 1),
                     (true, None) => first.clone(),
                     (false, _) => format!("{first}?next={cursor}"),
@@ -513,7 +611,7 @@ impl Crawler {
                     return Err(format!("E-Hentai answered a page with no gallery after the id {cursor}"));
                 }
                 // the walk of a range ends at its `lo`
-                let next = links.iter().filter_map(|link| gallery_id(&link.path)).min().filter(|id| self.ids.0.is_none_or(|lo| *id > lo)).map(|id| id.to_string());
+                let next = links.iter().filter_map(|link| gallery_id(&link.path)).min().filter(|id| ids.0.is_none_or(|lo| *id > lo)).map(|id| id.to_string());
 
                 Ok(Step { links, next })
             }
@@ -700,7 +798,7 @@ impl Crawler {
         if self.names_loaded.lock().unwrap().insert(index) {
             let known = self.engine.store().site_tag_names(site.def.name).await.unwrap_or_default();
             let mut names = self.tag_names.lock().unwrap();
-            for (attribute, id, name) in known.into_iter().filter(|(attribute, ..)| attribute == "tags") {
+            for (_, id, name) in known.into_iter().filter(|(attribute, ..)| attribute == "tags") {
                 names.entry((index, id)).or_insert(name);
             }
         }
@@ -987,7 +1085,7 @@ mod tests {
         let (index, source) = crawler.sources[0].clone();
 
         // what the first walk had saved before the server stopped: page 1 is read, the cursor is at page 2
-        let page = crawler.step(index, &source, "", (0, 1)).await.unwrap();
+        let page = crawler.step(index, &source, "", (0, 1), (None, None)).await.unwrap();
         let works = crawler.engine.works_of(page.links).await.unwrap();
         store.save_crawled("Listed", 1, &works, Some((page.next.as_deref().unwrap(), false))).await.unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1006,7 +1104,7 @@ mod tests {
 
         // the list was read to its end a while ago, when it was only page 4 and 5 (the works of pages 1 to 3 came after)
         for n in [4, 5] {
-            let page = crawler.step(index, &source, &n.to_string(), (0, 1)).await.unwrap();
+            let page = crawler.step(index, &source, &n.to_string(), (0, 1), (None, None)).await.unwrap();
             let works = crawler.engine.works_of(page.links).await.unwrap();
             store.save_crawled("Listed", 1, &works, Some(("", true))).await.unwrap();
         }
@@ -1019,7 +1117,7 @@ mod tests {
         // the safety limit stops it early, and the next walk goes on from the newest page again
         let limited = CrawlConfig { refresh_pages: 2, ..CrawlConfig::default() };
         let (crawler, store) = self::crawler(port, limited).await;
-        let page = crawler.step(index, &source, "5", (0, 1)).await.unwrap();
+        let page = crawler.step(index, &source, "5", (0, 1), (None, None)).await.unwrap();
         let works = crawler.engine.works_of(page.links).await.unwrap();
         store.save_crawled("Listed", 1, &works, Some(("", true))).await.unwrap();
         assert_eq!(crawler.walk(index, &source).await.unwrap().pages, 2);
@@ -1033,7 +1131,7 @@ mod tests {
 
         // pages 2 and 3 were read, the cursor is at 4; page 1 is what came to the list while the walk was stopped
         for n in [2, 3] {
-            let page = crawler.step(index, &source, &n.to_string(), (0, 1)).await.unwrap();
+            let page = crawler.step(index, &source, &n.to_string(), (0, 1), (None, None)).await.unwrap();
             let works = crawler.engine.works_of(page.links).await.unwrap();
             store.save_crawled("Listed", 1, &works, Some(("4", false))).await.unwrap();
         }
