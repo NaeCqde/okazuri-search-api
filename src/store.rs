@@ -201,7 +201,12 @@ impl SearchStore {
 
         let dir = path.with_file_name(format!("{}.index", path.file_name().map_or("search.db".into(), |name| name.to_string_lossy().into_owned())));
 
-        Self::init(options, Some(readers), TextIndex::open(&dir)?, Some(dir)).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
+        // a process that does not keep the text index (`OKAZURI_TEXT_INDEX=off`: a crawl, an import) does not open the directory of it either (the server
+        // that answers searches on the same database holds the lock of its writer)
+        let kept = std::env::var("OKAZURI_TEXT_INDEX").map_or(true, |value| value != "off");
+        let text = if kept { TextIndex::open(&dir)? } else { TextIndex::in_ram()? };
+
+        Self::init(options, Some(readers), text, kept.then_some(dir)).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
     }
 
     #[cfg(test)]
