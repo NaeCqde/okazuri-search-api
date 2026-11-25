@@ -412,8 +412,10 @@ pub struct SiteInfo {
     pub has_search: bool,
     /// The search finds works by their Japanese title, so a query in Japanese is asked as it is as well as in romaji.
     pub japanese: bool,
-    /// Searched by this engine with the current settings.
+    /// Asked by a search, or read by the crawl, with the current settings (and the site can be read with a plain request at all).
     pub active: bool,
+    /// The crawl of the whole list: `complete` (read to the end), `running`, `disabled` (it has a list to read, but the crawl is off or leaves the site out) or `unsupported` (no list to read).
+    pub crawl: &'static str,
     pub note: &'static str,
 }
 
@@ -622,18 +624,35 @@ impl Engine {
             .collect()
     }
 
-    pub fn sites_info(&self) -> Vec<SiteInfo> {
+    /// `crawling`: the names (lower case) of the sites that this server's crawl reads; `done`: the sites whose crawl read the whole list.
+    pub fn sites_info(&self, crawling: &HashSet<String>, done: &HashSet<String>) -> Vec<SiteInfo> {
+        let readable: HashSet<&str> = crate::crawl::sources().into_iter().map(|(name, _)| name).collect();
+
         self.sites
             .iter()
             .enumerate()
-            .map(|(index, site)| SiteInfo {
-                name: site.def.name,
-                is_legal: site.def.legal,
-                support: site.def.support.as_str(),
-                has_search: site.def.search.is_some(),
-                japanese: site.def.japanese,
-                active: self.active.contains(&index),
-                note: site.def.note,
+            .map(|(index, site)| {
+                let name = site.def.name;
+                let crawl = if done.contains(name) {
+                    "complete"
+                } else if !readable.contains(name) {
+                    "unsupported"
+                } else if crawling.contains(&name.to_lowercase()) {
+                    "running"
+                } else {
+                    "disabled"
+                };
+
+                SiteInfo {
+                    name,
+                    is_legal: site.def.legal,
+                    support: site.def.support.as_str(),
+                    has_search: site.def.search.is_some(),
+                    japanese: site.def.japanese,
+                    active: self.active.contains(&index) || (site.def.support == Support::Ready && matches!(crawl, "complete" | "running")),
+                    crawl,
+                    note: site.def.note,
+                }
             })
             .collect()
     }
@@ -1948,7 +1967,7 @@ pub enum GoneRule {
 /// galleries there are. E-Hentai answers 200 with a short text, and it bans an address that asks more than a page every few seconds.)
 pub fn gone_rule(site: &str) -> Option<GoneRule> {
     match site {
-        "RokuHentai" | "DLsite" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" | "177Picyy" => Some(GoneRule::NotFound),
+        "RokuHentai" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" | "177Picyy" => Some(GoneRule::NotFound),
         "AsmHentai" | "HentaiEra" => Some(GoneRule::RedirectsTo404),
         "Wnacg" => Some(GoneRule::Sentence("您要訪問的漫畫不存在")),
         _ => None,
@@ -2877,9 +2896,10 @@ pub(crate) mod tests {
 
         // the real list: only the sites that can be searched are active, and a site with no search never is
         let real = Engine::new(&config(), Arc::new(SearchStore::in_memory().await.unwrap()), crate::testing::romanizer_arc());
-        let info = real.sites_info();
+        let info = real.sites_info(&Default::default(), &Default::default());
         assert_eq!(info.len(), 28);
         assert!(info.iter().filter(|s| s.active).all(|s| s.support == "ready" && s.has_search));
+        assert!(info.iter().any(|s| s.name == "Anime-Sharing" && s.support == "account" && s.crawl == "unsupported"));
         assert!(info.iter().any(|s| s.name == "IMHentai" && !s.active && s.support == "cloudflare"));
         assert!(info.iter().find(|s| s.name == "Hitomi.La").unwrap().active, "it is searched through its index files");
 
@@ -2888,8 +2908,8 @@ pub(crate) mod tests {
             Arc::new(SearchStore::in_memory().await.unwrap()),
             crate::testing::romanizer_arc(),
         );
-        assert!(trying.sites_info().iter().find(|s| s.name == "IMHentai").unwrap().active);
-        assert!(!trying.sites_info().iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
+        assert!(trying.sites_info(&Default::default(), &Default::default()).iter().find(|s| s.name == "IMHentai").unwrap().active);
+        assert!(!trying.sites_info(&Default::default(), &Default::default()).iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
     }
 
     #[test]

@@ -346,7 +346,7 @@ Google が 5 回続けて答えなかったときは、その回をやめ、`rou
 
 ## ページがなくなった作品(`[verify]`)
 
-サイトによっては、ページがなくなった作品を一覧に出し続けます。`[verify] enabled = true` にすると、サーバーは、それが分かるサイト(RokuHentai、DLsite、HentaiEnvy、Nya:Hentai、
+サイトによっては、ページがなくなった作品を一覧に出し続けます。`[verify] enabled = true` にすると、サーバーは、それが分かるサイト(RokuHentai、HentaiEnvy、Nya:Hentai、
 momon:GA、Sukebei は 404。RokuHentai は "temporarily unavailable ... Here are some results that might be useful to you" という 503 も。AsmHentai と HentaiEra は `/404/` へのリダイレクト。
 Wnacg は「您要訪問的漫畫不存在」という文)の、保存済みのすべての作品のページを、`interval_days`(30)に 1 回見に行きます。サイトごとに独立に、`interval_days / 作品数` ごとに
 1 ページずつ見ます(`min_pause_ms`(5 秒)より短くしないので、作品が 518,400 を超えるサイトでは `interval_days` より長くかかり、サイトの間隔より長くもなります)。順番は、
