@@ -1457,6 +1457,12 @@ impl SearchStore {
         let new = Self::save_works(&transaction, website, now, &works).await?.len();
 
         let before = crawl_state::Entity::find_by_id(key.to_string()).one(&transaction).await?;
+        // a part of a site that is read again (no place to keep) has no row: a row without `done` would make the next walk read the whole list from its first page
+        if state.is_none() && before.is_none() && key != website {
+            transaction.commit().await?;
+
+            return Ok(new);
+        }
         let saved = before.as_ref().map_or(0, |row| row.saved) + new as i64;
         let (cursor, done) = match (state, &before) {
             (Some((cursor, done)), _) => (cursor.to_string(), done),
@@ -2065,6 +2071,23 @@ mod tests {
         let gone = store.save("q", "A", 300, &Ok(vec![link("/g/1", "One (new title)")]), true).await.unwrap();
         assert!(gone.is_empty());
         assert!(store.candidates_owned(&[]).await.unwrap().iter().any(|w| w.path == "/g/1"));
+    }
+
+    #[tokio::test]
+    async fn a_part_that_is_read_again_leaves_no_row_that_says_not_done() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let work = |path: &str| NewWork { path: path.to_string(), title: format!("title {path}"), romaji: format!("title {path}"), language: None, extra: Default::default() };
+
+        // a walk of the newest pages (no place to keep) of a part
+        store.save_crawled_in("Site#0/12", "Site", 100, &[work("/a")], None).await.unwrap();
+        assert!(store.crawl_state("Site#0/12").await.unwrap().is_none());
+
+        // the first walk of a part keeps its place
+        store.save_crawled_in("Site#1/12", "Site", 100, &[work("/b")], Some(("2", false))).await.unwrap();
+        assert_eq!(store.crawl_state("Site#1/12").await.unwrap().unwrap().cursor, "2");
+        // and a later walk of the newest pages leaves it as it is
+        store.save_crawled_in("Site#1/12", "Site", 200, &[work("/c")], None).await.unwrap();
+        assert_eq!(store.crawl_state("Site#1/12").await.unwrap().unwrap().cursor, "2");
     }
 
     #[tokio::test]
