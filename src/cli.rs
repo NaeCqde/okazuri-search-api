@@ -622,7 +622,16 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     let romanizer = load_romanizer(&config)?;
     let engine = if config.search.enabled { Some(open_engine(&config, romanizer.clone()).await?) } else { None };
 
+    let hub = (config.distribute.role == "host").then(|| Arc::new(crate::dist::Hub::new(config.distribute.token.clone())));
+    if config.distribute.role == "host" && config.distribute.token.is_empty() {
+        return Err("[distribute] role = \"host\" needs a token".into());
+    }
+    if !matches!(config.distribute.role.as_str(), "off" | "host" | "worker") {
+        return Err(format!("[distribute] role must be off, host or worker, not {:?}", config.distribute.role).into());
+    }
+
     let state = Arc::new(AppState {
+        hub: hub.clone(),
         romanizer: romanizer.clone(),
         max_query_chars: config.romaji.max_query_chars,
         search: engine.clone(),
@@ -662,10 +671,39 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
     }
     if let (true, Some(engine)) = (background.crawl, engine.clone()) {
         // checked here, with the engine: a site that is not known or a shard that is wrong stops the server before it listens
-        tasks.push(tokio::spawn(Arc::new(Crawler::new(engine, config.crawl.clone())?).run()));
-    }
-    if let (true, Some(engine)) = (background.verify, engine.clone()) {
-        tasks.push(tokio::spawn(Arc::new(Verifier::new(engine, config.verify.clone())?).run()));
+        let mut crawler = Crawler::new(engine.clone(), config.crawl.clone())?;
+        let mut verifier = if background.verify { Some(Verifier::new(engine.clone(), config.verify.clone())?) } else { None };
+
+        if let Some(hub) = &hub {
+            crawler = crawler.with_hub(hub.clone(), config.distribute.workers);
+            verifier = verifier.map(|verifier| verifier.with_hub(hub.clone(), config.distribute.workers));
+        }
+        let crawler = Arc::new(crawler);
+
+        if config.distribute.role == "worker" {
+            // the pages are read for the host: no walk of its own, no verification
+            let verified = verifier.as_ref().map(|verifier| verifier.site_names()).unwrap_or_default();
+            if config.distribute.host.is_empty() || config.distribute.token.is_empty() {
+                return Err("[distribute] role = \"worker\" needs host and token".into());
+            }
+            tasks.push(tokio::spawn(crate::dist::work(engine.clone(), crawler, config.distribute.clone(), verified)));
+        } else {
+            tasks.push(tokio::spawn(crawler.run()));
+            if let Some(verifier) = verifier {
+                tasks.push(tokio::spawn(Arc::new(verifier).run()));
+            }
+        }
+    } else if let (true, Some(engine)) = (background.verify, engine.clone()) {
+        let mut verifier = Verifier::new(engine.clone(), config.verify.clone())?;
+        if let Some(hub) = &hub {
+            verifier = verifier.with_hub(hub.clone(), config.distribute.workers);
+        }
+        if config.distribute.role == "worker" {
+            let crawler = Arc::new(Crawler::new(engine.clone(), config.crawl.clone())?);
+            tasks.push(tokio::spawn(crate::dist::work(engine, crawler, config.distribute.clone(), verifier.site_names())));
+        } else {
+            tasks.push(tokio::spawn(Arc::new(verifier).run()));
+        }
     }
     if let (true, Some(engine)) = (background.fill, engine.clone()) {
         tasks.push(tokio::spawn(Arc::new(TitleTranslator::new(engine, config.translation.fill.clone())).run()));

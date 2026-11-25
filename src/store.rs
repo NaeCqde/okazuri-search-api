@@ -1438,19 +1438,25 @@ impl SearchStore {
     /// Saves the works of a page of the crawl (no query listed them, so no query can take them away again), and, in the same
     /// transaction, where the walk stands (`state`: the cursor and whether the list is read to its end; None leaves it as it is).
     /// Returns how many of the works were new.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn save_crawled(&self, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>) -> Result<usize> {
+        self.save_crawled_in(website, website, now, works, state).await
+    }
+
+    /// `save_crawled`, with the walk saved under `key` (a site read in parts by workers has a place for each part: `EHentai#1/3`).
+    pub async fn save_crawled_in(&self, key: &str, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>) -> Result<usize> {
         let transaction = self.db.begin().await?;
         let works = Self::same_pages(&transaction, website, works).await?;
         let new = Self::save_works(&transaction, website, now, &works).await?.len();
 
-        let before = crawl_state::Entity::find_by_id(website.to_string()).one(&transaction).await?;
+        let before = crawl_state::Entity::find_by_id(key.to_string()).one(&transaction).await?;
         let saved = before.as_ref().map_or(0, |row| row.saved) + new as i64;
         let (cursor, done) = match (state, &before) {
             (Some((cursor, done)), _) => (cursor.to_string(), done),
             (None, Some(row)) => (row.cursor.clone(), row.done),
             (None, None) => (String::new(), false),
         };
-        let row = crawl_state::ActiveModel { website: Set(website.to_string()), cursor: Set(cursor), done: Set(done), saved: Set(saved), updated_at: Set(now) };
+        let row = crawl_state::ActiveModel { website: Set(key.to_string()), cursor: Set(cursor), done: Set(done), saved: Set(saved), updated_at: Set(now) };
         crawl_state::Entity::insert(row)
             .on_conflict(
                 OnConflict::column(crawl_state::Column::Website)

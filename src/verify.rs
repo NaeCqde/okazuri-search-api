@@ -20,6 +20,8 @@ pub struct Verifier {
     config: VerifyConfig,
     /// (index of the site in the engine, its name, how its pages say that a work is gone)
     sites: Vec<(usize, &'static str, GoneRule)>,
+    /// The host of workers (`[distribute]`): the pages are looked at by the workers (this many at the same time).
+    hub: Option<(Arc<crate::dist::Hub>, usize)>,
 }
 
 /// Every site that has a rule, by name.
@@ -44,7 +46,17 @@ impl Verifier {
             sites.push((index, *known, rule));
         }
 
-        Ok(Self { engine, config, sites })
+        Ok(Self { engine, config, sites, hub: None })
+    }
+
+    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, workers: usize) -> Self {
+        self.hub = Some((hub, workers.max(1)));
+        self
+    }
+
+    /// The names of the sites that this verification looks at.
+    pub fn site_names(&self) -> Vec<&'static str> {
+        self.sites.iter().map(|(_, name, _)| *name).collect()
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -87,10 +99,12 @@ impl Verifier {
     /// Looks at the pages of `name` that are due, `BATCH` of them at the most. Returns how many were looked at.
     async fn batch(&self, index: usize, name: &'static str, rule: GoneRule, works: u64, after: &mut String) -> Result<usize> {
         let before = now() - self.config.interval_days.max(1) as i64 * 86_400;
-        let mut due = self.engine.store().due_checks(name, before, after, BATCH).await?;
-        if (due.len() as u64) < BATCH && !after.is_empty() {
+        // with workers, a batch for each of them is taken at once
+        let count = BATCH * self.hub.as_ref().map_or(1, |(_, workers)| *workers as u64);
+        let mut due = self.engine.store().due_checks(name, before, after, count).await?;
+        if (due.len() as u64) < count && !after.is_empty() {
             // the end of the paths: go on from the first one again
-            let more = self.engine.store().due_checks(name, before, "", BATCH - due.len() as u64).await?;
+            let more = self.engine.store().due_checks(name, before, "", count - due.len() as u64).await?;
             *after = more.last().cloned().unwrap_or_default();
             due.extend(more);
         } else {
@@ -98,6 +112,29 @@ impl Verifier {
         }
         let spacing = Duration::from_millis((self.config.interval_days.max(1) * 86_400_000 / works).max(self.config.min_pause_ms));
         let mut results = Vec::new();
+
+        if let Some((hub, workers)) = &self.hub {
+            // each worker looks at its part of the batch, as far apart as one machine would, so the site sees one page in `spacing` from each of them
+            // and the whole batch takes a worker's share of the time
+            let size = due.len().div_ceil(*workers).max(1);
+            let mut jobs = tokio::task::JoinSet::new();
+            for part in due.chunks(size) {
+                let (hub, part) = (hub.clone(), part.to_vec());
+                jobs.spawn(async move { hub.submit(name, crate::dist::Job::Probe { paths: part, spacing_ms: spacing.as_millis() as u64 }).await });
+            }
+            while let Some(done) = jobs.join_next().await {
+                if let Ok(Ok(crate::dist::Done::Probe(part))) = done {
+                    results.extend(part);
+                }
+            }
+            let removed = results.iter().filter(|(_, gone)| *gone).count();
+            self.engine.store().record_checks(name, &results, now()).await?;
+            if removed > 0 {
+                log::info!("verify {name}: {} pages looked at, {removed} gone", results.len());
+            }
+
+            return Ok(results.len());
+        }
 
         for path in due {
             let started = Instant::now();
