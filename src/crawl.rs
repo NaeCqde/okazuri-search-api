@@ -159,6 +159,8 @@ pub struct Crawler {
     offset_seconds: i64,
     /// The names of the tags of the WordPress sites, by the index of the site and the id of the tag: asked of the site once, kept in memory.
     tag_names: std::sync::Mutex<HashMap<(usize, u64), String>>,
+    /// The sites whose names in `tag_names` are read from the database already.
+    names_loaded: std::sync::Mutex<HashSet<usize>>,
     /// What is learned of the numbers of the tags of AsmHentai and HentaiEra, by the index of the site.
     learners: std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<Learner>>>>,
 }
@@ -212,7 +214,7 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), learners: Default::default() })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default() })
     }
 
     /// Walks every site, each in a task of its own, for as long as the server runs.
@@ -609,6 +611,15 @@ impl Crawler {
     async fn name_tags(&self, index: usize, body: &str, links: &mut [Link]) {
         let Ok(posts) = serde_json::from_str::<Vec<serde_json::Value>>(body) else { return };
         let site = self.engine.site(index);
+
+        // the names learned before (kept in `site_tag_names`) are read once
+        if self.names_loaded.lock().unwrap().insert(index) {
+            let known = self.engine.store().site_tag_names(site.def.name).await.unwrap_or_default();
+            let mut names = self.tag_names.lock().unwrap();
+            for (attribute, id, name) in known.into_iter().filter(|(attribute, ..)| attribute == "tags") {
+                names.entry((index, id)).or_insert(name);
+            }
+        }
         let ids_of = |post: &serde_json::Value| -> Vec<u64> { post.get("tags").and_then(|tags| tags.as_array()).map(|tags| tags.iter().filter_map(|id| id.as_u64()).collect()).unwrap_or_default() };
         let unknown: Vec<u64> = {
             let names = self.tag_names.lock().unwrap();
@@ -623,16 +634,25 @@ impl Crawler {
             let url = format!("{}/wp-json/wp/v2/tags?per_page=100&include={}&_fields=id,name", site.def.origin.trim_end_matches('/'), list.join(","));
             let Ok((_, answer)) = self.engine.get_page(index, &url).await else { continue };
             let Ok(found) = serde_json::from_str::<Vec<serde_json::Value>>(&answer) else { continue };
-            let mut names = self.tag_names.lock().unwrap();
+            let mut learned: Vec<(u64, String)> = Vec::new();
 
             for tag in found {
                 if let (Some(id), Some(name)) = (tag.get("id").and_then(|id| id.as_u64()), tag.get("name").and_then(|name| name.as_str())) {
-                    names.insert((index, id), decode(name).trim().to_lowercase());
+                    learned.push((id, decode(name).trim().to_lowercase()));
                 }
             }
-            // an id the site does not know is not asked again
-            for id in chunk {
-                names.entry((index, *id)).or_default();
+            {
+                let mut names = self.tag_names.lock().unwrap();
+                for (id, name) in &learned {
+                    names.insert((index, *id), name.clone());
+                }
+                // an id the site does not know is not asked again (while this process runs)
+                for id in chunk {
+                    names.entry((index, *id)).or_default();
+                }
+            }
+            for (id, name) in learned.iter().filter(|(_, name)| !name.is_empty()) {
+                let _ = self.engine.store().save_site_tag_name(site.def.name, "tags", *id, name).await;
             }
         }
 
