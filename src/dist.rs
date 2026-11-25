@@ -37,7 +37,7 @@ const LONG_POLL: Duration = Duration::from_secs(25);
 pub enum Job {
     /// One page of the list of a site: the cursor, the shard and the ids of E-Hentai (`lo`, `hi`) of the part that is read.
     /// `limit` works are read before the answer (some pages, 0 is one page).
-    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] limit: usize },
+    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] limit: usize, #[serde(default)] seconds: u64 },
     /// Pages of saved works to look at, `spacing_ms` apart.
     Probe { paths: Vec<String>, spacing_ms: u64 },
 }
@@ -283,7 +283,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
 
 async fn run(engine: &Arc<Engine>, crawler: &Arc<Crawler>, site: &str, job: Job) -> Done {
     match job {
-        Job::Step { cursor, shard, ids, limit } => Done::Step(crawler.step_local(site, &cursor, shard, ids, limit).await),
+        Job::Step { cursor, shard, ids, limit, seconds } => Done::Step(crawler.step_local(site, &cursor, shard, ids, limit, seconds).await),
         Job::Probe { paths, spacing_ms } => Done::Probe(probe(engine, site, paths, Duration::from_millis(spacing_ms)).await),
     }
 }

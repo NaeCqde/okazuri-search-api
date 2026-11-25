@@ -268,11 +268,13 @@ pub struct DistributeConfig {
     pub parts: usize,
     /// Of the host: how many works a job of the crawl reads before the worker answers (the pages are read one after another; 0 is one page).
     pub job_works: usize,
+    /// Of the host: the longest a job of the crawl reads (a slow site gives fewer pages), so a job is never longer than a few minutes.
+    pub job_seconds: u64,
 }
 
 impl Default for DistributeConfig {
     fn default() -> Self {
-        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12, job_works: 200 }
+        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12, job_works: 200, job_seconds: 180 }
     }
 }
 

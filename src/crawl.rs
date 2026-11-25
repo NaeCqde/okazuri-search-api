@@ -241,6 +241,8 @@ pub struct Crawler {
     hub: Option<(Arc<crate::dist::Hub>, usize)>,
     /// With workers: how many works a job of the first walk reads (`[distribute] job_works`).
     job_works: usize,
+    /// With workers: the longest a job of the first walk reads, in seconds (`[distribute] job_seconds`).
+    job_seconds: u64,
 }
 
 /// How many pages of tags (`/tag/big-breasts/`) are read for each page of the list while a number that works carry has no name.
@@ -292,13 +294,14 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_works: 0 })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_works: 0, job_seconds: 0 })
     }
 
     /// The pages of the sites are read by the workers of this host, in `parts` parts of each site that the workers take as jobs.
-    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, parts: usize, job_works: usize) -> Self {
+    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, parts: usize, job_works: usize, job_seconds: u64) -> Self {
         self.hub = Some((hub, parts.max(1)));
         self.job_works = job_works;
+        self.job_seconds = job_seconds;
         self
     }
 
@@ -482,7 +485,7 @@ impl Crawler {
 
         loop {
             // the first walk is read in jobs of `job_works` works; the newest pages are read again one page at a time (they stop at the first page with nothing new)
-            let step = self.step_again(index, source, &cursor, shard, lane.ids, if first { self.job_works } else { 0 }).await?;
+            let step = self.step_again(index, source, &cursor, shard, lane.ids, if first { self.job_works } else { 0 }, self.job_seconds).await?;
             let mut next = step.next.clone();
             let listed = step.links.len();
             if next.is_none() && matches!(source, Source::Pages(_)) && walk.pages < leading_empty {
@@ -520,10 +523,10 @@ impl Crawler {
 
     /// `step`, asked again after a short wait when it fails (the sites answer 502, 504 and broken bodies now and then), so a walk does
     /// not wait `retry_minutes` for every one of them. A ban of the address is not asked again.
-    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), limit: usize) -> std::result::Result<Step, String> {
+    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), limit: usize, seconds: u64) -> std::result::Result<Step, String> {
         // the host of workers: a worker reads the page (and tries again as a server on its own does)
         if let Some((hub, _)) = &self.hub {
-            let job = crate::dist::Job::Step { cursor: cursor.to_string(), shard, ids, limit };
+            let job = crate::dist::Job::Step { cursor: cursor.to_string(), shard, ids, limit, seconds };
 
             return match hub.submit(self.engine.site(index).def.name, job).await? {
                 crate::dist::Done::Step(step) => step,
@@ -535,15 +538,17 @@ impl Crawler {
     }
 
     /// What a worker does with a job: the page of a site of this crawl, by the name of the site.
-    /// Reads pages one after another until there are `limit` works (0: one page), the list ends, or a page cannot be read (what was read is
+    /// Reads pages one after another until there are `limit` works (0: one page) or `seconds` have passed (0: no time limit), the list ends, or a page cannot be read (what was read is
     /// given, and `next` is the page that failed, so the host goes on from there). A page that is the same as the one before it (the last page
     /// of a list that repeats it) ends the job too.
-    pub async fn step_local(&self, site: &str, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), limit: usize) -> std::result::Result<Step, String> {
+    pub async fn step_local(&self, site: &str, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), limit: usize, seconds: u64) -> std::result::Result<Step, String> {
+        let started = std::time::Instant::now();
         let Some((index, source)) = self.sources.iter().find(|(index, _)| self.engine.site(*index).def.name == site) else { return Err(format!("{site} is not read by this worker")) };
         let mut step = self.step_retried(*index, source, cursor, shard, ids).await?;
         let mut last: Vec<String> = step.links.iter().map(|link| link.path.clone()).collect();
 
-        while step.links.len() < limit {
+        // a job ends with enough works or when it has read for `seconds` (a slow site gives fewer pages, so a job is never longer than a few minutes)
+        while step.links.len() < limit && (seconds == 0 || started.elapsed().as_secs() < seconds) {
             let Some(next) = step.next.clone() else { break };
             let more = match self.step_retried(*index, source, &next, shard, ids).await {
                 Ok(more) => more,
