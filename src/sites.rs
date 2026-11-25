@@ -567,6 +567,57 @@ fn dlsite_extras(html: &str) -> HashMap<String, Extra> {
 }
 
 /// The works of a HentaiEnvy list page, by gallery id: the category (`Artist CG`) as a tag and the time.
+/// The attributes of a card of AsmHentai and HentaiEra that hold ids of the site, and what the ids are: (attribute, listing path, word of the page of one).
+/// The ids are numbers of the site; their names are not on the list page (see `Crawler::name_cards`).
+pub const CARD_ATTRIBUTES: [(&str, &str, &str, TagKind); 5] = [
+    ("tags", "/tags/", "tag", TagKind::Tag),
+    ("artists", "/artists/", "artist", TagKind::Author),
+    ("groups", "/groups/", "group", TagKind::Circle),
+    ("characters", "/characters/", "character", TagKind::Tag),
+    ("parodies", "/parodies/", "parody", TagKind::Tag),
+];
+
+/// The cards of a list page of AsmHentai or HentaiEra: the gallery, and the ids the card carries by attribute (`data-tags="29 39"`).
+pub fn card_ids(html: &str) -> Vec<(String, Vec<(&'static str, u64)>)> {
+    static CARD: OnceLock<Regex> = OnceLock::new();
+    static GALLERY: OnceLock<Regex> = OnceLock::new();
+    static ATTRIBUTE: OnceLock<Regex> = OnceLock::new();
+    let card = CARD.get_or_init(|| Regex::new(r#"<div class="(?:preview_item|thumb)"([^>]*)>"#).unwrap());
+    let gallery = GALLERY.get_or_init(|| Regex::new(r#"href="/(?:g|gallery)/(\d+)/""#).unwrap());
+    let attribute = ATTRIBUTE.get_or_init(|| Regex::new(r#"data-(tags|artists|groups|characters|parodies)="([^"]*)""#).unwrap());
+    let starts: Vec<_> = card.captures_iter(html).map(|c| (c.get(0).unwrap().start(), c.get(0).unwrap().end(), c[1].to_string())).collect();
+    let mut found = Vec::new();
+
+    for (n, (_, end, attributes)) in starts.iter().enumerate() {
+        let stop = starts.get(n + 1).map_or(html.len(), |next| next.0);
+        let Some(id) = gallery.captures(&html[*end..stop]).map(|c| c[1].to_string()) else { continue };
+        let mut ids = Vec::new();
+
+        for c in attribute.captures_iter(attributes) {
+            let Some((name, ..)) = CARD_ATTRIBUTES.iter().find(|(name, ..)| *name == &c[1]) else { continue };
+            ids.extend(c[2].split_whitespace().filter_map(|number| number.parse::<u64>().ok()).map(|number| (*name, number)));
+        }
+        found.push((id, ids));
+    }
+
+    found
+}
+
+/// The pages of a listing of AsmHentai or HentaiEra (`/tags/?page=2`): the slugs of what it lists, in the order of the page, of the kind `word` (`tag`).
+pub fn listed_slugs(html: &str, word: &str) -> Vec<String> {
+    let link = Regex::new(&format!(r#"href="/{}/([^/"?]+)/""#, regex::escape(word))).unwrap();
+    let mut slugs: Vec<String> = Vec::new();
+
+    for c in link.captures_iter(html) {
+        let slug = c[1].to_string();
+        if slug != "popular" && !slugs.contains(&slug) {
+            slugs.push(slug);
+        }
+    }
+
+    slugs
+}
+
 fn hentaienvy_extras(html: &str) -> HashMap<String, Extra> {
     static ID: OnceLock<Regex> = OnceLock::new();
     static CATEGORY: OnceLock<Regex> = OnceLock::new();
@@ -1329,5 +1380,21 @@ mod tests {
 
         assert_eq!(extras["RJ01774529"].uploader, Some(Account { id: "RG01004518".into(), name: "RELEASE SOFT".into() }));
         assert_eq!(extras["RJ01774529"].tags.len(), 2);
+    }
+
+    #[test]
+    fn the_cards_of_asmhentai_and_hentaiera_give_their_numbers() {
+        let asm = r#"<div class="preview_item" data-tags="29 39"data-artists="23774"data-parodies="3107"data-languages="1"><a href="/g/699152/">x</a></div>
+            <div class="preview_item" data-tags="25"data-languages="1"><a href="/g/699151/">y</a></div>"#;
+        let cards = card_ids(asm);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0], ("699152".to_string(), vec![("tags", 29), ("tags", 39), ("artists", 23774), ("parodies", 3107)]));
+        assert_eq!(cards[1], ("699151".to_string(), vec![("tags", 25)]));
+
+        let era = r#"<div class="thumb" data-tags="12 15"data-groups="3001"data-categories="5"><a href="/gallery/1779605/">x</a></div><div class="thumb"><a href="/tag/-asura/">no gallery</a></div>"#;
+        assert_eq!(card_ids(era), vec![("1779605".to_string(), vec![("tags", 12), ("tags", 15), ("groups", 3001)])]);
+
+        let listing = r#"<a href="/tag/big-breasts/">big breasts</a><a href="/tag/big-breasts/popular/">p</a><a href="/tag/anal/">anal</a><a href="/tag/big-breasts/">again</a>"#;
+        assert_eq!(listed_slugs(listing, "tag"), ["big-breasts", "anal"]);
     }
 }

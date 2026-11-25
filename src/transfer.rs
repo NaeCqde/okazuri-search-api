@@ -8,6 +8,7 @@
 //! A work that is saved already is left as it is (the shards do not overlap, and a work does not change when it is read again), except that
 //! its tags, account and posted date are set when the file has them (a database filled before the tags were read). The tags go by name and kind,
 //! the ids are the ids of one database; a file of an older version has none.
+//! The names of the numbers that AsmHentai and HentaiEra give their tags (`site_tag_names`) go in the file too, before the works.
 //! The queries and the translations are not moved: only the works, which is what the crawl made.
 
 use crate::entity::work;
@@ -49,6 +50,15 @@ struct Line {
     uploader: Option<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     posted_at: Option<i64>,
+}
+
+/// A line of a file: a work, or the name of a number that a site gives its tags (`site_tag_names`, which AsmHentai and HentaiEra need to name
+/// the tags of their works). A file of an older version has works only.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Entry {
+    Name { site_tag_name: (String, String, u64, String) },
+    Work(Line),
 }
 
 /// The tags and the accounts of a database, to write the names in place of the ids.
@@ -93,6 +103,14 @@ pub async fn export(store: &SearchStore, out: &Path, sites: &[String], since: i6
     let mut allowed: Option<(String, bool)> = None;
     let names = Names { tags: store.tag_table().await?, uploaders: store.uploader_table().await? };
 
+    // the names of the numbers of the sites come first
+    for name in store.all_site_tag_names().await? {
+        if wanted.is_empty() || wanted.contains(&name.0.to_lowercase()) {
+            serde_json::to_writer(&mut writer, &Entry::Name { site_tag_name: name })?;
+            writer.write_all(b"\n")?;
+        }
+    }
+
     loop {
         let page = store.works_after(after.as_ref(), PAGE).await?;
         let Some(last) = page.last() else { break };
@@ -134,7 +152,14 @@ pub async fn import(store: &SearchStore, file: &Path, romanizer: &Arc<Romanizer>
         if text.trim().is_empty() {
             continue;
         }
-        let line: Line = serde_json::from_str(&text).map_err(|e| format!("{}: line {}: {e}", file.display(), number + 1))?;
+        let entry: Entry = serde_json::from_str(&text).map_err(|e| format!("{}: line {}: {e}", file.display(), number + 1))?;
+        let line = match entry {
+            Entry::Name { site_tag_name: (website, attribute, id, name) } => {
+                store.save_site_tag_name(&website, &attribute, id, &name).await?;
+                continue;
+            }
+            Entry::Work(line) => line,
+        };
 
         moved.works += 1;
         if !moved.sites.contains(&line.website) {
@@ -316,5 +341,23 @@ mod tests {
 
         let _ = std::fs::remove_file(file);
         let _ = std::fs::remove_file(again);
+    }
+
+    #[tokio::test]
+    async fn the_names_of_the_numbers_of_a_site_go_through_the_file() {
+        let from = SearchStore::in_memory().await.unwrap();
+        from.save_crawled("AsmHentai", 100, &[work("/g/1/", "Alpha one")], None).await.unwrap();
+        from.save_site_tag_name("AsmHentai", "tags", 1, "big breasts").await.unwrap();
+        from.save_site_tag_name("HentaiEra", "artists", 7, "someone").await.unwrap();
+        let file = scratch("names.jsonl.br");
+        let moved = export(&from, &file, &["AsmHentai".to_string()], 0).await.unwrap();
+        assert_eq!(moved.works, 1);
+
+        let to = SearchStore::in_memory().await.unwrap();
+        let imported = import(&to, &file, &crate::testing::romanizer_arc()).await.unwrap();
+        assert_eq!(imported.works, 1);
+        assert_eq!(to.all_site_tag_names().await.unwrap(), vec![("AsmHentai".to_string(), "tags".to_string(), 1, "big breasts".to_string())]);
+
+        let _ = std::fs::remove_file(file);
     }
 }

@@ -247,6 +247,8 @@ impl SearchStore {
         db.execute(backend.build(tags.if_not_exists())).await?;
         db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS tags_kind_name ON tags (kind, name)").await?;
         db.execute(backend.build(uploaders.if_not_exists())).await?;
+        // the names of the numbers a site gives its tags (AsmHentai, HentaiEra): only the ones that works carry are kept
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS site_tag_names (website TEXT NOT NULL, attribute TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (website, attribute, id))").await?;
         let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
         db.execute(backend.build(searches.if_not_exists())).await?;
         db.execute(backend.build(crawls.if_not_exists())).await?;
@@ -1272,6 +1274,46 @@ impl SearchStore {
     }
 
     /// Where the crawl of a site stands (None: it never ran).
+    /// The names of the numbers a site gives its tags, learned before: (attribute, id, name).
+    pub async fn site_tag_names(&self, website: &str) -> Result<Vec<(String, u64, String)>> {
+        let rows = self
+            .reader
+            .query_all(Statement::from_sql_and_values(self.reader.get_database_backend(), "SELECT attribute, id, name FROM site_tag_names WHERE website = ?", [website.into()]))
+            .await?;
+        let mut names = Vec::new();
+
+        for row in rows {
+            names.push((row.try_get::<String>("", "attribute")?, row.try_get::<i64>("", "id")? as u64, row.try_get::<String>("", "name")?));
+        }
+
+        Ok(names)
+    }
+
+    /// The names of the numbers of every site (for `transfer export`): (website, attribute, id, name).
+    pub async fn all_site_tag_names(&self) -> Result<Vec<(String, String, u64, String)>> {
+        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT website, attribute, id, name FROM site_tag_names ORDER BY website, attribute, id")).await?;
+        let mut names = Vec::new();
+
+        for row in rows {
+            names.push((row.try_get::<String>("", "website")?, row.try_get::<String>("", "attribute")?, row.try_get::<i64>("", "id")? as u64, row.try_get::<String>("", "name")?));
+        }
+
+        Ok(names)
+    }
+
+    /// Keeps the name of one number of a site.
+    pub async fn save_site_tag_name(&self, website: &str, attribute: &str, id: u64, name: &str) -> Result<()> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                "INSERT OR REPLACE INTO site_tag_names (website, attribute, id, name) VALUES (?, ?, ?, ?)",
+                [website.into(), attribute.into(), (id as i64).into(), name.into()],
+            ))
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn crawl_state(&self, website: &str) -> Result<Option<crawl_state::Model>> {
         Ok(crawl_state::Entity::find_by_id(website.to_string()).one(&self.reader).await?)
     }
