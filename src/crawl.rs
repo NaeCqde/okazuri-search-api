@@ -370,6 +370,11 @@ impl Crawler {
 
         loop {
             let done = match self.engine.store().crawl_state(&lane.key).await {
+                // a part that has no place yet of a site that was read to its end before it was cut in parts is read to its end
+                Ok(None) if lane.key != name => match self.engine.store().crawl_state(name).await {
+                    Ok(state) => state.is_some_and(|row| row.done),
+                    Err(_) => false,
+                },
                 Ok(state) => state.is_some_and(|row| row.done),
                 Err(e) => {
                     log::warn!("crawl {name}: {e}");
@@ -437,7 +442,10 @@ impl Crawler {
     async fn walk_lane(&self, index: usize, source: &Source, lane: &Lane) -> std::result::Result<Walk, String> {
         let site = self.engine.site(index);
         let name = site.def.name;
-        let state = self.engine.store().crawl_state(&lane.key).await.map_err(|e| e.to_string())?;
+        let mut state = self.engine.store().crawl_state(&lane.key).await.map_err(|e| e.to_string())?;
+        if state.is_none() && lane.key != name {
+            state = self.engine.store().crawl_state(name).await.map_err(|e| e.to_string())?.filter(|row| row.done);
+        }
         let first = !state.as_ref().is_some_and(|row| row.done);
         let cursor = if first { state.map(|row| row.cursor).unwrap_or_default() } else { String::new() };
         let mut walk = Walk::default();

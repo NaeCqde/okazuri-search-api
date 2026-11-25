@@ -199,10 +199,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
         let Ok(claimed) = response.json::<serde_json::Value>().await else { continue };
         let (Some(id), Some(job)) = (claimed.get("id").and_then(|id| id.as_u64()), claimed.get("job").and_then(|job| serde_json::from_value::<Job>(job.clone()).ok())) else { continue };
 
-        let done = match job {
-            Job::Step { cursor, shard, ids } => Done::Step(crawler.step_local(&site, &cursor, shard, ids).await),
-            Job::Probe { paths, spacing_ms } => Done::Probe(probe(&engine, &site, paths, Duration::from_millis(spacing_ms)).await),
-        };
+        let done = run(&engine, &crawler, &site, job).await;
 
         // a report that fails is tried again: the page was read, and asking the site again costs more than asking the host
         for attempt in 0..5 {
@@ -215,6 +212,37 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
             }
         }
     }
+}
+
+async fn run(engine: &Arc<Engine>, crawler: &Arc<Crawler>, site: &str, job: Job) -> Done {
+    match job {
+        Job::Step { cursor, shard, ids } => Done::Step(crawler.step_local(site, &cursor, shard, ids).await),
+        Job::Probe { paths, spacing_ms } => Done::Probe(probe(engine, site, paths, Duration::from_millis(spacing_ms)).await),
+    }
+}
+
+/// The host reads pages itself too: one task for each site and kind of job, taking the jobs of its own list as a worker does.
+pub async fn work_local(hub: Arc<Hub>, engine: Arc<Engine>, crawler: Arc<Crawler>, verified: Vec<&'static str>) {
+    let mut tasks = tokio::task::JoinSet::new();
+    let crawled = crawler.site_names();
+    log::info!("dist: the host reads too, {} sites crawled, {} verified", crawled.len(), verified.len());
+
+    let sites = crawled.into_iter().map(|name| (name, "step")).chain(verified.into_iter().map(|name| (name, "probe")));
+    for (site, kind) in sites {
+        let (hub, engine, crawler) = (hub.clone(), engine.clone(), crawler.clone());
+        tasks.spawn(async move {
+            loop {
+                match hub.take(site, kind) {
+                    Some((id, job)) => {
+                        let done = run(&engine, &crawler, site, job).await;
+                        hub.report(id, done);
+                    }
+                    None => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Looks at the pages of `paths` of `site`, `spacing` apart (the pages of the site are spread over the interval of the verification).
