@@ -37,6 +37,10 @@ pub enum Source {
     Cards(String),
     /// E-Hentai: the list page, and `?next=` the id of the last gallery of the page before.
     GalleryIds(String),
+    /// Several lists of pages, one after the other (a site whose list stops after some pages is cut in parts: a price range, a category). Each is an
+    /// address with `{n}` for the number of the page (from 1; the first page is asked without `&page={n}`, which some sites answer with a redirect).
+    /// A list ends at an empty page, at a page after the last one that its links name, or at an error 403, 404 or 302 of a page after the first.
+    Lists(Vec<String>),
 }
 
 /// The lists of the sites (checked in 2026-11). A site that is not here has no list that can be read: it is only searched.
@@ -54,7 +58,62 @@ pub fn sources() -> Vec<(&'static str, Source)> {
         ("HentaiEnvy", pages("https://hentaienvy.com/?page={n}")),
         ("RokuHentai", Source::Cards("https://rokuhentai.com/_search?sort=recent".to_string())),
         ("EHentai", Source::GalleryIds("https://e-hentai.org/".to_string())),
+        // the list stops after 417 pages of 120, so it is cut by price (the newest first in each part)
+        ("FANZA", Source::Lists(fanza_lists())),
+        ("JComic", Source::Lists(JCOMIC_CATEGORIES.iter().map(|category| format!("https://jcomic.net/cat/{category}/{{n}}")).collect())),
+        // the list stops after some 100 pages of 75, so it is cut by category, and read from both ends
+        ("Sukebei", Source::Lists(sukebei_lists())),
     ]
+}
+
+/// The price ranges (in yen, `price_min` and `price_max`) that FANZA's book list is cut in; none holds more than 417 pages of 120.
+const FANZA_PRICES: &[(Option<u32>, Option<u32>)] = &[
+    (None, Some(0)),
+    (Some(1), Some(99)),
+    (Some(100), Some(299)),
+    (Some(300), Some(399)),
+    (Some(400), Some(499)),
+    (Some(500), Some(699)),
+    (Some(700), Some(999)),
+    (Some(1000), Some(1099)),
+    (Some(1100), Some(1299)),
+    (Some(1300), Some(1599)),
+    (Some(1600), Some(1999)),
+    (Some(2000), None),
+];
+
+fn fanza_lists() -> Vec<String> {
+    FANZA_PRICES
+        .iter()
+        .map(|(min, max)| {
+            let mut address = "https://book.dmm.co.jp/list/?sort=date".to_string();
+            if let Some(min) = min {
+                address.push_str(&format!("&price_min={min}"));
+            }
+            if let Some(max) = max {
+                address.push_str(&format!("&price_max={max}"));
+            }
+            address.push_str("&page={n}");
+            address
+        })
+        .collect()
+}
+
+/// The categories of JComic (`/cat/<name>/<page>`); "最近更新" (the newest) comes first so that the walks that look for new works read it.
+const JCOMIC_CATEGORIES: &[&str] = &[
+    "最近更新", "同人", "單行本", "短篇", "長篇", "全彩", "CG雜圖", "Cosplay", "Fate", "Love Live", "NTR", "SAO 刀劍神域", "SM", "WEBTOON", "人妻", "偽娘哲學", "圓神領域", "妹妹系",
+    "姐姐系", "強暴", "後宮閃光", "性轉換", "扶他樂園", "東方", "歐美", "生肉", "百合花園", "碧藍幻想", "禁書目錄", "純愛", "耽美花園", "艦隊收藏", "英語 ENG", "足の恋", "重口地帶", "非人類",
+];
+
+/// Sukebei: the categories doujinshi, games, manga and pictures, the newest first and the oldest first (a list stops after some 100 pages).
+fn sukebei_lists() -> Vec<String> {
+    let mut lists = Vec::new();
+    for order in ["", "&o=asc"] {
+        for category in ["1_2", "1_4", "1_3", "1_5"] {
+            lists.push(format!("https://sukebei.nyaa.si/?f=0&c={category}{order}&p={{n}}"));
+        }
+    }
+    lists
 }
 
 /// A list of pages goes on past empty pages at its very start, up to this many of them (the first pages of DLsite have no work that is out yet).
@@ -427,6 +486,7 @@ impl Crawler {
 
                 Ok(Step { links, next })
             }
+            Source::Lists(templates) => self.lists_step(index, templates, cursor, shard).await,
             Source::Cards(first) => {
                 let url = if cursor.is_empty() { first.as_str() } else { cursor };
                 let (page_url, body) = self.engine.get_page(index, url).await?;
@@ -509,6 +569,30 @@ impl Crawler {
 }
 
 impl Crawler {
+    /// One page of `Source::Lists`. The cursor is `list:page`.
+    async fn lists_step(&self, index: usize, templates: &[String], cursor: &str, shard: (u64, u64)) -> std::result::Result<Step, String> {
+        let site = self.engine.site(index);
+        let (list, number) = cursor
+            .split_once(':')
+            .and_then(|(list, number)| Some((list.parse::<usize>().ok()?, number.parse::<u64>().ok()?)))
+            .unwrap_or((0, shard.0 + 1));
+        let Some(template) = templates.get(list) else { return Ok(Step { links: Vec::new(), next: None }) };
+        let address = if number == 1 { template.replace("&page={n}", "") } else { template.clone() }.replace("{n}", &number.to_string());
+        let after_list = || (list + 1 < templates.len()).then(|| format!("{}:{}", list + 1, shard.0 + 1));
+
+        let (page_url, body) = match self.engine.get_page(index, &address).await {
+            Ok(page) => page,
+            Err(e) if number > 1 && matches!(e.as_str(), "HTTP 403" | "HTTP 404" | "HTTP 302") => return Ok(Step { links: Vec::new(), next: after_list() }),
+            Err(e) => return Err(e),
+        };
+        let links = site.read(&page_url, &body, MOST_LINKS)?;
+        let last = last_page(template, site.def.origin, &body);
+        let ended = links.is_empty() || last.is_some_and(|last| number + shard.1 > last);
+        let next = if ended { after_list() } else { Some(format!("{list}:{}", number + shard.1)) };
+
+        Ok(Step { links, next })
+    }
+
     /// Puts the tags, the artists and the groups on the links of a list page of AsmHentai or HentaiEra, which only carry numbers. A number whose
     /// name is not learned yet is left out (the work is saved without it).
     async fn name_cards(&self, index: usize, body: &str, links: &mut [Link]) {
@@ -675,6 +759,18 @@ impl Crawler {
 /// The number of the page to read: the first page of this machine, or the one the cursor names.
 fn page_number(cursor: &str, shard: (u64, u64)) -> u64 {
     cursor.parse().unwrap_or(shard.0 + 1)
+}
+
+/// The number of the last page that a page of a list names: the biggest number in the place of `{n}` in the links of the page (`/cat/x/199`, `&page=417`).
+fn last_page(template: &str, origin: &str, html: &str) -> Option<u64> {
+    let before = &template[..template.find("{n}")?];
+    let key = if before.contains('?') { before.rsplit(['&', '?']).next()? } else { before.strip_prefix(origin)? };
+    if key.is_empty() {
+        return None;
+    }
+    let pattern = regex::Regex::new(&format!("{}(\\d+)", regex::escape(key))).ok()?;
+
+    pattern.captures_iter(&html.replace("&amp;", "&")).filter_map(|c| c[1].parse::<u64>().ok()).max()
 }
 
 /// The id in `/g/3000000/abcdef0123/`.
@@ -856,6 +952,32 @@ mod tests {
         let next = crawler.walk(index, &source).await.unwrap();
         assert_eq!(next, Walk { pages: 1, new: 0, finished: false });
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn lists_are_read_one_after_the_other_and_lists_are_read_one_after_the_other() {
+        let (port, hits) = server(2, 3).await;
+        let store = Arc::new(SearchStore::in_memory().await.unwrap());
+        let search = SearchConfig { min_delay_ms: 0, ..SearchConfig::default() };
+        let engine = Engine::with_sites(vec![Site::new(def("Listed", port))], &search, store.clone(), crate::testing::romanizer_arc());
+        let source = Source::Lists(vec![format!("http://127.0.0.1:{port}/list/{{n}}"), format!("http://127.0.0.1:{port}/list/{{n}}?other=1")]);
+        let crawler = Arc::new(Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), source)]).unwrap());
+        let (index, source) = crawler.sources[0].clone();
+
+        // the pages 1 to 3 of the first list and the empty one that ends it, then the same of the second: its works are the ones of the first
+        let walk = crawler.walk(index, &source).await.unwrap();
+        assert_eq!(walk, Walk { pages: 8, new: 6, finished: true });
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(store.crawl_state("Listed").await.unwrap().unwrap().done);
+    }
+
+    #[test]
+    fn the_last_page_is_the_biggest_number_in_the_place_of_n() {
+        let html = r#"<a href="/cat/x/2">2</a><a href="/cat/x/199">199</a><a href="/cat/y/500">y</a>"#;
+        assert_eq!(last_page("https://jcomic.net/cat/x/{n}", "https://jcomic.net", html), Some(199));
+        let query = r#"<a href="https://b.example/list/?sort=date&amp;page=417">last</a><a href="?sort=date&amp;page=3">3</a>"#;
+        assert_eq!(last_page("https://b.example/list/?sort=date&price_min=1&page={n}", "https://b.example", query), Some(417));
+        assert_eq!(last_page("https://b.example/list/?page={n}", "https://b.example", "no pager"), None);
     }
 
     #[tokio::test]
