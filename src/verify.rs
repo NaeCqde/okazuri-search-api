@@ -29,18 +29,18 @@ const NAMES: &[&str] = &["RokuHentai", "DLsite", "HentaiEnvy", "Nya:Hentai", "mo
 
 impl Verifier {
     /// An unknown site, or one whose pages do not tell, is an error.
-    pub fn new(engine: Arc<Engine>, config: VerifyConfig) -> Result<Self> {
+    pub fn new(engine: Arc<Engine>, config: VerifyConfig, disabled: &[String]) -> Result<Self> {
         let names: Vec<String> = if config.sites.is_empty() { NAMES.iter().map(|s| s.to_string()).collect() } else { config.sites.clone() };
         let mut sites = Vec::new();
 
         for name in names {
             let Some(known) = NAMES.iter().find(|known| **known == name) else {
-                return Err(format!("[verify] sites: {name} is not a site whose pages tell that a work is gone ({})", NAMES.join(", ")).into());
+                return Err(format!("[crawl.verify] sites: {name} is not a site whose pages tell that a work is gone ({})", NAMES.join(", ")).into());
             };
-            let index = engine.site_named(known).ok_or_else(|| format!("[verify] sites: {known} is not one of the sites of this program"))?;
-            let rule = gone_rule(known).ok_or_else(|| format!("[verify] sites: no rule for {known}"))?;
-            if engine.is_disabled(index) {
-                log::info!("verify: {known} is in [search] disabled_sites, left out");
+            let index = engine.site_named(known).ok_or_else(|| format!("[crawl.verify] sites: {known} is not one of the sites of this program"))?;
+            let rule = gone_rule(known).ok_or_else(|| format!("[crawl.verify] sites: no rule for {known}"))?;
+            if disabled.iter().chain(&config.disabled_sites).any(|off| off.eq_ignore_ascii_case(known)) {
+                log::info!("verify: {known} is in [crawl] disabled_sites, left out");
                 continue;
             }
             sites.push((index, *known, rule));

@@ -280,6 +280,7 @@ impl Crawler {
         }
 
         let wanted: HashSet<String> = config.sites.iter().map(|name| name.to_lowercase()).collect();
+        let off: HashSet<String> = config.disabled_sites.iter().map(|name| name.to_lowercase()).collect();
         let mut chosen = Vec::new();
 
         for (name, source) in sources {
@@ -287,7 +288,7 @@ impl Crawler {
                 continue;
             }
             match engine.site_named(&name) {
-                Some(index) if engine.is_disabled(index) => log::info!("crawl: {name} is in [search] disabled_sites, left out"),
+                Some(_) if off.contains(&name.to_lowercase()) => log::info!("crawl: {name} is in [crawl] disabled_sites, left out"),
                 Some(index) => chosen.push((index, source)),
                 None => log::warn!("crawl: {name} is not one of the sites of this program, left out"),
             }
@@ -1291,13 +1292,19 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_site_is_not_crawled() {
         let store = Arc::new(SearchStore::in_memory().await.unwrap());
-        let search = SearchConfig { min_delay_ms: 0, disabled_sites: vec!["listed".into()], ..SearchConfig::default() };
+        let search = SearchConfig { min_delay_ms: 0, ..SearchConfig::default() };
         let engine = Engine::with_sites(vec![Site::new(def("Listed", 1))], &search, store, crate::testing::romanizer_arc());
         let source = Source::Pages("http://127.0.0.1:1/list/{n}".to_string());
 
-        let crawler = Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), source)]).unwrap();
-
+        let crawler = Crawler::with_sources(engine.clone(), CrawlConfig { disabled_sites: vec!["listed".into()], ..CrawlConfig::default() }, vec![("Listed".to_string(), source.clone())]).unwrap();
         assert!(crawler.sources.is_empty());
+
+        // a site that the searches leave out (`[search] disabled_sites`) is still crawled
+        let store = Arc::new(SearchStore::in_memory().await.unwrap());
+        let search = SearchConfig { min_delay_ms: 0, disabled_sites: vec!["listed".into()], ..SearchConfig::default() };
+        let engine = Engine::with_sites(vec![Site::new(def("Listed", 1))], &search, store, crate::testing::romanizer_arc());
+        let crawler = Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), source)]).unwrap();
+        assert_eq!(crawler.sources.len(), 1);
     }
 
     #[test]

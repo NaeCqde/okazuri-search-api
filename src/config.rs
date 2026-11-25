@@ -17,7 +17,6 @@ pub struct Config {
     pub magazine: MagazineConfig,
     pub translation: TranslationConfig,
     pub crawl: CrawlConfig,
-    pub verify: VerifyConfig,
     pub distribute: DistributeConfig,
     pub cron: CronConfig,
     pub log: LogConfig,
@@ -106,7 +105,8 @@ pub struct SearchConfig {
     /// How much a query that names a tag adds to the score, by what the tag is (`tag`, `author`, `circle`, `weak`; the weight of the tag in the
     /// `tags` table counts too). A kind that is not here keeps its default (1, 6, 4, 0.25).
     pub tag_boost: BTreeMap<String, f64>,
-    /// Names of the sites (`GET /okazuri/sites`) that are left out.
+    /// Names of the sites (`GET /okazuri/sites`) that the searches and the prefetch do not ask (what is saved of them is still searched). The crawl and the
+    /// verification have lists of their own: `[crawl] disabled_sites`.
     pub disabled_sites: Vec<String>,
     /// A site whose whole list the crawl has read (`crawls.done`) is answered from the database and not asked live; a request with `live=force`
     /// still asks it. The sites that have no list, or whose list is not read yet, are asked as before.
@@ -286,6 +286,10 @@ pub struct CrawlConfig {
     pub utc_offset: String,
     /// The sites to crawl, by name; empty is every site that can be.
     pub sites: Vec<String>,
+    /// The sites that the crawl and the verification leave out (names as in `GET /okazuri/sites`), apart from the searches (`[search] disabled_sites`).
+    pub disabled_sites: Vec<String>,
+    /// The verification of the saved works (`[crawl.verify]`): it goes with the crawl, which keeps the list of the sites that are left out.
+    pub verify: VerifyConfig,
     /// `k/N`: this machine reads the pages whose number leaves k when divided by N, so N machines (each with its own IP address) read
     /// every site together without any one of them being the only one a site sees. `0/1` is the whole list.
     pub shard: String,
@@ -312,6 +316,8 @@ impl Default for CrawlConfig {
             schedule: "17 * * * *".to_string(),
             utc_offset: "UTC".to_string(),
             sites: Vec::new(),
+            disabled_sites: Vec::new(),
+            verify: VerifyConfig::default(),
             shard: "0/1".to_string(),
             gallery_ids: String::new(),
             hitomi_index: "index-all.nozomi".to_string(),
@@ -322,13 +328,15 @@ impl Default for CrawlConfig {
     }
 }
 
-/// Looking at the page of every saved work now and then, and removing the works whose page is gone (`verify.rs`). Off unless `enabled` is true.
+/// Looking at the page of every saved work now and then, and removing the works whose page is gone (`verify.rs`): `[crawl.verify]`. Off unless `enabled` is true.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct VerifyConfig {
     pub enabled: bool,
     /// The sites to look at, by name; empty is every site whose pages say that a work is gone (`engine::gone_rule`).
     pub sites: Vec<String>,
+    /// The sites that are left out of the verification, besides the ones of `[crawl] disabled_sites`.
+    pub disabled_sites: Vec<String>,
     /// Every page is looked at once in this many days: a site is asked one page every `days / works` (the works of a site that are saved
     /// now), never closer than the delay of the site.
     pub interval_days: u64,
@@ -338,7 +346,7 @@ pub struct VerifyConfig {
 
 impl Default for VerifyConfig {
     fn default() -> Self {
-        Self { enabled: false, sites: Vec::new(), interval_days: 30, min_pause_ms: 5000 }
+        Self { enabled: false, sites: Vec::new(), disabled_sites: Vec::new(), interval_days: 30, min_pause_ms: 5000 }
     }
 }
 
@@ -456,6 +464,19 @@ mod tests {
         assert!(config.search.enabled && config.magazine.enabled && config.magazine.prefetch.enabled);
         assert_eq!((config.search.ttl_hours, config.search.concurrency), (1, 8));
         assert_eq!(config.search.disabled_sites, ["Sukebei"]);
+    }
+
+    #[test]
+    fn the_verification_is_under_the_crawl_and_the_sites_left_out_are_listed_apart_from_the_searches() {
+        let config: Config = toml::from_str(
+            "[search]\ndisabled_sites = [\"A\"]\n[crawl]\nenabled = true\ndisabled_sites = [\"B\"]\n[crawl.verify]\nenabled = true\ndisabled_sites = [\"C\"]\ninterval_days = 7\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.search.disabled_sites, ["A"]);
+        assert_eq!(config.crawl.disabled_sites, ["B"]);
+        assert!(config.crawl.enabled && config.crawl.verify.enabled);
+        assert_eq!((config.crawl.verify.disabled_sites.as_slice(), config.crawl.verify.interval_days), (["C".to_string()].as_slice(), 7));
     }
 
     #[test]

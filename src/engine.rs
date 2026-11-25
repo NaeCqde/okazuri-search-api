@@ -421,7 +421,7 @@ pub struct Engine {
     sites: Vec<Site>,
     /// Indexes into `sites` of the ones that are searched.
     active: Vec<usize>,
-    /// The sites that `[search] disabled_sites` names: not asked by a search or the prefetch, and not walked by the crawl or the verification.
+    /// The sites that `[search] disabled_sites` names: not asked by a search or the prefetch (the crawl and the verification have `[crawl] disabled_sites`).
     off: Vec<bool>,
     /// The place of a searched site in the list, to put the works in the order of the sites.
     order: HashMap<&'static str, usize>,
@@ -522,7 +522,7 @@ impl Engine {
         self.sites.iter().position(|site| site.def.name == name)
     }
 
-    /// Is the site one that `[search] disabled_sites` names? What is saved of it is still searched; it is not asked, crawled or verified.
+    /// Is the site one that `[search] disabled_sites` names? What is saved of it is still searched; it is not asked by a search or the prefetch.
     pub(crate) fn is_disabled(&self, index: usize) -> bool {
         self.off[index]
     }
