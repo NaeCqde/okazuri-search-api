@@ -678,9 +678,33 @@ fn hentaienvy_extras(html: &str) -> HashMap<String, Extra> {
     found
 }
 
-/// The works of a Wnacg list page, by album id: the day it was created (`創建於2026-11-25`).
+/// The tags of a category of Wnacg (`pic_box cate-12`): the group and the language the site's menu gives it.
+fn wnacg_category(number: u32) -> &'static [&'static str] {
+    match number {
+        1 => &["同人誌", "漢化"],
+        12 => &["同人誌", "日語"],
+        16 => &["同人誌", "English"],
+        5 => &["同人誌"],
+        2 => &["CG畫集"],
+        37 => &["AI圖集"],
+        22 => &["3D漫畫"],
+        3 => &["Cosplay"],
+        9 => &["單行本", "漢化"],
+        13 => &["單行本", "日語"],
+        17 => &["單行本", "English"],
+        6 => &["單行本"],
+        10 => &["雜誌&短篇", "漢化"],
+        14 => &["雜誌&短篇", "日語"],
+        18 => &["雜誌&短篇", "English"],
+        7 => &["雜誌&短篇"],
+        _ => &[],
+    }
+}
+
+/// The works of a Wnacg list page, by album id: the day it was created (`創建於2026-11-25`) and the category (`pic_box cate-12`, as tags).
 fn wnacg_extras(html: &str) -> HashMap<String, Extra> {
     static ITEM: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY: OnceLock<Regex> = OnceLock::new();
     let item = ITEM.get_or_init(|| Regex::new(r#"(?s)href="/photos-index-aid-(\d+)\.html".*?創建於(\d{4})-(\d\d)-(\d\d)"#).unwrap());
     let mut found = HashMap::new();
 
@@ -688,6 +712,55 @@ fn wnacg_extras(html: &str) -> HashMap<String, Extra> {
         let number = |n: usize| c[n].parse::<i64>().ok();
         if let (Some(y), Some(m), Some(d)) = (number(2), number(3), number(4)) {
             found.entry(c[1].to_string()).or_insert_with(|| Extra { posted_at: Some(epoch(y, m, d, 0, 0)), ..Default::default() });
+        }
+    }
+
+    let category = CATEGORY.get_or_init(|| Regex::new(r#"pic_box cate-(\d+)">\s*<a href="/photos-index-aid-(\d+)\.html""#).unwrap());
+    for c in category.captures_iter(html) {
+        let tags: Vec<Tag> = c[1].parse().map(wnacg_category).unwrap_or(&[]).iter().map(|name| Tag::new(name.to_string(), TagKind::Tag)).collect();
+        if !tags.is_empty() {
+            found.entry(c[2].to_string()).or_default().tags = tags;
+        }
+    }
+
+    found
+}
+
+/// The works of a Sukebei list page, by id: the category (`Art - Doujinshi`, as the two tags `Art` and `Doujinshi`) and the time of the upload (`data-timestamp`).
+fn sukebei_extras(html: &str) -> HashMap<String, Extra> {
+    static ROW: OnceLock<Regex> = OnceLock::new();
+    let row = ROW.get_or_init(|| Regex::new(r#"(?s)<a href="/\?c=[0-9_]+" title="([^"]+)">.*?href="/view/(\d+)".*?data-timestamp="(\d+)""#).unwrap());
+    let mut found = HashMap::new();
+
+    for c in row.captures_iter(html) {
+        let tags = decode(c[1].trim()).split(" - ").map(|name| Tag::new(name.trim().to_string(), TagKind::Tag)).filter(|tag| !tag.name.is_empty()).collect();
+        found.entry(c[2].to_string()).or_insert_with(|| Extra { tags, posted_at: c[3].parse().ok(), ..Default::default() });
+    }
+
+    found
+}
+
+/// The works of a FANZA book list page, by content id: the authors (the links of the "author" line of a card) as author tags.
+fn fanza_extras(html: &str) -> HashMap<String, Extra> {
+    static AUTHORS: OnceLock<Regex> = OnceLock::new();
+    static LINK: OnceLock<Regex> = OnceLock::new();
+    let authors = AUTHORS.get_or_init(|| Regex::new(r#"(?s)<span class="[^"]*authorTxt[^"]*">(.*?)</span>"#).unwrap());
+    let link = LINK.get_or_init(|| Regex::new(r#"(?s)<a [^>]*>(.*?)</a>"#).unwrap());
+    let mut found = HashMap::new();
+
+    for item in html.split("data-content-id=\"").skip(1) {
+        let Some(id) = item.split('"').next().filter(|id| !id.is_empty()) else { continue };
+        let Some(line) = authors.captures(item) else { continue };
+        let mut tags: Vec<Tag> = Vec::new();
+
+        for c in link.captures_iter(&line[1]) {
+            let tag = Tag::new(decode(c[1].trim()), TagKind::Author);
+            if !tag.name.is_empty() && !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        if !tags.is_empty() {
+            found.insert(id.to_string(), Extra { tags, ..Default::default() });
         }
     }
 
@@ -928,6 +1001,8 @@ impl Site {
             "HentaiEnvy" => Some((hentaienvy_extras(html), |path| path.split('/').filter(|part| !part.is_empty()).nth(1).map(str::to_string))),
             "Wnacg" => Some((wnacg_extras(html), |path| path.rsplit_once("aid-")?.1.strip_suffix(".html").map(str::to_string))),
             "JComic" => Some((jcomic_extras(html), |path| Some(path.strip_prefix("/page/")?.to_string()))),
+            "Sukebei" => Some((sukebei_extras(html), |path| path.rsplit('/').find(|part| !part.is_empty()).map(str::to_string))),
+            "FANZA" => Some((fanza_extras(html), |path| path.rsplit('/').find(|part| !part.is_empty()).map(str::to_string))),
             "RokuHentai" => Some((rokuhentai_extras(html), |path| path.split('/').find(|part| !part.is_empty()).map(str::to_string))),
             _ => None,
         };
@@ -1409,6 +1484,22 @@ mod tests {
         let links = read("RokuHentai", "https://rokuhentai.com/", roku);
         assert_eq!(links.len(), 1, "{links:?}");
         assert_eq!(links[0].extra.posted_at, Some(epoch(2026, 11, 24, 21, 0)));
+
+        let wnacg_cate = r#"<li class="li gallary_item"><div class="pic_box cate-12"><a href="/photos-index-aid-407281.html" title="[A] B">x</a></div><div class="info"><div class="title"><a href="/photos-index-aid-407281.html" title="[A] B">[A] B</a></div><div class="info_col">44張圖片， 創建於2026-11-25</div></div></li>"#;
+        let links = read("Wnacg", "https://www.wnacg.com/albums-index-page-2.html", wnacg_cate);
+        let names: Vec<&str> = links[0].extra.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["同人誌", "日語"]);
+        assert_eq!(links[0].extra.posted_at, Some(epoch(2026, 11, 25, 0, 0)));
+
+        let sukebei = r#"<tr class="success"><td><a href="/?c=1_2" title="Art - Doujinshi"><img alt="Art - Doujinshi"></a></td><td colspan="2"><a href="/view/4770976" title="(同人誌) [A] B">(同人誌) [A] B</a></td><td class="text-center" data-timestamp="1795625626">2026-11-25 16:53</td></tr>"#;
+        let links = read("Sukebei", "https://sukebei.nyaa.si/?c=1_2&p=1", sukebei);
+        let names: Vec<&str> = links[0].extra.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Art", "Doujinshi"]);
+        assert_eq!(links[0].extra.posted_at, Some(1795625626));
+
+        let fanza_list = r#"<li class="m-boxListBookProduct2__item" data-content-id="b401btmep17225"><a href="https://book.dmm.co.jp/product/6278540/b401btmep17225/"><span class="m-boxListBookProduct2Tmb__ttl">タイトル</span></a><div class="m-boxListBookProductTmbInfo"><span class="m-boxListBookProductTmbInfo__authorTxt m-boxListBookProductTmbInfo__authorTxt__multiple"><a href="https://book.dmm.co.jp/list/?actress=1017395"> 神波多一花 </a> 他</span></div></li>"#;
+        let links = read("FANZA", "https://book.dmm.co.jp/list/?sort=date", fanza_list);
+        assert_eq!(links[0].extra.tags, [Tag::new("神波多一花", TagKind::Author)]);
 
         // the same pages without any of it: the works are still read
         let links = read("Wnacg", "https://www.wnacg.com/albums-index-page-2.html", r#"<a href="/photos-index-aid-5.html" title="T">T</a>"#);
