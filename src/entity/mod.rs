@@ -12,6 +12,7 @@ pub mod magazine;
 pub mod mirror_meta;
 pub mod number;
 pub mod search;
+pub mod site_tag_name;
 pub mod tag;
 pub mod translation;
 pub mod translation_lookup;
