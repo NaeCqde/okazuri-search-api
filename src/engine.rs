@@ -1381,10 +1381,19 @@ impl Engine {
             self.wait_turn(index).await;
 
             let (client, passport_cookie) = self.client_of(site).await?;
-            let mut request = client.get(url).header("Accept-Language", "ja,en;q=0.8").header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            );
+            // the headers a browser sends for a page: Cloudflare reads them with the TLS and HTTP/2 of the client
+            let mut request = client
+                .get(url)
+                .header("Accept-Language", "ja,en;q=0.8")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                .header("Sec-CH-UA", "\"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\", \"Not-A.Brand\";v=\"24\"")
+                .header("Sec-CH-UA-Mobile", "?0")
+                .header("Sec-CH-UA-Platform", "\"Windows\"")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "none")
+                .header("Sec-Fetch-User", "?1");
             if let Some(cookie) = &passport_cookie {
                 request = request.header("Cookie", cookie.as_str());
             } else if let Some(cookie) = site.def.cookie {
@@ -3122,5 +3131,19 @@ pub(crate) mod tests {
         assert_eq!(of("/4")["title_english"], serde_json::json!({ "text": "Her B", "source": "google" }));
         assert!(of("/5")["title_english"].is_null());
         assert!(of("/5").get("title_english_source").is_none());
+    }
+
+    /// Asks the real sites of Support::Cloudflare (by hand: `cargo test --release live_cloudflare -- --ignored --nocapture`).
+    #[tokio::test]
+    #[ignore = "asks the real sites"]
+    async fn live_cloudflare() {
+        let engine = Engine::new(&config(), Arc::new(SearchStore::in_memory().await.unwrap()), crate::testing::romanizer_arc());
+        for (index, site) in engine.sites.iter().enumerate() {
+            if site.def.support != Support::Cloudflare {
+                continue;
+            }
+            let result = engine.get_page(index, site.def.origin).await;
+            println!("LIVE {} {}", site.def.name, match &result { Ok((_, body)) => format!("ok {} bytes", body.len()), Err(e) => e.clone() });
+        }
     }
 }
