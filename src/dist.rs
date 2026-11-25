@@ -199,7 +199,14 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
         let Ok(claimed) = response.json::<serde_json::Value>().await else { continue };
         let (Some(id), Some(job)) = (claimed.get("id").and_then(|id| id.as_u64()), claimed.get("job").and_then(|job| serde_json::from_value::<Job>(job.clone()).ok())) else { continue };
 
+        let what = match &job {
+            Job::Step { cursor, shard, .. } => format!("step of part {}/{} from {cursor:?}", shard.0, shard.1),
+            Job::Probe { paths, .. } => format!("probe of {} pages", paths.len()),
+        };
+        let started = std::time::Instant::now();
+        log::info!("dist {site}: job {id} taken from the host ({what})");
         let done = run(&engine, &crawler, &site, job).await;
+        log::info!("dist {site}: job {id} done in {} ms, reporting", started.elapsed().as_millis());
 
         // a report that fails is tried again: the page was read, and asking the site again costs more than asking the host
         for attempt in 0..5 {
