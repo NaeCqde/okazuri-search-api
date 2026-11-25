@@ -1948,7 +1948,7 @@ pub enum GoneRule {
 /// galleries there are. E-Hentai answers 200 with a short text, and it bans an address that asks more than a page every few seconds.)
 pub fn gone_rule(site: &str) -> Option<GoneRule> {
     match site {
-        "RokuHentai" | "DLsite" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" => Some(GoneRule::NotFound),
+        "RokuHentai" | "DLsite" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" | "177Picyy" => Some(GoneRule::NotFound),
         "AsmHentai" | "HentaiEra" => Some(GoneRule::RedirectsTo404),
         "Wnacg" => Some(GoneRule::Sentence("您要訪問的漫畫不存在")),
         _ => None,

@@ -202,8 +202,6 @@ retry_minutes = 5
 enabled = false
 # Empty: every site of that list.
 sites = []
-# Sites that are left out of the verification, besides [crawl] disabled_sites.
-disabled_sites = []
 interval_days = 30
 # A site is never asked two pages closer than this, so a site with more works than interval_days allows is looked at over more days.
 min_pause_ms = 5000
