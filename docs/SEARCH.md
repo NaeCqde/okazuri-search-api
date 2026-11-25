@@ -222,7 +222,7 @@ Hitomi.La の保存済みの行と Google の保存済みの行は別です(`tra
 | | サイト |
 |---|---|
 | 検索する | DLsite、FANZA、momon:GA、Nya:Hentai(現在は nyahentai.one)、同人の森、JComic、R18Best、Sukebei、RokuHentai、HentaiEnvy、HentaiEra、177Picyy、Wnacg、AsmHentai、EHentai、Hitomi.La(16 サイト。すべて日本語とローマ字ですが、HentaiEra と EHentai はローマ字のみ) |
-| Cloudflare のチャレンジ | IMHentai、HentaiOMG、HentaiCore、NijiGazo、NukiBooks、HentaiName、HentaiPaw: ブラウザが必要 |
+| Cloudflare のチャレンジ | IMHentai、HentaiOMG、HentaiCore、NijiGazo、NukiBooks、HentaiPaw: ブラウザが必要 |
 | JavaScript | Anime-Sharing(分析済み。下を見てください) |
 | 閉鎖 | MasDr、JMwu、BatoTo、HentaiDesi |
 

@@ -384,10 +384,10 @@ pub const SITES: &[SiteDef] = &[
             "HentaiName",
             false,
             "https://www.hentai.name",
-            r"^https://www\.hentai\.name/[a-z]+/\d+.*",
-            None,
-            Support::Cloudflare,
-            "Cloudflare challenges a browser's User-Agent here, not a plain client; there is no search page to ask yet",
+            r"^https://www\.hentai\.name/g/\d+/?$",
+            Some("https://www.hentai.name/search/{q}/"),
+            Support::Ready,
+            "Cloudflare challenges a browser's User-Agent here, not a plain client",
         )
     },
     site(
@@ -1270,6 +1270,17 @@ mod tests {
         let links = site("Nya:Hentai").extract("https://nyahentai.one/?s=x", html, 50);
 
         assert_eq!(links, vec![link("/magazine/re3280150/", "a"), link("/fanzine/re1/", "b")]);
+    }
+
+    /// HentaiName: the cards are links to /g/N/ and the title is the caption inside.
+    #[test]
+    fn hentai_name_gives_the_caption_of_the_card() {
+        let html = r#"<div class="gallery" data-tags=""><a href="/g/371075/" class="cover" style="padding:0 0 142.0% 0"><img loading="lazy" src="https://pics.hentai.name/p.webp" alt="Sexual♡Special♡Holidays"><div class="caption">Sexual♡Special♡Holidays</div></a></div>"#;
+
+        assert_eq!(
+            site("HentaiName").extract("https://www.hentai.name/search/a/", html, 50),
+            vec![link("/g/371075/", "Sexual♡Special♡Holidays")]
+        );
     }
 
     /// The cards of the list pages, as the sites write them (the badge, the price and the date are not the title).
