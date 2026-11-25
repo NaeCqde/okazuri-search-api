@@ -6,6 +6,7 @@
 
 pub mod catalog_author;
 pub mod catalog_work;
+pub mod crawl_range;
 pub mod crawl_state;
 pub mod listing;
 pub mod magazine;
