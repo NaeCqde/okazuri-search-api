@@ -37,6 +37,11 @@ const MAX_DEPTH: usize = 24;
 #[allow(async_fn_in_trait)]
 pub trait Fetch {
     async fn get(&mut self, path: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String>;
+
+    /// The size of a file in bytes, from the `Content-Range` of a read of its first bytes (the crawl watches the length of the index of the galleries).
+    async fn size(&mut self, _path: &str) -> Result<u64, String> {
+        Err("the size of a file is not known".to_string())
+    }
 }
 
 /// The key of a word: the first 4 bytes of its SHA-256.

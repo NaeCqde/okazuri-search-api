@@ -327,6 +327,22 @@ pub struct CrawlConfig {
     pub refresh_pages: usize,
     /// The wait after a site failed, before it is tried again.
     pub retry_minutes: u64,
+    /// Gap check (host of workers only): while the first walk of a list that shows the newest works first is not done, page 1 is read this often (seconds) to
+    /// learn when works were added at the top. 0: no polling (every boundary of pages that were read out of order is then read again). The wait is never less
+    /// than 4 times the delay of the site.
+    pub watch_seconds: u64,
+    /// The master switch of the gap check: after the first walk of a newest-first numbered list, the boundaries of pages that were read out of order while the top
+    /// of the list grew are read again.
+    pub gap_check: bool,
+    /// The most pages that one boundary is read again for.
+    pub gap_reread_max_pages: usize,
+    /// The most pages read again for the boundaries of one walk of one site; the rest is left to the refresher.
+    pub gap_budget_pages: usize,
+    /// The sites whose work ids are numbers: once their list is read, the ids that are missing between the smallest and the largest saved are looked at (once
+    /// each). Empty turns the id check off. A site without a rule that says a page is gone (`engine::gone_rule`) cannot be checked.
+    pub id_gap_sites: Vec<String>,
+    /// The most ids looked at for one site in one reading of the newest pages.
+    pub id_gap_per_cycle: usize,
 }
 
 impl Default for CrawlConfig {
@@ -344,6 +360,12 @@ impl Default for CrawlConfig {
             hitomi_batch: 100,
             refresh_pages: 1000,
             retry_minutes: 5,
+            watch_seconds: 120,
+            gap_check: true,
+            gap_reread_max_pages: 10,
+            gap_budget_pages: 300,
+            id_gap_sites: ["HentaiEnvy", "HentaiEra", "AsmHentai", "Wnacg"].map(str::to_string).to_vec(),
+            id_gap_per_cycle: 20,
         }
     }
 }
@@ -495,6 +517,28 @@ mod tests {
         assert_eq!(config.crawl.disabled_sites, ["B"]);
         assert!(config.crawl.enabled && config.crawl.verify.enabled);
         assert_eq!(config.crawl.verify.interval_days, 7);
+    }
+
+    #[test]
+    fn the_gap_settings_have_defaults() {
+        let config = CrawlConfig::default();
+
+        assert_eq!((config.watch_seconds, config.gap_check, config.gap_reread_max_pages, config.gap_budget_pages, config.id_gap_per_cycle), (120, true, 10, 300, 20));
+        assert_eq!(config.id_gap_sites, ["HentaiEnvy", "HentaiEra", "AsmHentai", "Wnacg"]);
+        // a file with no [crawl] keys of them has the defaults too
+        let read: Config = toml::from_str("[crawl]\nenabled = true\n").unwrap();
+        assert_eq!((read.crawl.watch_seconds, read.crawl.gap_check), (120, true));
+    }
+
+    #[test]
+    fn the_gap_settings_can_be_set_in_toml() {
+        let config: Config = toml::from_str(
+            "[crawl]\nwatch_seconds = 0\ngap_check = false\ngap_reread_max_pages = 3\ngap_budget_pages = 50\nid_gap_sites = []\nid_gap_per_cycle = 5\n",
+        )
+        .unwrap();
+
+        assert_eq!((config.crawl.watch_seconds, config.crawl.gap_check, config.crawl.gap_reread_max_pages, config.crawl.gap_budget_pages, config.crawl.id_gap_per_cycle), (0, false, 3, 50, 5));
+        assert!(config.crawl.id_gap_sites.is_empty());
     }
 
     #[test]

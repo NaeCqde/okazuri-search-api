@@ -62,7 +62,14 @@ struct Item {
     id: u64,
     site: String,
     job: Job,
-    done: oneshot::Sender<Done>,
+    /// The answer, and the time (unix ms of the clock of the host) the job was handed to a worker.
+    done: oneshot::Sender<(Done, i64)>,
+    /// When the job was handed to a worker (unix ms of the clock of the host); none while it waits.
+    taken: Option<i64>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 #[derive(Default)]
@@ -88,12 +95,18 @@ impl Hub {
 
     /// Puts a job of `site` in the list and waits for the worker's answer.
     pub async fn submit(&self, site: &str, job: Job) -> Result<Done, String> {
+        self.submit_timed(site, job).await.map(|(done, _)| done)
+    }
+
+    /// `submit`, and the time (unix ms of the clock of the host) at which a worker took the job: the pages the job read were read after it (the time a job waited
+    /// for a worker is not part of the time it read).
+    pub async fn submit_timed(&self, site: &str, job: Job) -> Result<(Done, i64), String> {
         let (done, wait) = oneshot::channel();
         {
             let mut queue = self.queue.lock().unwrap();
             queue.next += 1;
             let id = queue.next;
-            queue.waiting.push_back(Item { id, site: site.to_string(), job, done });
+            queue.waiting.push_back(Item { id, site: site.to_string(), job, done, taken: None });
         }
 
         wait.await.map_err(|_| "the job was dropped".to_string())
@@ -106,14 +119,16 @@ impl Hub {
         let silent = |queue: &Queue, name: &str| name != HOST && queue.seen.get(name).is_none_or(|at| at.elapsed() > LOST_AFTER);
         let lost: Vec<u64> = queue.running.iter().filter(|(_, (name, _))| silent(&queue, name)).map(|(id, _)| *id).collect();
         for id in lost {
-            if let Some((_, item)) = queue.running.remove(&id) {
+            if let Some((_, mut item)) = queue.running.remove(&id) {
+                item.taken = None;
                 log::warn!("dist: the job {id} of {} was not reported, given again", item.site);
                 queue.waiting.push_front(item);
             }
         }
 
         let place = queue.waiting.iter().position(|item| item.site == site && item.job.kind() == kind)?;
-        let item = queue.waiting.remove(place)?;
+        let mut item = queue.waiting.remove(place)?;
+        item.taken = Some(now_ms());
         let taken = (item.id, item.job.clone());
         queue.running.insert(item.id, (worker.to_string(), item));
 
@@ -126,7 +141,8 @@ impl Hub {
         match queue.running.remove(&id) {
             Some((worker, item)) => {
                 queue.seen.insert(worker, Instant::now());
-                item.done.send(done).is_ok()
+                let taken = item.taken.unwrap_or_else(now_ms);
+                item.done.send((done, taken)).is_ok()
             }
             None => false,
         }
@@ -313,7 +329,7 @@ pub async fn work_local(hub: Arc<Hub>, engine: Arc<Engine>, crawler: Arc<Crawler
 }
 
 /// Looks at the pages of `paths` of `site`, `spacing` apart (the pages of the site are spread over the interval of the verification).
-async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, spacing: Duration) -> Vec<(String, bool)> {
+pub(crate) async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, spacing: Duration) -> Vec<(String, bool)> {
     let (Some(index), Some(rule)) = (engine.site_named(site), gone_rule(site)) else { return Vec::new() };
     let mut results = Vec::new();
 
@@ -330,4 +346,61 @@ async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, spacing: Du
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step() -> Job {
+        Job::Step { cursor: "1".to_string(), shard: (0, 1), ids: (None, None), pages: 2, seconds: 0, oldest: false }
+    }
+
+    #[tokio::test]
+    async fn submit_timed_returns_the_take_time_and_a_requeued_job_gets_a_new_one() {
+        let hub = Arc::new(Hub::new("t".to_string()));
+        let waiting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.submit_timed("A", step()).await })
+        };
+
+        // the job waits for a worker: the time it waits is not in the time it was taken
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let before = now_ms();
+        let (id, _) = loop {
+            if let Some(taken) = hub.take("A", "step", "w1") {
+                break taken;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let first = hub.queue.lock().unwrap().running[&id].1.taken.unwrap();
+        assert!(first >= before, "taken at the moment of the take");
+
+        // the worker is lost: the job goes back to the list and is taken again later, with its own time
+        hub.queue.lock().unwrap().seen.insert("w1".to_string(), Instant::now().checked_sub(LOST_AFTER + Duration::from_secs(1)).unwrap_or_else(Instant::now));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (again, _) = hub.take("A", "step", "w2").expect("the lost job is given again");
+        assert_eq!(again, id);
+        let second = hub.queue.lock().unwrap().running[&id].1.taken.unwrap();
+        assert!(second > first, "a requeued job gets a new time ({first} then {second})");
+
+        assert!(hub.report(id, Done::Probe(Vec::new())));
+        let (done, taken) = waiting.await.unwrap().unwrap();
+        assert!(matches!(done, Done::Probe(_)));
+        assert_eq!(taken, second);
+
+        // `submit` is the same without the time
+        let plain = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.submit("A", step()).await })
+        };
+        let (id, _) = loop {
+            if let Some(taken) = hub.take("A", "step", "w2") {
+                break taken;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        hub.report(id, Done::Probe(Vec::new()));
+        assert!(matches!(plain.await.unwrap().unwrap(), Done::Probe(_)));
+    }
 }

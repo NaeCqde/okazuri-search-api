@@ -1051,6 +1051,44 @@ impl Site {
     }
 }
 
+/// The number of the work in its path, for the sites whose ids are numbers in the order the works came (`/gallery/123/`, `/g/123/`, `/photos-index-aid-123.html`, `/view/123`,
+/// `/galleries/123.html`). `None` for another site and for a path that has no number.
+pub fn work_id(site: &str, path: &str) -> Option<u32> {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let second = |first: &str| -> Option<u32> {
+        let mut parts = path.split('/').filter(|part| !part.is_empty());
+
+        (parts.next()? == first).then_some(())?;
+        let id = parts.next()?;
+
+        if parts.next().is_some_and(|rest| !rest.is_empty()) && site != "Sukebei" {
+            return None;
+        }
+        id.parse().ok()
+    };
+
+    match site {
+        "HentaiEnvy" | "HentaiEra" => second("gallery"),
+        "AsmHentai" => second("g"),
+        "Sukebei" => second("view"),
+        "Wnacg" => path.strip_prefix("/photos-index-aid-")?.strip_suffix(".html")?.parse().ok(),
+        "Hitomi.La" => path.strip_prefix("/galleries/")?.strip_suffix(".html")?.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The path (as the lists of the site write it, which is how it is saved) of the work with the number `id`; the other way of `work_id`.
+pub fn path_of(site: &str, id: u32) -> Option<String> {
+    Some(match site {
+        "HentaiEnvy" | "HentaiEra" => format!("/gallery/{id}/"),
+        "AsmHentai" => format!("/g/{id}/"),
+        "Sukebei" => format!("/view/{id}"),
+        "Wnacg" => format!("/photos-index-aid-{id}.html"),
+        "Hitomi.La" => format!("/galleries/{id}.html"),
+        _ => return None,
+    })
+}
+
 /// `/g/1/` and `/g/1` are the same page (the part before a `?` is what counts).
 pub fn same_page(a: &str, b: &str) -> bool {
     a == b || (toggle_slash(a) == b && a != b)
@@ -1258,6 +1296,25 @@ mod tests {
         assert_eq!(toggle_slash("/"), "/");
         assert_eq!(toggle_slash("/g/1"), "/g/1/");
         assert_eq!(toggle_slash("/g/1/"), "/g/1");
+    }
+
+    #[test]
+    fn work_id_and_path_of_round_trip_for_each_site() {
+        for (name, path) in [("HentaiEnvy", "/gallery/1654751/"), ("HentaiEra", "/gallery/4102658/"), ("AsmHentai", "/g/55/"), ("Wnacg", "/photos-index-aid-407198.html"), ("Sukebei", "/view/1234567"), ("Hitomi.La", "/galleries/3500000.html")] {
+            let id = work_id(name, path).unwrap_or_else(|| panic!("{name} {path}"));
+
+            assert_eq!(path_of(name, id).as_deref(), Some(path), "{name}");
+        }
+        // the page of a work that was saved without its slash, and one with a query
+        assert_eq!(work_id("AsmHentai", "/g/55"), Some(55));
+        assert_eq!(work_id("HentaiEra", "/gallery/9?x=1"), Some(9));
+        // not a work, and not a site with numbers
+        assert_eq!(work_id("AsmHentai", "/tags/"), None);
+        assert_eq!(work_id("AsmHentai", "/gallery/5/"), None);
+        assert_eq!(work_id("HentaiEra", "/gallery/5/more/6/"), None);
+        assert_eq!(work_id("Sukebei", "/view/abc"), None);
+        assert_eq!(work_id("DLsite", "/g/5/"), None);
+        assert_eq!(path_of("DLsite", 5), None);
     }
 
     #[test]

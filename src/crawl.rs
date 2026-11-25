@@ -24,6 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+mod gap;
+use gap::{gap_checked, next_ms, page_reads};
+#[cfg(test)]
+mod gap_tests;
+
 /// How a site lists all of its works.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -179,6 +184,10 @@ const MOST_LINKS: usize = 1000;
 pub struct Step {
     pub links: Vec<Link>,
     pub next: Option<String>,
+    /// For each page of the job, the milliseconds from the start of the job to the end of that page's read (the host adds them to the time it handed the job
+    /// out; the clocks of the machines are never compared). Empty from a worker that does not tell, and from a job of one page that is not timed.
+    #[serde(default)]
+    pub at: Vec<u32>,
 }
 
 /// One part of the walk of a site: the pages of this shard, the ids of E-Hentai of this part, and the name its state is saved under (`crawls`).
@@ -257,6 +266,10 @@ pub struct Crawler {
     job_pages: usize,
     /// With workers: the longest a job of the first walk reads, in seconds (`[distribute] job_seconds`).
     job_seconds: u64,
+    /// The sites (by index) that banned the address, and until when (the gap check leaves them alone).
+    bans: std::sync::Mutex<HashMap<usize, std::time::Instant>>,
+    /// The sites whose pages the workers look at (the verified ones): the id check sends its probes only to them.
+    probe_sites: Vec<String>,
 }
 
 /// How many pages of tags (`/tag/big-breasts/`) are read for each page of the list while a number that works carry has no name.
@@ -308,7 +321,7 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_pages: 0, job_seconds: 0 })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_pages: 0, job_seconds: 0, bans: Default::default(), probe_sites: Vec::new() })
     }
 
     /// The pages of the sites are read by the workers of this host: the first walk of a numbered list is cut in jobs of `job_pages` pages (up to `lookahead` of them wait
@@ -317,6 +330,12 @@ impl Crawler {
         self.hub = Some((hub, lookahead.max(2)));
         self.job_pages = job_pages;
         self.job_seconds = job_seconds;
+        self
+    }
+
+    /// The sites whose pages the workers of the host look at (the verified sites): the id check of the other sites is left out while there are workers.
+    pub fn with_probe_sites(mut self, sites: Vec<&'static str>) -> Self {
+        self.probe_sites = sites.into_iter().map(str::to_string).collect();
         self
     }
 
@@ -345,6 +364,10 @@ impl Crawler {
 
             for lane in self.lanes(source, name) {
                 tasks.spawn(self.clone().run_site(place, lane));
+            }
+            // the host of workers looks at the top of a list while its first walk is going (the gap check)
+            if self.watched_sites().contains(&name) {
+                tasks.spawn(self.clone().watch_site(place));
             }
         }
         while tasks.join_next().await.is_some() {}
@@ -405,8 +428,15 @@ impl Crawler {
                     } else if done {
                         log::info!("crawl {name}: {} pages read again, {} new works", walk.pages, walk.new);
                     }
+                    // the ids that no list showed are looked at after the newest pages (once the list is read, the refresher goes on)
+                    if done && lane.refresher {
+                        if let Err(e) = self.id_gap_pass(*index).await {
+                            log::warn!("id gap {name}: {e}");
+                        }
+                    }
                 }
                 Err(e) => {
+                    self.note_ban(*index, &e);
                     // a ban says how long it lasts: the next try waits that long (a request while banned may make it longer)
                     let wait = ban_wait(&e).map_or(retry, |ban| ban.max(retry));
                     log::warn!("crawl {name}: {e}, again in {} minutes", wait.as_secs() / 60);
@@ -501,14 +531,21 @@ impl Crawler {
         store.save_crawl_ranges(name, &done.list()).await.map_err(|e| e.to_string())?;
 
         let oldest = can_oldest(source);
+        // a newest-first list moves when a work is added at the top: when each page is read is kept, and the top is looked at (`gap.rs`)
+        let check = gap_checked(source) && self.config.gap_check;
         let width = self.job_pages.max(1) as u64;
         let mut pending: HashMap<u64, u64> = HashMap::new();
-        let mut tasks: JoinSet<(u64, std::result::Result<crate::dist::Done, String>)> = JoinSet::new();
+        let mut tasks: JoinSet<(u64, std::result::Result<(crate::dist::Done, i64, i64), String>)> = JoinSet::new();
         let mut walk = Walk::default();
         // the start of the lowest job in which the list ended
         let mut end: Option<u64> = None;
         let mut from = 1;
         let mut reported = 0;
+
+        // the look at the top that the reads are compared with starts before the first job
+        if check && self.config.watch_seconds > 0 && store.watch(name).await.map_err(|e| e.to_string())?.is_none() {
+            self.watch_once(index, source, true).await?;
+        }
 
         loop {
             while tasks.len() < lookahead {
@@ -521,13 +558,18 @@ impl Crawler {
 
                 pending.insert(start, start + width - 1);
                 from = start;
-                tasks.spawn(async move { (start, hub.submit(&site, job).await) });
+                tasks.spawn(async move {
+                    let answer = hub.submit_timed(&site, job).await.map(|(done, taken)| (done, taken, gap::now_ms()));
+
+                    (start, answer)
+                });
             }
 
             let Some(finished) = tasks.join_next().await else { break };
             let (start, answer) = finished.map_err(|e| e.to_string())?;
             let hi = pending.remove(&start).unwrap_or(start + width - 1);
-            let step = match answer? {
+            let (answer, taken, answered) = answer?;
+            let step = match answer {
                 crate::dist::Done::Step(step) => step?,
                 _ => return Err("a worker answered with something that is not a page".to_string()),
             };
@@ -538,7 +580,10 @@ impl Crawler {
                 None => hi,
             };
             let works = self.engine.works_of(step.links).await?;
-            let new = store.save_crawled_range(name, unix_now(), &works, start, read_to).await.map_err(|e| e.to_string())?;
+            // the job that met the end of the list read the pages up to the one that was empty (or repeated): the pages after it were not asked for
+            let asked = if step.next.is_none() && !step.at.is_empty() { (step.at.len() as u64).min(read_to - start + 1) } else { read_to - start + 1 };
+            let reads = if check { page_reads(start, asked, taken, answered, &step.at, next_ms()) } else { Vec::new() };
+            let new = store.save_crawled_range_read(name, unix_now(), &works, start, read_to, &reads).await.map_err(|e| e.to_string())?;
 
             done.add(start, read_to);
             from = from.min(read_to + 1);
@@ -554,6 +599,10 @@ impl Crawler {
         }
 
         if end.is_some_and(|end| done.first_gap(1) > end) {
+            // the boundaries of pages that were read out of order while the top grew are read again, then the list is read
+            if check {
+                self.gap_pass(index, source, &hub, lookahead).await?;
+            }
             store.mark_crawled(name, unix_now()).await.map_err(|e| e.to_string())?;
             walk.finished = true;
         }
@@ -632,6 +681,7 @@ impl Crawler {
         let started = std::time::Instant::now();
         let Some((index, source)) = self.sources.iter().find(|(index, _)| self.engine.site(*index).def.name == site) else { return Err(format!("{site} is not read by this worker")) };
         let mut step = self.step_retried(*index, source, cursor, shard, ids, oldest).await?;
+        step.at = vec![started.elapsed().as_millis().min(u32::MAX as u128) as u32];
         let mut last: Vec<String> = step.links.iter().map(|link| link.path.clone()).collect();
 
         // a job ends with enough pages or when it has read for `seconds` (a slow site gives fewer pages, so a job is never longer than a few minutes)
@@ -657,6 +707,7 @@ impl Crawler {
             read += 1;
             step.links.extend(more.links);
             step.next = more.next;
+            step.at.push(started.elapsed().as_millis().min(u32::MAX as u128) as u32);
         }
 
         Ok(step)
@@ -697,7 +748,7 @@ impl Crawler {
                 // a page beyond the last one is a 400 of WordPress: the end of the list
                 let body = match self.engine.get_page(index, &url).await {
                     Ok((_, body)) => body,
-                    Err(e) if e == "HTTP 400" => return Ok(Step { links: Vec::new(), next: None }),
+                    Err(e) if e == "HTTP 400" => return Ok(Step { links: Vec::new(), next: None, at: Vec::new() }),
                     Err(e) => return Err(e),
                 };
 
@@ -705,7 +756,7 @@ impl Crawler {
                 self.name_tags(index, &body, &mut links).await;
                 let next = (!links.is_empty()).then(|| (number + shard.1).to_string());
 
-                Ok(Step { links, next })
+                Ok(Step { links, next, at: Vec::new() })
             }
             Source::Pages(template) => {
                 let number = page_number(cursor, shard);
@@ -713,7 +764,7 @@ impl Crawler {
                 let template = if oldest { oldest_first(template) } else { template.clone() };
                 let (page_url, body) = match self.engine.get_page(index, &template.replace("{n}", &number.to_string())).await {
                     Ok(page) => page,
-                    Err(e) if e == "HTTP 404" && number > 1 => return Ok(Step { links: Vec::new(), next: None }),
+                    Err(e) if e == "HTTP 404" && number > 1 => return Ok(Step { links: Vec::new(), next: None, at: Vec::new() }),
                     Err(e) => return Err(e),
                 };
                 let mut links = site.read(&page_url, &body, MOST_LINKS)?;
@@ -722,7 +773,7 @@ impl Crawler {
                 }
                 let next = (!links.is_empty()).then(|| (number + shard.1).to_string());
 
-                Ok(Step { links, next })
+                Ok(Step { links, next, at: Vec::new() })
             }
             Source::Lists(templates) => self.lists_step(index, templates, cursor, shard).await,
             Source::Cards(first) => {
@@ -734,7 +785,7 @@ impl Crawler {
                     .and_then(|json| json.get("next")?.as_str().map(str::to_string))
                     .filter(|next| !links.is_empty() && !next.is_empty());
 
-                Ok(Step { links, next })
+                Ok(Step { links, next, at: Vec::new() })
             }
             Source::GalleryIds(first) => {
                 // a machine of a range starts under its `hi` (`?next=` lists the galleries with a smaller id)
@@ -753,7 +804,7 @@ impl Crawler {
                 // the walk of a range ends at its `lo`
                 let next = links.iter().filter_map(|link| gallery_id(&link.path)).min().filter(|id| ids.0.is_none_or(|lo| *id > lo)).map(|id| id.to_string());
 
-                Ok(Step { links, next })
+                Ok(Step { links, next, at: Vec::new() })
             }
         }
     }
@@ -777,7 +828,7 @@ impl Crawler {
         let ids: Vec<u32> = bytes.chunks_exact(4).map(|id| u32::from_be_bytes([id[0], id[1], id[2], id[3]])).collect();
 
         if ids.is_empty() {
-            return Ok(Step { links: Vec::new(), next: None });
+            return Ok(Step { links: Vec::new(), next: None, at: Vec::new() });
         }
 
         let paths: Vec<String> = ids.iter().map(|id| format!("/galleries/{id}.html")).collect();
@@ -802,7 +853,7 @@ impl Crawler {
 
         let more = bytes.len() as u64 >= batch * 4;
 
-        Ok(Step { links, next: more.then(|| (offset + batch * shard.1).to_string()) })
+        Ok(Step { links, next: more.then(|| (offset + batch * shard.1).to_string()), at: Vec::new() })
     }
 }
 
@@ -814,13 +865,13 @@ impl Crawler {
             .split_once(':')
             .and_then(|(list, number)| Some((list.parse::<usize>().ok()?, number.parse::<u64>().ok()?)))
             .unwrap_or((0, shard.0 + 1));
-        let Some(template) = templates.get(list) else { return Ok(Step { links: Vec::new(), next: None }) };
+        let Some(template) = templates.get(list) else { return Ok(Step { links: Vec::new(), next: None, at: Vec::new() }) };
         let address = if number == 1 { template.replace("&page={n}", "") } else { template.clone() }.replace("{n}", &number.to_string());
         let after_list = || (list + 1 < templates.len()).then(|| format!("{}:{}", list + 1, shard.0 + 1));
 
         let (page_url, body) = match self.engine.get_page(index, &address).await {
             Ok(page) => page,
-            Err(e) if number > 1 && matches!(e.as_str(), "HTTP 403" | "HTTP 404" | "HTTP 302") => return Ok(Step { links: Vec::new(), next: after_list() }),
+            Err(e) if number > 1 && matches!(e.as_str(), "HTTP 403" | "HTTP 404" | "HTTP 302") => return Ok(Step { links: Vec::new(), next: after_list(), at: Vec::new() }),
             Err(e) => return Err(e),
         };
         let links = site.read(&page_url, &body, MOST_LINKS)?;
@@ -828,7 +879,7 @@ impl Crawler {
         let ended = links.is_empty() || last.is_some_and(|last| number + shard.1 > last);
         let next = if ended { after_list() } else { Some(format!("{list}:{}", number + shard.1)) };
 
-        Ok(Step { links, next })
+        Ok(Step { links, next, at: Vec::new() })
     }
 
     /// Puts the tags, the artists and the groups on the links of a list page of AsmHentai or HentaiEra, which only carry numbers. A number whose
@@ -1235,7 +1286,9 @@ mod tests {
         let engine = Engine::with_sites(vec![Site::new(def("Listed", port))], &search, store.clone(), crate::testing::romanizer_arc());
         let source = Source::Pages(format!("http://127.0.0.1:{port}/list/{{n}}"));
         let hub = Arc::new(crate::dist::Hub::new("token".to_string()));
-        let crawler = Arc::new(Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), source)]).unwrap().with_hub(hub.clone(), 3, pages_per_job, 0));
+        // the gap check reads the top of the list too: these tests count the requests of the ranges alone (`gap_tests.rs` has the ones of the check)
+        let config = CrawlConfig { gap_check: false, ..CrawlConfig::default() };
+        let crawler = Arc::new(Crawler::with_sources(engine, config, vec![("Listed".to_string(), source)]).unwrap().with_hub(hub.clone(), 3, pages_per_job, 0));
 
         for worker in 0..2 {
             let (hub, crawler) = (hub.clone(), crawler.clone());

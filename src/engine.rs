@@ -1903,6 +1903,11 @@ impl Engine {
         })
     }
 
+    /// The shortest time between two requests to the site (its delay, or `min_delay_ms`).
+    pub(crate) fn delay(&self, index: usize) -> Duration {
+        self.delays[index]
+    }
+
     /// Keeps `min_delay_ms` (or the longer delay of the site) between two requests to the same site.
     async fn wait_turn(&self, index: usize) {
         let delay = self.delays[index];
@@ -1923,7 +1928,34 @@ pub(crate) struct HitomiFetch<'a> {
     index: usize,
 }
 
+/// The size of a file in `Content-Range: bytes 0-3/123456`.
+pub(crate) fn size_in_content_range(value: &str) -> Option<u64> {
+    value.rsplit_once('/')?.1.trim().parse().ok()
+}
+
 impl crate::hitomi::Fetch for HitomiFetch<'_> {
+    async fn size(&mut self, path: &str) -> std::result::Result<u64, String> {
+        self.engine.wait_turn(self.index).await;
+
+        let response = self
+            .engine
+            .client
+            .get(format!("{}{path}", crate::hitomi::ORIGIN))
+            .header("Referer", "https://hitomi.la/")
+            .header("Range", "bytes=0-3")
+            .header("Accept-Encoding", "identity")
+            .send()
+            .await
+            .map_err(|e| format!("{path}: {}", e.without_url()))?;
+        let status = response.status().as_u16();
+
+        if status != 206 {
+            return Err(format!("{path}: HTTP {status}, no Content-Range"));
+        }
+
+        response.headers().get("content-range").and_then(|value| value.to_str().ok()).and_then(size_in_content_range).ok_or_else(|| format!("{path}: no size in Content-Range"))
+    }
+
     async fn get(&mut self, path: &str, range: Option<(u64, u64)>) -> std::result::Result<Vec<u8>, String> {
         self.engine.wait_turn(self.index).await;
 

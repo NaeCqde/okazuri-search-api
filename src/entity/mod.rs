@@ -6,8 +6,13 @@
 
 pub mod catalog_author;
 pub mod catalog_work;
+pub mod crawl_gap;
+pub mod crawl_growth;
+pub mod crawl_probe;
 pub mod crawl_range;
+pub mod crawl_read;
 pub mod crawl_state;
+pub mod crawl_watch;
 pub mod listing;
 pub mod magazine;
 pub mod mirror_meta;

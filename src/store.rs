@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{crawl_range, crawl_state, listing, search, tag, translation, translation_lookup, uploader, work};
+use crate::entity::{crawl_gap, crawl_growth, crawl_probe, crawl_range, crawl_read, crawl_state, crawl_watch, listing, search, tag, translation, translation_lookup, uploader, work};
 use crate::language;
 use crate::query::{outside_key, title_key};
 use crate::sites::toggle_slash;
@@ -54,6 +54,34 @@ pub struct NewWork {
 
 /// A saved work.
 pub type Work = work::Model;
+
+/// When a page of a list was read by the first walk, as the earliest and the latest time it may have been (unix ms, the clock of the host), and the job
+/// that read it (the pages of a job are read in order, from the top).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRead {
+    pub page: u64,
+    pub job: i64,
+    pub lo_ms: i64,
+    pub hi_ms: i64,
+}
+
+/// A boundary of two neighbouring pages (`k` and `k + 1`) that were read by different jobs, the page after it possibly before it: the latest time page `k` may
+/// have been read, and the earliest time page `k + 1` may have been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boundary {
+    pub k: u64,
+    pub a_hi: i64,
+    pub b_lo: i64,
+}
+
+/// A look at the top of a list that saw works added: between `since` and `at` (unix ms), `added` works came (`saturated`: at least that many).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    pub since: i64,
+    pub at: i64,
+    pub added: i64,
+    pub saturated: bool,
+}
 
 /// The most rows `find` reads: a word that is in nearly every title would read the whole table.
 const MAX_CANDIDATES: u64 = 50_000;
@@ -256,6 +284,12 @@ impl SearchStore {
         // the names of the numbers a site gives its tags (AsmHentai, HentaiEra): only the ones that works carry are kept
         // the pages of a list that the first walk of a site has read, as ranges (`lo`..=`hi`): the pages are read in any order, by any worker
         db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_ranges (website TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, PRIMARY KEY (website, lo))").await?;
+        // the gap check (`crawl.rs`): when each page was read, the look at the top of the list, the growth seen there, the pages to read again, and the ids looked at
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_reads (website TEXT NOT NULL, page INTEGER NOT NULL, job INTEGER NOT NULL, lo_ms INTEGER NOT NULL, hi_ms INTEGER NOT NULL, PRIMARY KEY (website, page))").await?;
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_watch (website TEXT NOT NULL PRIMARY KEY, since0 INTEGER NOT NULL, at INTEGER NOT NULL, top TEXT NOT NULL, per_page INTEGER NOT NULL)").await?;
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_growth (website TEXT NOT NULL, since INTEGER NOT NULL, at INTEGER NOT NULL, added INTEGER NOT NULL, saturated INTEGER NOT NULL, PRIMARY KEY (website, at))").await?;
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_gap_plan (website TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, done_at INTEGER, tries INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (website, lo))").await?;
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_probes (website TEXT NOT NULL, id INTEGER NOT NULL, checked_at INTEGER NOT NULL, found INTEGER NOT NULL, PRIMARY KEY (website, id))").await?;
         db.execute_unprepared("CREATE TABLE IF NOT EXISTS site_tag_names (website TEXT NOT NULL, attribute TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (website, attribute, id))").await?;
         let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
         db.execute(backend.build(searches.if_not_exists())).await?;
@@ -1402,7 +1436,8 @@ impl SearchStore {
     /// Notes that the whole list of a site is read (the works came from the files of every shard): the crawl then only reads the newest
     /// pages again, and the prefetch leaves the site to it.
     pub async fn mark_crawled(&self, website: &str, now: i64) -> Result<()> {
-        let before = crawl_state::Entity::find_by_id(website.to_string()).one(&self.db).await?;
+        let transaction = self.db.begin().await?;
+        let before = crawl_state::Entity::find_by_id(website.to_string()).one(&transaction).await?;
         let row = crawl_state::ActiveModel {
             website: Set(website.to_string()),
             cursor: Set(String::new()),
@@ -1416,8 +1451,14 @@ impl SearchStore {
                     .update_columns([crawl_state::Column::Cursor, crawl_state::Column::Done, crawl_state::Column::UpdatedAt])
                     .to_owned(),
             )
-            .exec_without_returning(&self.db)
+            .exec_without_returning(&transaction)
             .await?;
+        // what the gap check kept for the walk is not needed any more (`crawl_probes` stays: an id that was looked at is not asked again)
+        crawl_read::Entity::delete_many().filter(crawl_read::Column::Website.eq(website)).exec(&transaction).await?;
+        crawl_watch::Entity::delete_many().filter(crawl_watch::Column::Website.eq(website)).exec(&transaction).await?;
+        crawl_growth::Entity::delete_many().filter(crawl_growth::Column::Website.eq(website)).exec(&transaction).await?;
+        crawl_gap::Entity::delete_many().filter(crawl_gap::Column::Website.eq(website)).exec(&transaction).await?;
+        transaction.commit().await?;
 
         Ok(())
     }
@@ -1462,12 +1503,19 @@ impl SearchStore {
 
     /// `save_crawled`, with the walk saved under `key` (a site read in parts by workers has a place for each part: `EHentai#1/3`).
     pub async fn save_crawled_in(&self, key: &str, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>) -> Result<usize> {
-        self.save_crawled_inner(key, website, now, works, state, None).await
+        self.save_crawled_inner(key, website, now, works, state, None, &[]).await
     }
 
     /// `save_crawled`, and the pages `lo..=hi` of the list are noted as read, in the same transaction as the works.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn save_crawled_range(&self, website: &str, now: i64, works: &[NewWork], lo: u64, hi: u64) -> Result<usize> {
-        self.save_crawled_inner(website, website, now, works, None, Some((lo, hi))).await
+        self.save_crawled_inner(website, website, now, works, None, Some((lo, hi)), &[]).await
+    }
+
+    /// `save_crawled_range`, and when each page of the range was read (`reads`) is kept in the same transaction. A page that has a row already keeps it
+    /// (a lost work needs every read of a page after a shift, and the pages are read once in a walk).
+    pub async fn save_crawled_range_read(&self, website: &str, now: i64, works: &[NewWork], lo: u64, hi: u64, reads: &[PageRead]) -> Result<usize> {
+        self.save_crawled_inner(website, website, now, works, None, Some((lo, hi)), reads).await
     }
 
     /// The pages of the list of a site that the first walk has read, as ranges (`lo`, `hi`), the lowest first and joined when they touch.
@@ -1500,7 +1548,234 @@ impl SearchStore {
         Ok(())
     }
 
-    async fn save_crawled_inner(&self, key: &str, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>, range: Option<(u64, u64)>) -> Result<usize> {
+    // ---- the gap check (`crawl.rs`) ----
+
+    /// The boundaries of pages `k` and `k + 1` (`k` over `after`, the lowest first, at most `limit`) that were read by different jobs with page `k + 1`
+    /// possibly read before page `k` was done.
+    pub async fn crawl_pairs(&self, website: &str, after: u64, limit: u64) -> Result<Vec<Boundary>> {
+        let rows = self
+            .reader
+            .query_all(Statement::from_sql_and_values(
+                self.reader.get_database_backend(),
+                "SELECT a.page AS k, a.hi_ms AS a_hi, b.lo_ms AS b_lo FROM crawl_reads a JOIN crawl_reads b ON b.website = a.website AND b.page = a.page + 1 \
+                 WHERE a.website = ? AND a.page > ? AND a.job != b.job AND b.lo_ms < a.hi_ms ORDER BY a.page LIMIT ?",
+                [website.into(), (after as i64).into(), (limit as i64).into()],
+            ))
+            .await?;
+
+        rows.iter().map(|row| Ok(Boundary { k: row.try_get::<i64>("", "k")? as u64, a_hi: row.try_get("", "a_hi")?, b_lo: row.try_get("", "b_lo")? })).collect()
+    }
+
+    /// The last page that has a read time (the last page that was asked for: the one that was empty and ended the list, or the last one).
+    pub async fn crawl_read_top(&self, website: &str) -> Result<u64> {
+        let row = self
+            .reader
+            .query_one(Statement::from_sql_and_values(self.reader.get_database_backend(), "SELECT max(page) AS top FROM crawl_reads WHERE website = ?", [website.into()]))
+            .await?;
+
+        Ok(row.and_then(|row| row.try_get::<Option<i64>>("", "top").ok().flatten()).unwrap_or(0).max(0) as u64)
+    }
+
+    /// How many pages have a read time saved.
+    #[cfg(test)]
+    pub async fn crawl_read_count(&self, website: &str) -> Result<u64> {
+        Ok(crawl_read::Entity::find().filter(crawl_read::Column::Website.eq(website)).count(&self.reader).await?)
+    }
+
+    /// The last look at the top of the list of a site.
+    pub async fn watch(&self, website: &str) -> Result<Option<crawl_watch::Model>> {
+        Ok(crawl_watch::Entity::find_by_id(website.to_string()).one(&self.reader).await?)
+    }
+
+    /// Saves a look at the top of the list (`top`, `per_page`) at `at`, and the growth it saw (`sample`), in one transaction. The first look of a site
+    /// is the start of the watch (`since0`).
+    pub async fn save_watch(&self, website: &str, at: i64, top: &str, per_page: i64, sample: Option<Sample>) -> Result<()> {
+        let transaction = self.db.begin().await?;
+        let row = crawl_watch::ActiveModel { website: Set(website.to_string()), since0: Set(at), at: Set(at), top: Set(top.to_string()), per_page: Set(per_page) };
+
+        crawl_watch::Entity::insert(row)
+            .on_conflict(OnConflict::column(crawl_watch::Column::Website).update_columns([crawl_watch::Column::At, crawl_watch::Column::Top, crawl_watch::Column::PerPage]).to_owned())
+            .exec_without_returning(&transaction)
+            .await?;
+        if let Some(sample) = sample {
+            let row = crawl_growth::ActiveModel { website: Set(website.to_string()), since: Set(sample.since), at: Set(sample.at), added: Set(sample.added), saturated: Set(sample.saturated) };
+
+            crawl_growth::Entity::insert(row)
+                .on_conflict(OnConflict::columns([crawl_growth::Column::Website, crawl_growth::Column::At]).update_columns([crawl_growth::Column::Since, crawl_growth::Column::Added, crawl_growth::Column::Saturated]).to_owned())
+                .exec_without_returning(&transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    /// The works that came to the top in `(lo, hi)` (unix ms): the sum of the samples that overlap it, and whether one of them is only a lower bound.
+    pub async fn growth(&self, website: &str, lo: i64, hi: i64) -> Result<(i64, bool)> {
+        let rows = crawl_growth::Entity::find().filter(crawl_growth::Column::Website.eq(website)).filter(crawl_growth::Column::Since.lt(hi)).filter(crawl_growth::Column::At.gt(lo)).all(&self.reader).await?;
+
+        Ok((rows.iter().map(|row| row.added).sum(), rows.iter().any(|row| row.saturated)))
+    }
+
+    /// The works that came to the top after `t` (unix ms), as `growth`.
+    pub async fn growth_since(&self, website: &str, t: i64) -> Result<(i64, bool)> {
+        self.growth(website, t, i64::MAX).await
+    }
+
+    /// Makes the plan of the pages to read again: one row for each span `(lo, hi)`, or, with no span, the row `(0, 0)` that is done at `now`.
+    /// The plan that was there is replaced.
+    pub async fn save_gap_plan(&self, website: &str, spans: &[(u64, u64)], now: i64) -> Result<()> {
+        let transaction = self.db.begin().await?;
+
+        crawl_gap::Entity::delete_many().filter(crawl_gap::Column::Website.eq(website)).exec(&transaction).await?;
+        let rows: Vec<crawl_gap::ActiveModel> = if spans.is_empty() {
+            vec![crawl_gap::ActiveModel { website: Set(website.to_string()), lo: Set(0), hi: Set(0), done_at: Set(Some(now)), tries: Set(0) }]
+        } else {
+            spans.iter().map(|(lo, hi)| crawl_gap::ActiveModel { website: Set(website.to_string()), lo: Set(*lo as i64), hi: Set(*hi as i64), done_at: Set(None), tries: Set(0) }).collect()
+        };
+        for chunk in rows.chunks(500) {
+            crawl_gap::Entity::insert_many(chunk.to_vec()).exec_without_returning(&transaction).await?;
+        }
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    /// The plan of the pages to read again, the lowest span first (empty: no plan yet).
+    pub async fn gap_plan(&self, website: &str) -> Result<Vec<crawl_gap::Model>> {
+        Ok(crawl_gap::Entity::find().filter(crawl_gap::Column::Website.eq(website)).order_by_asc(crawl_gap::Column::Lo).all(&self.reader).await?)
+    }
+
+    /// Notes that reading the span at `lo` failed; at `max` tries it is given up (done at `now`, left to the refresher). Returns the tries.
+    pub async fn bump_gap_tries(&self, website: &str, lo: u64, max: i64, now: i64) -> Result<i64> {
+        let transaction = self.db.begin().await?;
+        let row = crawl_gap::Entity::find_by_id((website.to_string(), lo as i64)).one(&transaction).await?;
+        let Some(row) = row else { return Ok(0) };
+        let tries = row.tries + 1;
+        let mut changed = row.into_active_model();
+
+        changed.tries = Set(tries);
+        if tries >= max {
+            changed.done_at = Set(Some(now));
+        }
+        changed.update(&transaction).await?;
+        transaction.commit().await?;
+
+        Ok(tries)
+    }
+
+    /// Saves the works of pages that were read again, and notes in the same transaction that the span at `lo` is done. No page range and no read time is written
+    /// (the pages were read in the walk). Returns how many of the works were new.
+    pub async fn save_gap_reread(&self, website: &str, now: i64, works: &[NewWork], lo: u64) -> Result<usize> {
+        let transaction = self.db.begin().await?;
+        let works = Self::same_pages(&transaction, website, works).await?;
+        let new = Self::save_works(&transaction, website, now, &works).await?.len();
+
+        transaction
+            .execute(Statement::from_sql_and_values(self.db.get_database_backend(), "UPDATE crawls SET saved = saved + ?, updated_at = ? WHERE website = ?", [(new as i64).into(), now.into(), website.into()]))
+            .await?;
+        transaction
+            .execute(Statement::from_sql_and_values(self.db.get_database_backend(), "UPDATE crawl_gap_plan SET done_at = ? WHERE website = ? AND lo = ?", [now.into(), website.into(), (lo as i64).into()]))
+            .await?;
+        transaction.commit().await?;
+
+        Ok(new)
+    }
+
+    /// The numbers in the paths of the works of a site (`id_of` reads one; a path that has none is left out; the works whose page is gone are in it), sorted and without repeats.
+    /// The paths are read in chunks, so the paths of a big site are never all in memory.
+    pub async fn site_ids(&self, website: &str, id_of: impl Fn(&str) -> Option<u32>) -> Result<Vec<u32>> {
+        let mut ids: Vec<u32> = Vec::new();
+        let mut after = String::new();
+
+        loop {
+            let rows = self
+                .reader
+                .query_all(Statement::from_sql_and_values(
+                    self.reader.get_database_backend(),
+                    "SELECT path FROM works WHERE website = ? AND path > ? ORDER BY path LIMIT 20000",
+                    [website.into(), after.clone().into()],
+                ))
+                .await?;
+            let Some(last) = rows.last() else { break };
+
+            after = last.try_get::<String>("", "path")?;
+            let count = rows.len();
+            for row in &rows {
+                if let Some(id) = id_of(&row.try_get::<String>("", "path")?) {
+                    ids.push(id);
+                }
+            }
+            if count < 20000 {
+                break;
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+
+        Ok(ids)
+    }
+
+    /// The ids between the smallest and the largest of `ids` (sorted) that are not in it and have not been looked at (`crawl_probes`), the newest first, at most `limit`.
+    pub async fn missing_ids(&self, website: &str, ids: &[u32], limit: usize) -> Result<Vec<u32>> {
+        let (Some(&min), Some(&max)) = (ids.first(), ids.last()) else { return Ok(Vec::new()) };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut missing = Vec::new();
+        let mut top = max;
+
+        loop {
+            let bottom = top.saturating_sub(1999).max(min);
+            let probed: HashSet<i64> = crawl_probe::Entity::find()
+                .filter(crawl_probe::Column::Website.eq(website))
+                .filter(crawl_probe::Column::Id.between(bottom as i64, top as i64))
+                .all(&self.reader)
+                .await?
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+
+            for id in (bottom..=top).rev() {
+                if ids.binary_search(&id).is_err() && !probed.contains(&(id as i64)) {
+                    missing.push(id);
+                    if missing.len() >= limit {
+                        return Ok(missing);
+                    }
+                }
+            }
+            if bottom == min {
+                break;
+            }
+            top = bottom - 1;
+        }
+
+        Ok(missing)
+    }
+
+    /// Notes that the ids were looked at (`true`: the page exists and was saved). They are not asked again.
+    pub async fn save_probes(&self, website: &str, results: &[(u32, bool)], now: i64) -> Result<()> {
+        let transaction = self.db.begin().await?;
+
+        for chunk in results.chunks(500) {
+            let rows = chunk.iter().map(|(id, found)| crawl_probe::ActiveModel { website: Set(website.to_string()), id: Set(*id as i64), checked_at: Set(now), found: Set(*found) });
+            crawl_probe::Entity::insert_many(rows)
+                .on_conflict(OnConflict::columns([crawl_probe::Column::Website, crawl_probe::Column::Id]).update_columns([crawl_probe::Column::CheckedAt, crawl_probe::Column::Found]).to_owned())
+                .exec_without_returning(&transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    /// The ids that were looked at, with whether the page exists.
+    #[cfg(test)]
+    pub async fn probes(&self, website: &str) -> Result<Vec<(u32, bool)>> {
+        Ok(crawl_probe::Entity::find().filter(crawl_probe::Column::Website.eq(website)).order_by_asc(crawl_probe::Column::Id).all(&self.reader).await?.into_iter().map(|row| (row.id as u32, row.found)).collect())
+    }
+
+    async fn save_crawled_inner(&self, key: &str, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>, range: Option<(u64, u64)>, reads: &[PageRead]) -> Result<usize> {
         let transaction = self.db.begin().await?;
         let works = Self::same_pages(&transaction, website, works).await?;
         let new = Self::save_works(&transaction, website, now, &works).await?.len();
@@ -1509,6 +1784,13 @@ impl SearchStore {
             let row = crawl_range::ActiveModel { website: Set(website.to_string()), lo: Set(lo as i64), hi: Set(hi as i64) };
             crawl_range::Entity::insert(row)
                 .on_conflict(OnConflict::columns([crawl_range::Column::Website, crawl_range::Column::Lo]).update_column(crawl_range::Column::Hi).to_owned())
+                .exec_without_returning(&transaction)
+                .await?;
+        }
+        for chunk in reads.chunks(500) {
+            let rows = chunk.iter().map(|read| crawl_read::ActiveModel { website: Set(website.to_string()), page: Set(read.page as i64), job: Set(read.job), lo_ms: Set(read.lo_ms), hi_ms: Set(read.hi_ms) });
+            crawl_read::Entity::insert_many(rows)
+                .on_conflict(OnConflict::columns([crawl_read::Column::Website, crawl_read::Column::Page]).do_nothing().to_owned())
                 .exec_without_returning(&transaction)
                 .await?;
         }
@@ -2837,5 +3119,242 @@ mod tests {
         store.db.execute_unprepared("UPDATE tags SET weight = 10 WHERE kind = 0").await.unwrap();
         *store.tag_keys.lock().unwrap() = None;
         assert_eq!(paths(&store, &matcher).await, ["/g/1/", "/g/2/", "/g/3/"]);
+    }
+
+    // ---- the gap check ----
+
+    fn read(page: u64, job: i64, lo_ms: i64, hi_ms: i64) -> PageRead {
+        PageRead { page, job, lo_ms, hi_ms }
+    }
+
+    async fn reads_of(store: &SearchStore) -> Vec<(i64, i64, i64, i64)> {
+        let rows = crawl_read::Entity::find().filter(crawl_read::Column::Website.eq("A")).order_by_asc(crawl_read::Column::Page).all(&store.db).await.unwrap();
+
+        rows.into_iter().map(|row| (row.page, row.job, row.lo_ms, row.hi_ms)).collect()
+    }
+
+    #[tokio::test]
+    async fn page_reads_are_saved_with_the_works_and_the_first_read_is_kept() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save_crawled_range_read("A", 1, &[link("/g/1/", "One")], 1, 2, &[read(1, 7, 100, 110), read(2, 7, 110, 120)]).await.unwrap();
+        assert_eq!(reads_of(&store).await, [(1, 7, 100, 110), (2, 7, 110, 120)]);
+        assert_eq!(store.crawl_ranges("A").await.unwrap(), [(1, 2)]);
+        assert_eq!(store.counts_of("A").await.unwrap(), 1);
+
+        // a page that is saved again keeps its first read (a lost work needs every read of a page after a shift), and a page that is new is added
+        store.save_crawled_range_read("A", 2, &[], 2, 3, &[read(2, 9, 500, 510), read(3, 9, 500, 510)]).await.unwrap();
+        assert_eq!(reads_of(&store).await, [(1, 7, 100, 110), (2, 7, 110, 120), (3, 9, 500, 510)]);
+
+        // the plain save writes no read
+        store.save_crawled_range("A", 3, &[], 4, 4).await.unwrap();
+        assert_eq!(store.crawl_read_count("A").await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_writes_no_page_reads() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        // the table of the state is not there: the save fails after the reads were written, and the transaction takes them back
+        store.db.execute_unprepared("DROP TABLE crawls").await.unwrap();
+        let failed = store.save_crawled_range_read("A", 1, &[link("/g/1/", "One")], 1, 1, &[read(1, 7, 100, 110)]).await;
+
+        assert!(failed.is_err());
+        assert_eq!(store.crawl_read_count("A").await.unwrap(), 0);
+        assert!(store.crawl_ranges("A").await.unwrap().is_empty());
+        assert_eq!(store.counts_of("A").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn crawl_pairs_returns_only_out_of_order_boundaries_of_different_jobs() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let reads = [
+            // job 1: pages 1 and 2 (one job, in order, so no boundary inside it)
+            read(1, 1, 1000, 1100),
+            read(2, 1, 1100, 1200),
+            // job 2 read page 3 before page 2 was done: out of order
+            read(3, 2, 1000, 1150),
+            // job 3 read page 4 after page 3 was done: in order
+            read(4, 3, 1300, 1400),
+            // page 5 of job 4 began when page 4 was done (the same time): in order
+            read(5, 4, 1400, 1500),
+            // page 6 may have been read before page 5 was done
+            read(6, 5, 1450, 1460),
+            // page 8 has no page 7 next to it
+            read(8, 6, 0, 10),
+        ];
+        store.save_crawled_range_read("A", 1, &[], 1, 8, &reads).await.unwrap();
+
+        let pairs = store.crawl_pairs("A", 0, 100).await.unwrap();
+
+        assert_eq!(pairs, [Boundary { k: 2, a_hi: 1200, b_lo: 1000 }, Boundary { k: 5, a_hi: 1500, b_lo: 1450 }]);
+        assert_eq!(store.crawl_pairs("A", 2, 100).await.unwrap().len(), 1, "after page 2");
+        assert_eq!(store.crawl_pairs("A", 0, 1).await.unwrap().len(), 1, "at most the limit");
+        assert!(store.crawl_pairs("B", 0, 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn growth_sums_overlapping_samples_only() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let sample = |since, at, added, saturated| Some(Sample { since, at, added, saturated });
+
+        store.save_watch("A", 0, "x", 20, None).await.unwrap();
+        store.save_watch("A", 100, "y", 20, sample(0, 100, 2, false)).await.unwrap();
+        store.save_watch("A", 200, "z", 20, sample(100, 200, 3, true)).await.unwrap();
+        store.save_watch("A", 300, "z", 20, sample(200, 300, 5, false)).await.unwrap();
+
+        // a window inside the second sample
+        assert_eq!(store.growth("A", 120, 180).await.unwrap(), (3, true));
+        // a window over the first two
+        assert_eq!(store.growth("A", 50, 150).await.unwrap(), (5, true));
+        // a window that only touches the end of a sample does not take it
+        assert_eq!(store.growth("A", 100, 200).await.unwrap(), (3, true));
+        assert_eq!(store.growth("A", 0, 100).await.unwrap(), (2, false));
+        // after the last look
+        assert_eq!(store.growth("A", 300, 400).await.unwrap(), (0, false));
+        assert_eq!(store.growth_since("A", 150).await.unwrap(), (8, true));
+        assert_eq!(store.growth_since("A", 250).await.unwrap(), (5, false));
+        assert_eq!(store.growth("B", 0, 1000).await.unwrap(), (0, false));
+        assert_eq!(store.watch("A").await.unwrap().map(|row| (row.since0, row.at, row.top)), Some((0, 300, "z".to_string())), "the start of the watch stays");
+    }
+
+    #[tokio::test]
+    async fn watch_row_and_sample_are_one_transaction() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save_watch("A", 10, "a", 20, None).await.unwrap();
+        store.db.execute_unprepared("DROP TABLE crawl_growth").await.unwrap();
+        let failed = store.save_watch("A", 20, "b", 20, Some(Sample { since: 10, at: 20, added: 1, saturated: false })).await;
+
+        assert!(failed.is_err());
+        let row = store.watch("A").await.unwrap().unwrap();
+        assert_eq!((row.at, row.top.as_str()), (10, "a"), "the look is not saved without its sample");
+    }
+
+    #[tokio::test]
+    async fn gap_tables_appear_on_an_old_database() {
+        let dir = std::env::temp_dir().join(format!("okazuri-gap-tables-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("search.db");
+
+        let store = SearchStore::open(&path).await.unwrap();
+        for table in ["crawl_reads", "crawl_watch", "crawl_growth", "crawl_gap_plan", "crawl_probes"] {
+            store.db.execute_unprepared(&format!("DROP TABLE {table}")).await.unwrap();
+        }
+        store.save("q", "A", 1, &Ok(vec![link("/1", "One")]), false).await.unwrap();
+        drop(store);
+
+        let again = SearchStore::open(&path).await.unwrap();
+        again.save_crawled_range_read("A", 1, &[], 1, 1, &[read(1, 1, 1, 2)]).await.unwrap();
+        again.save_watch("A", 1, "t", 1, Some(Sample { since: 0, at: 1, added: 1, saturated: false })).await.unwrap();
+        again.save_gap_plan("A", &[(2, 3)], 1).await.unwrap();
+        again.save_probes("A", &[(5, true)], 1).await.unwrap();
+        assert_eq!(titles(&again.candidates_owned(&[]).await.unwrap()), ["One"], "the data is kept");
+        drop(again);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn mark_crawled_clears_the_gap_tables_but_keeps_probes() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save_crawled_range_read("A", 1, &[link("/g/1/", "One")], 1, 1, &[read(1, 1, 1, 2)]).await.unwrap();
+        store.save_crawled_range_read("B", 1, &[], 1, 1, &[PageRead { page: 1, job: 1, lo_ms: 1, hi_ms: 2 }]).await.unwrap();
+        store.save_watch("A", 1, "t", 1, Some(Sample { since: 0, at: 1, added: 1, saturated: false })).await.unwrap();
+        store.save_gap_plan("A", &[(2, 3)], 1).await.unwrap();
+        store.save_probes("A", &[(5, false)], 1).await.unwrap();
+
+        store.mark_crawled("A", 9).await.unwrap();
+
+        assert_eq!(store.crawl_read_count("A").await.unwrap(), 0);
+        assert!(store.watch("A").await.unwrap().is_none());
+        assert_eq!(store.growth("A", 0, 100).await.unwrap(), (0, false));
+        assert!(store.gap_plan("A").await.unwrap().is_empty());
+        assert_eq!(store.probes("A").await.unwrap(), [(5, false)]);
+        let state = store.crawl_state("A").await.unwrap().unwrap();
+        assert!(state.done);
+        assert_eq!(state.saved, 1, "what was saved is still counted");
+        assert_eq!(store.crawl_read_count("B").await.unwrap(), 1, "another site is not touched");
+    }
+
+    #[tokio::test]
+    async fn save_gap_reread_marks_the_plan_row_in_the_same_transaction() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        store.save_crawled_range_read("A", 1, &[link("/g/1/", "One")], 1, 4, &[read(1, 1, 1, 2)]).await.unwrap();
+        store.save_gap_plan("A", &[(3, 3), (5, 6)], 1).await.unwrap();
+
+        let new = store.save_gap_reread("A", 50, &[link("/g/1/", "One"), link("/g/2/", "Two")], 3).await.unwrap();
+
+        assert_eq!(new, 1);
+        let plan = store.gap_plan("A").await.unwrap();
+        assert_eq!(plan.iter().map(|row| (row.lo, row.hi, row.done_at)).collect::<Vec<_>>(), [(3, 3, Some(50)), (5, 6, None)]);
+        assert_eq!(store.crawl_state("A").await.unwrap().unwrap().saved, 2);
+        assert_eq!(store.crawl_read_count("A").await.unwrap(), 1, "no read time is written by a read again");
+        assert_eq!(store.crawl_ranges("A").await.unwrap(), [(1, 4)], "and no range");
+
+        // a failed save leaves the plan row as it was
+        store.db.execute_unprepared("DROP TABLE crawls").await.unwrap();
+        assert!(store.save_gap_reread("A", 60, &[link("/g/9/", "Nine")], 5).await.is_err());
+        assert_eq!(store.gap_plan("A").await.unwrap()[1].done_at, None);
+
+        // tries: the span is given up at the third
+        assert_eq!(store.bump_gap_tries("A", 5, 3, 70).await.unwrap(), 1);
+        assert_eq!(store.bump_gap_tries("A", 5, 3, 71).await.unwrap(), 2);
+        assert_eq!(store.gap_plan("A").await.unwrap()[1].done_at, None);
+        assert_eq!(store.bump_gap_tries("A", 5, 3, 72).await.unwrap(), 3);
+        assert_eq!(store.gap_plan("A").await.unwrap()[1].done_at, Some(72));
+    }
+
+    #[tokio::test]
+    async fn a_plan_with_no_spans_keeps_the_sentinel() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        assert!(store.gap_plan("A").await.unwrap().is_empty(), "no plan yet");
+        store.save_gap_plan("A", &[], 33).await.unwrap();
+
+        let plan = store.gap_plan("A").await.unwrap();
+        assert_eq!(plan.iter().map(|row| (row.lo, row.hi, row.done_at)).collect::<Vec<_>>(), [(0, 0, Some(33))]);
+
+        // a plan that is made again replaces it
+        store.save_gap_plan("A", &[(4, 5)], 34).await.unwrap();
+        assert_eq!(store.gap_plan("A").await.unwrap().len(), 1);
+        assert_eq!(store.gap_plan("A").await.unwrap()[0].done_at, None);
+    }
+
+    #[tokio::test]
+    async fn missing_ids_skip_probed_ids_and_stay_inside_min_max() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let ids = [1u32, 2, 5, 9, 12];
+
+        // the newest first, only between the smallest and the largest
+        assert_eq!(store.missing_ids("A", &ids, 100).await.unwrap(), [11, 10, 8, 7, 6, 4, 3]);
+        assert_eq!(store.missing_ids("A", &ids, 2).await.unwrap(), [11, 10]);
+        assert!(store.missing_ids("A", &ids, 0).await.unwrap().is_empty());
+        assert!(store.missing_ids("A", &[], 5).await.unwrap().is_empty());
+        assert!(store.missing_ids("A", &[7], 5).await.unwrap().is_empty());
+
+        // an id that was looked at (found or not) is not missing any more; another site's probes do not count
+        store.save_probes("A", &[(11, false), (8, true)], 1).await.unwrap();
+        store.save_probes("B", &[(10, false)], 1).await.unwrap();
+        assert_eq!(store.missing_ids("A", &ids, 4).await.unwrap(), [10, 7, 6, 4]);
+
+        // a range wider than a window of ids
+        let wide = [1u32, 5000];
+        assert_eq!(store.missing_ids("A", &wide, 3).await.unwrap(), [4999, 4998, 4997]);
+        store.save_probes("A", &(1000..=4999).map(|id| (id, false)).collect::<Vec<_>>(), 1).await.unwrap();
+        assert_eq!(store.missing_ids("A", &wide, 2).await.unwrap(), [999, 998]);
+    }
+
+    #[tokio::test]
+    async fn the_ids_of_a_site_are_read_from_its_paths() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let works: Vec<NewWork> = [3, 1, 2, 3].iter().map(|id| link(&format!("/gallery/{id}/"), "t")).chain([link("/tags/", "x")]).collect();
+
+        store.save_crawled("A", 1, &works, None).await.unwrap();
+        store.save_crawled("B", 1, &[link("/gallery/99/", "t")], None).await.unwrap();
+
+        assert_eq!(store.site_ids("A", |path| crate::sites::work_id("HentaiEra", path)).await.unwrap(), [1, 2, 3]);
     }
 }

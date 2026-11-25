@@ -325,6 +325,9 @@ momon:GA と Nya:Hentai の WordPress API、DLsite、Wnacg、AsmHentai、HentaiE
 - **事前検索**は、最初に歩き終えたサイトを外し、一覧を持たないサイト(Sukebei、JComic など)には尋ね続けます。
 - **一覧からの応答:** `[search] skip_crawled = true` にすると、リクエストは、一覧を読み終えたサイト(`crawls.done`)に尋ねなくなり、データベースが代わりに答えます
   (`live=force` はそれでも尋ねます)。ほかのサイトには、これまでどおり尋ねます。データベースに一覧が全件入ったとき(分割したクロールなら、`import --mark-done` のあと)にオンにしてください。
+- **ギャップチェック:** ワーカーに分けて新しい順の番号つき一覧を歩くと、歩いている間に先頭へ増えた作品が、順不同に読んだ 2 ページのあいだに落ちることがあります。
+  ホストは、各ページを読んだ時刻と、先頭の増加を記録し(`watch_seconds`、既定 120 秒)、歩き終えたあとで危険な境界のページだけを読み直します(`gap_check`、`gap_reread_max_pages`、`gap_budget_pages`)。
+  また、番号が連番のサイトは、更新のたびに欠けている ID を数個ずつ調べます(`id_gap_sites`、`id_gap_per_cycle`)。決まりと上限は `docs/SPEC.md` の「ギャップチェック」にあります。
 - **サイトの間隔**は、プログラムのすべてのリクエストを合わせて守ります(`[search] min_delay_ms`、またはサイトごとに `[search.site_delay_ms]`)。
 - **複数のマシンで:** それぞれに `shard = "k/N"` を指定し、それぞれで `export`(`okazuri-search-api export out.jsonl.br`。JSON Lines を brotli で圧縮)を行い、サーバーで
   `okazuri-search-api import a.jsonl.br b.jsonl.br c.jsonl.br --mark-done Hitomi.La ...` を実行します。保存済みの作品はそのままです。
