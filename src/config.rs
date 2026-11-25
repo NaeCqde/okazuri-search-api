@@ -266,11 +266,13 @@ pub struct DistributeConfig {
     /// Of the host: in how many parts a site is cut for the crawl. The parts are jobs that any worker takes, so the number of workers can change
     /// at any time without changing the parts (the state of a part is kept by its number); more parts than workers is the usual case.
     pub parts: usize,
+    /// Of the host: how many works a job of the crawl reads before the worker answers (the pages are read one after another; 0 is one page).
+    pub job_works: usize,
 }
 
 impl Default for DistributeConfig {
     fn default() -> Self {
-        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12 }
+        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12, job_works: 1000 }
     }
 }
 

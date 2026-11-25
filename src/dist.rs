@@ -2,12 +2,12 @@
 //!
 //! A site sees one IP address asking for its pages, and answers a limited number of them. The host (the server that keeps the database) cuts the
 //! work into jobs, and each worker (a machine with an address of its own) asks the sites and gives the answer back:
-//! - a **step** is one page of a list of the crawl (`Crawler::step_local`): the host gets the links and saves the works;
+//! - a **step** is some pages of a list of the crawl, as many as it takes to have `limit` works (`Crawler::step_local`): the host gets the links and saves the works;
 //! - a **probe** is a batch of pages of saved works that are looked at for the sign that the work is gone (`Engine::probe`): the host records them.
 //!
 //! The workers keep no state of the crawl: the host has the cursors and the database. A worker asks the host for a job (`GET /dist/claim`,
 //! answered when there is one, or after some seconds with nothing) and sends what it found (`POST /dist/report/{id}`). A job that nobody reports
-//! within `LOST_AFTER` is given to another worker. One task of a worker for each site and kind of job, so a site is never asked more often than
+//! while its worker has not been heard of for `LOST_AFTER` (a worker says it is alive every `HEARTBEAT`: `POST /dist/alive`) is given to another worker. One task of a worker for each site and kind of job, so a site is never asked more often than
 //! its delay allows, and a slow site does not hold the others.
 
 use crate::api::AppState;
@@ -24,15 +24,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-/// How long a claimed job may stay without a report before it is given to another worker.
-const LOST_AFTER: Duration = Duration::from_secs(30 * 60);
+/// How often a worker says it is alive.
+const HEARTBEAT: Duration = Duration::from_secs(10 * 60);
+/// How long a worker may be silent (claims, reports and heartbeats all count) before its jobs are given to another worker: two heartbeats and a half.
+const LOST_AFTER: Duration = Duration::from_secs(25 * 60);
+/// The name of the host as a worker of its own jobs: it is never lost.
+const HOST: &str = "host";
 /// How long `claim` waits for a job before it answers that there is none.
 const LONG_POLL: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
     /// One page of the list of a site: the cursor, the shard and the ids of E-Hentai (`lo`, `hi`) of the part that is read.
-    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>) },
+    /// `limit` works are read before the answer (some pages, 0 is one page).
+    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] limit: usize },
     /// Pages of saved works to look at, `spacing_ms` apart.
     Probe { paths: Vec<String>, spacing_ms: u64 },
 }
@@ -64,7 +69,10 @@ struct Item {
 struct Queue {
     next: u64,
     waiting: VecDeque<Item>,
-    running: HashMap<u64, (Instant, Item)>,
+    /// The jobs that are taken, with the worker that has them.
+    running: HashMap<u64, (String, Item)>,
+    /// When each worker was heard of last.
+    seen: HashMap<String, Instant>,
 }
 
 /// The host's list of jobs.
@@ -92,9 +100,11 @@ impl Hub {
     }
 
     /// The first job of `site` and `kind` that waits (or whose worker was lost).
-    fn take(&self, site: &str, kind: &str) -> Option<(u64, Job)> {
+    fn take(&self, site: &str, kind: &str, worker: &str) -> Option<(u64, Job)> {
         let mut queue = self.queue.lock().unwrap();
-        let lost: Vec<u64> = queue.running.iter().filter(|(_, (since, _))| since.elapsed() > LOST_AFTER).map(|(id, _)| *id).collect();
+        queue.seen.insert(worker.to_string(), Instant::now());
+        let silent = |queue: &Queue, name: &str| name != HOST && queue.seen.get(name).is_none_or(|at| at.elapsed() > LOST_AFTER);
+        let lost: Vec<u64> = queue.running.iter().filter(|(_, (name, _))| silent(&queue, name)).map(|(id, _)| *id).collect();
         for id in lost {
             if let Some((_, item)) = queue.running.remove(&id) {
                 log::warn!("dist: the job {id} of {} was not reported, given again", item.site);
@@ -105,18 +115,26 @@ impl Hub {
         let place = queue.waiting.iter().position(|item| item.site == site && item.job.kind() == kind)?;
         let item = queue.waiting.remove(place)?;
         let taken = (item.id, item.job.clone());
-        queue.running.insert(item.id, (Instant::now(), item));
+        queue.running.insert(item.id, (worker.to_string(), item));
 
         Some(taken)
     }
 
     fn report(&self, id: u64, done: Done) -> bool {
-        let item = self.queue.lock().unwrap().running.remove(&id);
+        let mut queue = self.queue.lock().unwrap();
 
-        match item {
-            Some((_, item)) => item.done.send(done).is_ok(),
+        match queue.running.remove(&id) {
+            Some((worker, item)) => {
+                queue.seen.insert(worker, Instant::now());
+                item.done.send(done).is_ok()
+            }
             None => false,
         }
+    }
+
+    /// A worker says it is alive.
+    fn alive(&self, worker: &str) {
+        self.queue.lock().unwrap().seen.insert(worker.to_string(), Instant::now());
     }
 
     fn allows(&self, headers: &HeaderMap) -> bool {
@@ -138,7 +156,9 @@ pub async fn claim(State(state): State<Arc<AppState>>, headers: HeaderMap, Query
     let started = Instant::now();
 
     loop {
-        if let Some((id, job)) = hub.take(&query.site, &query.kind) {
+        let worker = headers.get("x-worker").and_then(|value| value.to_str().ok()).unwrap_or("unnamed");
+
+        if let Some((id, job)) = hub.take(&query.site, &query.kind, worker) {
             return Json(serde_json::json!({ "id": id, "job": job })).into_response();
         }
         if started.elapsed() > LONG_POLL {
@@ -155,6 +175,15 @@ pub async fn report(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     if hub.report(id, done) { StatusCode::OK } else { StatusCode::GONE }
 }
 
+/// `POST /dist/alive` (the name of the worker in `X-Worker`): the worker says it is alive.
+pub async fn alive(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(hub) = state.hub.clone().filter(|hub| hub.allows(&headers)) else { return StatusCode::UNAUTHORIZED };
+
+    hub.alive(headers.get("x-worker").and_then(|value| value.to_str().ok()).unwrap_or("unnamed"));
+
+    StatusCode::OK
+}
+
 /// The worker: one task for each site and kind of job. Never returns.
 pub async fn work(engine: Arc<Engine>, crawler: Arc<Crawler>, config: DistributeConfig, verified: Vec<&'static str>) {
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(60)).build() {
@@ -166,22 +195,53 @@ pub async fn work(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distribute
     };
     let mut tasks = tokio::task::JoinSet::new();
     let crawled = crawler.site_names();
-    log::info!("dist: worker of {}, {} sites crawled, {} verified", config.host, crawled.len(), verified.len());
+    let name = worker_name();
+    tasks.spawn(heartbeat(client.clone(), config.clone(), name.clone()));
+    let me = name.clone();
+    log::info!("dist: worker {name} of {}, {} sites crawled, {} verified", config.host, crawled.len(), verified.len());
 
     for name in crawled {
-        tasks.spawn(worker_loop(engine.clone(), crawler.clone(), config.clone(), client.clone(), name.to_string(), "step"));
+        tasks.spawn(worker_loop(engine.clone(), crawler.clone(), config.clone(), client.clone(), me.clone(), name.to_string(), "step"));
     }
     for name in verified {
-        tasks.spawn(worker_loop(engine.clone(), crawler.clone(), config.clone(), client.clone(), name.to_string(), "probe"));
+        tasks.spawn(worker_loop(engine.clone(), crawler.clone(), config.clone(), client.clone(), me.clone(), name.to_string(), "probe"));
     }
     while tasks.join_next().await.is_some() {}
 }
 
-async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: DistributeConfig, client: reqwest::Client, site: String, kind: &'static str) {
+/// The name of this worker in the logs of the host: the name of the machine and the id of the process (`vultr-2738203`).
+fn worker_name() -> String {
+    let machine = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .or_else(|| std::process::Command::new("hostname").output().ok().and_then(|out| String::from_utf8(out.stdout).ok()))
+        // it travels in a header: letters, digits and a few marks only
+        .map(|name| name.trim().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')).collect::<String>())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "worker".to_string());
+
+    format!("{machine}-{}", std::process::id())
+}
+
+/// Says to the host that this worker is alive, every `HEARTBEAT`.
+async fn heartbeat(client: reqwest::Client, config: DistributeConfig, name: String) {
+    let url = format!("{}/dist/alive", config.host.trim_end_matches('/'));
+
+    loop {
+        match client.post(&url).header("x-worker", &name).bearer_auth(&config.token).send().await {
+            Ok(response) if response.status().is_success() => log::debug!("dist: the host knows that {name} is alive"),
+            Ok(response) => log::warn!("dist: the host answered {} to the heartbeat", response.status()),
+            Err(e) => log::warn!("dist: the heartbeat failed: {e}"),
+        }
+        tokio::time::sleep(HEARTBEAT).await;
+    }
+}
+
+async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: DistributeConfig, client: reqwest::Client, me: String, site: String, kind: &'static str) {
     let base = config.host.trim_end_matches('/').to_string();
 
     loop {
-        let answer = client.get(format!("{base}/dist/claim")).query(&[("site", site.as_str()), ("kind", kind)]).bearer_auth(&config.token).send().await;
+        let answer = client.get(format!("{base}/dist/claim")).query(&[("site", site.as_str()), ("kind", kind)]).header("x-worker", &me).bearer_auth(&config.token).send().await;
         let response = match answer {
             Ok(response) if response.status() == StatusCode::NO_CONTENT => continue,
             Ok(response) if response.status().is_success() => response,
@@ -200,7 +260,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
         let (Some(id), Some(job)) = (claimed.get("id").and_then(|id| id.as_u64()), claimed.get("job").and_then(|job| serde_json::from_value::<Job>(job.clone()).ok())) else { continue };
 
         let what = match &job {
-            Job::Step { cursor, shard, .. } => format!("step of part {}/{} from {cursor:?}", shard.0, shard.1),
+            Job::Step { cursor, shard, limit, .. } => format!("step of {limit} works of part {}/{} from {cursor:?}", shard.0, shard.1),
             Job::Probe { paths, .. } => format!("probe of {} pages", paths.len()),
         };
         let started = std::time::Instant::now();
@@ -210,7 +270,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
 
         // a report that fails is tried again: the page was read, and asking the site again costs more than asking the host
         for attempt in 0..5 {
-            match client.post(format!("{base}/dist/report/{id}")).bearer_auth(&config.token).json(&done).send().await {
+            match client.post(format!("{base}/dist/report/{id}")).header("x-worker", &me).bearer_auth(&config.token).json(&done).send().await {
                 Ok(response) if response.status().is_success() || response.status() == StatusCode::GONE => break,
                 other => {
                     log::warn!("dist {site}: the report of {id} failed ({}), try {attempt}", other.map_or_else(|e| e.to_string(), |r| r.status().to_string()));
@@ -223,7 +283,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
 
 async fn run(engine: &Arc<Engine>, crawler: &Arc<Crawler>, site: &str, job: Job) -> Done {
     match job {
-        Job::Step { cursor, shard, ids } => Done::Step(crawler.step_local(site, &cursor, shard, ids).await),
+        Job::Step { cursor, shard, ids, limit } => Done::Step(crawler.step_local(site, &cursor, shard, ids, limit).await),
         Job::Probe { paths, spacing_ms } => Done::Probe(probe(engine, site, paths, Duration::from_millis(spacing_ms)).await),
     }
 }
@@ -239,7 +299,7 @@ pub async fn work_local(hub: Arc<Hub>, engine: Arc<Engine>, crawler: Arc<Crawler
         let (hub, engine, crawler) = (hub.clone(), engine.clone(), crawler.clone());
         tasks.spawn(async move {
             loop {
-                match hub.take(site, kind) {
+                match hub.take(site, kind, HOST) {
                     Some((id, job)) => {
                         let done = run(&engine, &crawler, site, job).await;
                         hub.report(id, done);

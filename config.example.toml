@@ -213,4 +213,5 @@ role = "off"                       # off, host or worker
 token = ""                         # the same on the host and its workers
 host = ""                          # of a worker: http://<address of the host>:<its port>
 workers = 3                        # of the host: how many workers there are (the verification cuts its pages for them)
+job_works = 1000                   # of the host: how many works a job of the crawl reads before the worker answers (some pages, one after another)
 parts = 12                         # of the host: in how many parts the crawl cuts a site (more than the workers; a number that 1, 2, 3, 4, 6 divide)
