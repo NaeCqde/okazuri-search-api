@@ -272,7 +272,7 @@ pub struct DistributeConfig {
 
 impl Default for DistributeConfig {
     fn default() -> Self {
-        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12, job_works: 1000 }
+        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12, job_works: 200 }
     }
 }
 
