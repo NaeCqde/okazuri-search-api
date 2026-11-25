@@ -1168,6 +1168,7 @@ mod tests {
             keep_times: false,
             support: Support::Ready,
             note: "",
+            plain_agent: false,
         }))
     }
 
