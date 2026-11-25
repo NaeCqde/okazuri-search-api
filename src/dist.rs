@@ -37,7 +37,7 @@ const LONG_POLL: Duration = Duration::from_secs(25);
 pub enum Job {
     /// One page of the list of a site: the cursor, the shard and the ids of E-Hentai (`lo`, `hi`) of the part that is read.
     /// `pages` pages are read before the answer (0 is one page).
-    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] pages: usize, #[serde(default)] seconds: u64 },
+    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] pages: usize, #[serde(default)] seconds: u64, #[serde(default)] oldest: bool },
     /// Pages of saved works to look at, `spacing_ms` apart.
     Probe { paths: Vec<String>, spacing_ms: u64 },
 }
@@ -100,7 +100,7 @@ impl Hub {
     }
 
     /// The first job of `site` and `kind` that waits (or whose worker was lost).
-    fn take(&self, site: &str, kind: &str, worker: &str) -> Option<(u64, Job)> {
+    pub(crate) fn take(&self, site: &str, kind: &str, worker: &str) -> Option<(u64, Job)> {
         let mut queue = self.queue.lock().unwrap();
         queue.seen.insert(worker.to_string(), Instant::now());
         let silent = |queue: &Queue, name: &str| name != HOST && queue.seen.get(name).is_none_or(|at| at.elapsed() > LOST_AFTER);
@@ -120,7 +120,7 @@ impl Hub {
         Some(taken)
     }
 
-    fn report(&self, id: u64, done: Done) -> bool {
+    pub(crate) fn report(&self, id: u64, done: Done) -> bool {
         let mut queue = self.queue.lock().unwrap();
 
         match queue.running.remove(&id) {
@@ -283,7 +283,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
 
 async fn run(engine: &Arc<Engine>, crawler: &Arc<Crawler>, site: &str, job: Job) -> Done {
     match job {
-        Job::Step { cursor, shard, ids, pages, seconds } => Done::Step(crawler.step_local(site, &cursor, shard, ids, pages, seconds).await),
+        Job::Step { cursor, shard, ids, pages, seconds, oldest } => Done::Step(crawler.step_local(site, &cursor, shard, ids, pages, seconds, oldest).await),
         Job::Probe { paths, spacing_ms } => Done::Probe(probe(engine, site, paths, Duration::from_millis(spacing_ms)).await),
     }
 }

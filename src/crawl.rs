@@ -167,7 +167,6 @@ pub struct Step {
 }
 
 /// One part of the walk of a site: the pages of this shard, the ids of E-Hentai of this part, and the name its state is saved under (`crawls`).
-/// A server on its own has one part, the whole list; the host of workers (`[distribute]`) cuts a site in `[distribute] parts` parts (the workers take them as jobs).
 #[derive(Debug, Clone)]
 struct Lane {
     shard: (u64, u64),
@@ -297,9 +296,10 @@ impl Crawler {
         Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_pages: 0, job_seconds: 0 })
     }
 
-    /// The pages of the sites are read by the workers of this host, in `parts` parts of each site that the workers take as jobs.
-    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, parts: usize, job_pages: usize, job_seconds: u64) -> Self {
-        self.hub = Some((hub, parts.max(1)));
+    /// The pages of the sites are read by the workers of this host: the first walk of a numbered list is cut in jobs of `job_pages` pages (up to `lookahead` of them wait
+    /// or run at a time) that any worker takes.
+    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, lookahead: usize, job_pages: usize, job_seconds: u64) -> Self {
+        self.hub = Some((hub, lookahead.max(2)));
         self.job_pages = job_pages;
         self.job_seconds = job_seconds;
         self
@@ -310,36 +310,12 @@ impl Crawler {
         self.sources.iter().map(|(index, _)| self.engine.site(*index).def.name).collect()
     }
 
-    /// The part of the walk that this server reads, for each site: the whole of it, or (with workers) as many parts as `[distribute] parts` says (the workers take them as jobs, so their number does not matter).
-    fn lanes(&self, source: &Source, name: &str) -> Vec<Lane> {
-        let whole = Lane { shard: self.shard, ids: self.ids, key: name.to_string(), refresher: true };
-        let Some((_, workers)) = &self.hub else { return vec![whole] };
-        let workers = *workers as u64;
+    /// The part of the walk that this server reads, for each site: the whole of it (the host of workers cuts the first walk of a numbered list into jobs of pages that
+    /// the workers take, `walk_ranges`, so there are no parts of a site to keep).
+    fn lanes(&self, _source: &Source, name: &str) -> Vec<Lane> {
+        let shard = if self.hub.is_some() { (0, 1) } else { self.shard };
 
-        if workers < 2 {
-            return vec![Lane { shard: (0, 1), ..whole }];
-        }
-        let part = |k: u64, shard: (u64, u64), ids: (Option<u64>, Option<u64>)| Lane { shard, ids, key: format!("{name}#{k}/{workers}"), refresher: k == 0 };
-
-        match source {
-            // the pages follow one another (the cursor is the address of the next one): one part
-            Source::Cards(_) => vec![Lane { shard: (0, 1), ..whole }],
-            // the ids are cut in ranges, and one more part reads from the newest page down to the range (and reads the newest pages again)
-            Source::GalleryIds(_) => match self.ids {
-                (lo, Some(hi)) => {
-                    let lo = lo.unwrap_or(0);
-                    let size = (hi.saturating_sub(lo) + 1).div_ceil(workers);
-                    let mut lanes: Vec<Lane> = (0..workers).map(|k| part(k + 1, (0, 1), (if k == 0 { Some(lo).filter(|lo| *lo > 0) } else { Some(lo + k * size - 1) }, Some((lo + (k + 1) * size - 1).min(hi))))).collect();
-                    lanes.push(Lane { shard: (0, 1), ids: (Some(hi), None), key: name.to_string(), refresher: true });
-                    for lane in lanes.iter_mut().take(workers as usize) {
-                        lane.refresher = false;
-                    }
-                    lanes
-                }
-                _ => vec![Lane { shard: (0, 1), ..whole }],
-            },
-            _ => (0..workers).map(|k| part(k, (k, workers), self.ids)).collect(),
-        }
+        vec![Lane { shard, ids: self.ids, key: name.to_string(), refresher: true }]
     }
 
     /// Walks every site, each in a task of its own (each part of it, with workers), for as long as the server runs.
@@ -453,6 +429,11 @@ impl Crawler {
             state = self.engine.store().crawl_state(name).await.map_err(|e| e.to_string())?.filter(|row| row.done);
         }
         let first = !state.as_ref().is_some_and(|row| row.done);
+
+        // the host of workers reads the first walk of a numbered list in jobs of pages that any worker takes
+        if first && self.hub.is_some() && lane.key == name && numbered(source) {
+            return self.walk_ranges(index, source, lane).await;
+        }
         let cursor = if first { state.map(|row| row.cursor).unwrap_or_default() } else { String::new() };
         let mut walk = Walk::default();
 
@@ -474,6 +455,97 @@ impl Crawler {
         Ok(walk)
     }
 
+    /// The cursor that makes a job start at `page` of a numbered list.
+    fn cursor_of(&self, source: &Source, page: u64) -> String {
+        match source {
+            Source::Hitomi => ((page - 1) * self.config.hitomi_batch.max(1) as u64).to_string(),
+            _ => page.to_string(),
+        }
+    }
+
+    /// The page that a cursor of a numbered list names (the other way of `cursor_of`).
+    fn page_of(&self, source: &Source, cursor: &str) -> Option<u64> {
+        let number: u64 = cursor.parse().ok()?;
+
+        Some(match source {
+            Source::Hitomi => number / self.config.hitomi_batch.max(1) as u64 + 1,
+            _ => number,
+        })
+    }
+
+    /// The first walk of a numbered list by the host of workers: the pages are given out in ranges of `job_pages` (at most `lookahead` of them out at a time), the
+    /// workers read them in any order, and what is read is kept as ranges in the database (the place a restart goes on from is the first page that is not read). The
+    /// list is read when a job meets its end (an empty page, a page that is the one before) and every page before it is read. A list that the site can give with the oldest
+    /// works first is read so, since its pages do not move while it is read.
+    async fn walk_ranges(&self, index: usize, source: &Source, _lane: &Lane) -> std::result::Result<Walk, String> {
+        let name = self.engine.site(index).def.name;
+        let Some((hub, lookahead)) = self.hub.clone() else { return Err("no workers".to_string()) };
+        let store = self.engine.store();
+        let mut done = Ranges::new(&store.crawl_ranges(name).await.map_err(|e| e.to_string())?);
+        // the rows are one for each job of the walks before: they are written as the joined ranges
+        store.save_crawl_ranges(name, &done.list()).await.map_err(|e| e.to_string())?;
+
+        let oldest = can_oldest(source);
+        let width = self.job_pages.max(1) as u64;
+        let mut pending: HashMap<u64, u64> = HashMap::new();
+        let mut tasks: JoinSet<(u64, std::result::Result<crate::dist::Done, String>)> = JoinSet::new();
+        let mut walk = Walk::default();
+        // the start of the lowest job in which the list ended
+        let mut end: Option<u64> = None;
+        let mut from = 1;
+        let mut reported = 0;
+
+        loop {
+            while tasks.len() < lookahead {
+                let start = next_free(&done, &pending, from);
+                if end.is_some_and(|end| start >= end) {
+                    break;
+                }
+                let job = crate::dist::Job::Step { cursor: self.cursor_of(source, start), shard: (0, 1), ids: (None, None), pages: width as usize, seconds: self.job_seconds, oldest };
+                let (hub, site) = (hub.clone(), name.to_string());
+
+                pending.insert(start, start + width - 1);
+                from = start;
+                tasks.spawn(async move { (start, hub.submit(&site, job).await) });
+            }
+
+            let Some(finished) = tasks.join_next().await else { break };
+            let (start, answer) = finished.map_err(|e| e.to_string())?;
+            let hi = pending.remove(&start).unwrap_or(start + width - 1);
+            let step = match answer? {
+                crate::dist::Done::Step(step) => step?,
+                _ => return Err("a worker answered with something that is not a page".to_string()),
+            };
+
+            // a job that stopped early (a page could not be read) gives the pages it read, and the rest is given out again
+            let read_to = match &step.next {
+                Some(next) => self.page_of(source, next).filter(|page| *page > start).ok_or_else(|| format!("a job from page {start} came back with no pages read"))? - 1,
+                None => hi,
+            };
+            let works = self.engine.works_of(step.links).await?;
+            let new = store.save_crawled_range(name, unix_now(), &works, start, read_to).await.map_err(|e| e.to_string())?;
+
+            done.add(start, read_to);
+            from = from.min(read_to + 1);
+            walk.pages += (read_to - start + 1) as usize;
+            walk.new += new;
+            if step.next.is_none() {
+                end = Some(end.map_or(start, |end| end.min(start)));
+            }
+            if walk.pages / 50 > reported {
+                reported = walk.pages / 50;
+                log::info!("crawl {name}: {} pages read, {} new works, pages up to {} are read", walk.pages, walk.new, done.first_gap(1) - 1);
+            }
+        }
+
+        if end.is_some_and(|end| done.first_gap(1) > end) {
+            store.mark_crawled(name, unix_now()).await.map_err(|e| e.to_string())?;
+            walk.finished = true;
+        }
+
+        Ok(walk)
+    }
+
     /// Reads pages from `cursor`. A first walk (`first`) goes to the end of the list and saves where it is after each page; any
     /// other stops at the first page with nothing new in it (or after `refresh_pages`) and leaves the saved place as it is.
     async fn pages(&self, index: usize, source: &Source, mut cursor: String, shard: (u64, u64), first: bool, lane: &Lane) -> std::result::Result<Walk, String> {
@@ -485,7 +557,7 @@ impl Crawler {
 
         loop {
             // the first walk is read in jobs of `job_pages` pages; the newest pages are read again one page at a time (they stop at the first page with nothing new)
-            let step = self.step_again(index, source, &cursor, shard, lane.ids, if first { self.job_pages } else { 0 }, self.job_seconds).await?;
+            let step = self.step_again(index, source, &cursor, shard, lane.ids, if first { self.job_pages } else { 0 }, self.job_seconds, false).await?;
             let mut next = step.next.clone();
             let listed = step.links.len();
             if next.is_none() && matches!(source, Source::Pages(_)) && walk.pages < leading_empty {
@@ -523,10 +595,10 @@ impl Crawler {
 
     /// `step`, asked again after a short wait when it fails (the sites answer 502, 504 and broken bodies now and then), so a walk does
     /// not wait `retry_minutes` for every one of them. A ban of the address is not asked again.
-    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), pages: usize, seconds: u64) -> std::result::Result<Step, String> {
+    async fn step_again(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), pages: usize, seconds: u64, oldest: bool) -> std::result::Result<Step, String> {
         // the host of workers: a worker reads the page (and tries again as a server on its own does)
         if let Some((hub, _)) = &self.hub {
-            let job = crate::dist::Job::Step { cursor: cursor.to_string(), shard, ids, pages, seconds };
+            let job = crate::dist::Job::Step { cursor: cursor.to_string(), shard, ids, pages, seconds, oldest };
 
             return match hub.submit(self.engine.site(index).def.name, job).await? {
                 crate::dist::Done::Step(step) => step,
@@ -534,17 +606,17 @@ impl Crawler {
             };
         }
 
-        self.step_retried(index, source, cursor, shard, ids).await
+        self.step_retried(index, source, cursor, shard, ids, oldest).await
     }
 
     /// What a worker does with a job: the page of a site of this crawl, by the name of the site.
     /// Reads pages one after another until `pages` pages are read (0 or 1: one page) or `seconds` have passed (0: no time limit), the list ends, or a page cannot be read (what was read is
     /// given, and `next` is the page that failed, so the host goes on from there). A page that is the same as the one before it (the last page
     /// of a list that repeats it) ends the job too.
-    pub async fn step_local(&self, site: &str, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), pages: usize, seconds: u64) -> std::result::Result<Step, String> {
+    pub async fn step_local(&self, site: &str, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), pages: usize, seconds: u64, oldest: bool) -> std::result::Result<Step, String> {
         let started = std::time::Instant::now();
         let Some((index, source)) = self.sources.iter().find(|(index, _)| self.engine.site(*index).def.name == site) else { return Err(format!("{site} is not read by this worker")) };
-        let mut step = self.step_retried(*index, source, cursor, shard, ids).await?;
+        let mut step = self.step_retried(*index, source, cursor, shard, ids, oldest).await?;
         let mut last: Vec<String> = step.links.iter().map(|link| link.path.clone()).collect();
 
         // a job ends with enough pages or when it has read for `seconds` (a slow site gives fewer pages, so a job is never longer than a few minutes)
@@ -552,7 +624,7 @@ impl Crawler {
 
         while read < pages && (seconds == 0 || started.elapsed().as_secs() < seconds) {
             let Some(next) = step.next.clone() else { break };
-            let more = match self.step_retried(*index, source, &next, shard, ids).await {
+            let more = match self.step_retried(*index, source, &next, shard, ids, oldest).await {
                 Ok(more) => more,
                 Err(e) => {
                     log::warn!("crawl {site}: {e}, the job is given back with {} works", step.links.len());
@@ -561,7 +633,9 @@ impl Crawler {
             };
             let paths: Vec<String> = more.links.iter().map(|link| link.path.clone()).collect();
 
+            // the page is the one before: the list repeats its last page (Wnacg), so it has ended
             if paths == last {
+                step.next = None;
                 break;
             }
             last = paths;
@@ -573,11 +647,11 @@ impl Crawler {
         Ok(step)
     }
 
-    async fn step_retried(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>)) -> std::result::Result<Step, String> {
+    async fn step_retried(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), oldest: bool) -> std::result::Result<Step, String> {
         let mut waits = STEP_RETRY_SECS.iter();
 
         loop {
-            match self.step(index, source, cursor, shard, ids).await {
+            match self.step_with(index, source, cursor, shard, ids, oldest).await {
                 Err(e) if !e.contains("banned") => match waits.next() {
                     Some(secs) => {
                         log::debug!("crawl {}: {e}, again in {secs} s", self.engine.site(index).def.name);
@@ -591,14 +665,20 @@ impl Crawler {
     }
 
     /// The page of the list at `cursor` (empty: the first), and where the next one is.
+    #[cfg(test)]
     async fn step(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>)) -> std::result::Result<Step, String> {
+        self.step_with(index, source, cursor, shard, ids, false).await
+    }
+
+    /// `step`, with `oldest` the list of the oldest works first when the site can (`oldest_first`): the pages of such a list do not move when works are added.
+    async fn step_with(&self, index: usize, source: &Source, cursor: &str, shard: (u64, u64), ids: (Option<u64>, Option<u64>), oldest: bool) -> std::result::Result<Step, String> {
         let site = self.engine.site(index);
 
         match source {
             Source::Hitomi => self.hitomi_step(index, cursor, shard).await,
             Source::WordPress(template) => {
                 let number = page_number(cursor, shard);
-                let url = template.replace("{n}", &number.to_string());
+                let url = if oldest { oldest_first(template) } else { template.clone() }.replace("{n}", &number.to_string());
                 // a page beyond the last one is a 400 of WordPress: the end of the list
                 let body = match self.engine.get_page(index, &url).await {
                     Ok((_, body)) => body,
@@ -615,6 +695,7 @@ impl Crawler {
             Source::Pages(template) => {
                 let number = page_number(cursor, shard);
                 // a page beyond the last one is a 404 (DLsite)
+                let template = if oldest { oldest_first(template) } else { template.clone() };
                 let (page_url, body) = match self.engine.get_page(index, &template.replace("{n}", &number.to_string())).await {
                     Ok(page) => page,
                     Err(e) if e == "HTTP 404" && number > 1 => return Ok(Step { links: Vec::new(), next: None }),
@@ -898,6 +979,79 @@ impl Crawler {
     }
 }
 
+/// The lists whose pages have numbers (`{n}`, or a batch of the index of Hitomi.La): any page can be read without the ones before it, so a walk cuts them
+/// in ranges of pages that workers take at the same time. The others (the cursor is the address of the next page) are read one page after another.
+fn numbered(source: &Source) -> bool {
+    matches!(source, Source::Pages(_) | Source::WordPress(_) | Source::Hitomi)
+}
+
+/// The address of a list with the oldest works first, from the address with the newest first (WordPress `order=desc`, DLsite `order/release_d/`).
+fn oldest_first(template: &str) -> String {
+    template.replace("order=desc", "order=asc").replace("order/release_d/", "order/release/")
+}
+
+/// Whether the list of the site can be read with the oldest works first (`oldest_first`). The pages of such a list do not move when a work is added (a new work
+/// is at the end), so the pages that are read at different times leave no work out; the newest-first list moves by every new work.
+fn can_oldest(source: &Source) -> bool {
+    match source {
+        Source::WordPress(template) => template.contains("order=desc"),
+        Source::Pages(template) => template.contains("order/release_d/"),
+        _ => false,
+    }
+}
+
+/// The pages of a list that are read, as ranges (`lo..=hi`, joined when they touch).
+#[derive(Debug, Default, Clone)]
+struct Ranges(std::collections::BTreeMap<u64, u64>);
+
+impl Ranges {
+    fn new(list: &[(u64, u64)]) -> Self {
+        let mut ranges = Self::default();
+        for (lo, hi) in list {
+            ranges.add(*lo, *hi);
+        }
+        ranges
+    }
+
+    fn add(&mut self, lo: u64, hi: u64) {
+        let (mut lo, mut hi) = (lo, hi);
+        let touching: Vec<u64> = self.0.range(..=hi.saturating_add(1)).filter(|(_, end)| end.saturating_add(1) >= lo).map(|(start, _)| *start).collect();
+
+        for start in touching {
+            if let Some(end) = self.0.remove(&start) {
+                lo = lo.min(start);
+                hi = hi.max(end);
+            }
+        }
+        self.0.insert(lo, hi);
+    }
+
+    /// The first page from `from` that is not in a range.
+    fn first_gap(&self, from: u64) -> u64 {
+        match self.0.range(..=from).next_back() {
+            Some((_, end)) if *end >= from => end + 1,
+            _ => from,
+        }
+    }
+
+    fn list(&self) -> Vec<(u64, u64)> {
+        self.0.iter().map(|(lo, hi)| (*lo, *hi)).collect()
+    }
+}
+
+/// The first page from `from` that is neither read nor given to a worker (`pending`: start and last page of each job that is out).
+fn next_free(done: &Ranges, pending: &HashMap<u64, u64>, from: u64) -> u64 {
+    let mut page = from;
+
+    loop {
+        page = done.first_gap(page);
+        match pending.iter().find(|(lo, hi)| **lo <= page && page <= **hi) {
+            Some((_, hi)) => page = hi + 1,
+            None => return page,
+        }
+    }
+}
+
 /// The number of the page to read: the first page of this machine, or the one the cursor names.
 fn page_number(cursor: &str, shard: (u64, u64)) -> u64 {
     cursor.parse().unwrap_or(shard.0 + 1)
@@ -1038,6 +1192,100 @@ mod tests {
         let source = Source::Pages(format!("http://127.0.0.1:{port}/list/{{n}}"));
 
         (Arc::new(Crawler::with_sources(engine, config, vec![("Listed".to_string(), source)]).unwrap()), store)
+    }
+
+    #[test]
+    fn ranges_join_when_they_touch_and_say_the_first_page_that_is_not_read() {
+        let mut ranges = Ranges::new(&[(1, 10), (21, 30)]);
+        assert_eq!(ranges.first_gap(1), 11);
+        assert_eq!(ranges.first_gap(15), 15);
+        assert_eq!(ranges.first_gap(25), 31);
+
+        ranges.add(11, 20);
+        assert_eq!(ranges.list(), [(1, 30)]);
+        ranges.add(5, 8);
+        ranges.add(40, 45);
+        assert_eq!(ranges.list(), [(1, 30), (40, 45)]);
+
+        let pending = HashMap::from([(31, 35), (36, 39)]);
+        assert_eq!(next_free(&ranges, &pending, 1), 46);
+        assert_eq!(next_free(&Ranges::default(), &HashMap::new(), 1), 1);
+    }
+
+    /// A crawler of the host with one worker of its own (as the host reads too).
+    async fn host_crawler(port: u16, pages_per_job: usize) -> (Arc<Crawler>, Arc<SearchStore>, Arc<crate::dist::Hub>) {
+        let store = Arc::new(SearchStore::in_memory().await.unwrap());
+        let search = SearchConfig { min_delay_ms: 0, ..SearchConfig::default() };
+        let engine = Engine::with_sites(vec![Site::new(def("Listed", port))], &search, store.clone(), crate::testing::romanizer_arc());
+        let source = Source::Pages(format!("http://127.0.0.1:{port}/list/{{n}}"));
+        let hub = Arc::new(crate::dist::Hub::new("token".to_string()));
+        let crawler = Arc::new(Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), source)]).unwrap().with_hub(hub.clone(), 3, pages_per_job, 0));
+
+        for worker in 0..2 {
+            let (hub, crawler) = (hub.clone(), crawler.clone());
+            tokio::spawn(async move {
+                loop {
+                    match hub.take("Listed", "step", &format!("test-{worker}")) {
+                        Some((id, crate::dist::Job::Step { cursor, shard, ids, pages, seconds, oldest })) => {
+                            let done = crate::dist::Done::Step(crawler.step_local("Listed", &cursor, shard, ids, pages, seconds, oldest).await);
+                            hub.report(id, done);
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+            });
+        }
+
+        (crawler, store, hub)
+    }
+
+    #[tokio::test]
+    async fn the_host_reads_a_numbered_list_in_ranges_that_workers_take() {
+        let (port, _hits) = server(2, 7).await;
+        let (crawler, store, _hub) = host_crawler(port, 2).await;
+        let (index, source) = crawler.sources[0].clone();
+
+        let walk = crawler.walk(index, &source).await.unwrap();
+
+        assert!(walk.finished);
+        assert_eq!(store.count_works().await.unwrap(), 14, "7 pages of 2 works");
+        assert!(store.crawl_state("Listed").await.unwrap().unwrap().done);
+        let ranges = store.crawl_ranges("Listed").await.unwrap();
+        assert_eq!(ranges.len(), 1, "the ranges are joined: {ranges:?}");
+        assert_eq!(ranges[0].0, 1);
+        assert!(ranges[0].1 >= 8, "up to the page that is empty: {ranges:?}");
+    }
+
+    #[tokio::test]
+    async fn a_walk_in_ranges_goes_on_with_the_pages_that_are_not_read() {
+        let (port, hits) = server(2, 7).await;
+        let (crawler, store, _hub) = host_crawler(port, 2).await;
+        let (index, source) = crawler.sources[0].clone();
+
+        // pages 1 to 4 were read before the server stopped (out of order: 3 and 4 first, and 1 and 2 are not)
+        for (lo, hi) in [(3, 4), (5, 6)] {
+            let page = crawler.step_local("Listed", &lo.to_string(), (0, 1), (None, None), 2, 0, false).await.unwrap();
+            let works = crawler.engine.works_of(page.links).await.unwrap();
+            store.save_crawled_range("Listed", 1, &works, lo, hi).await.unwrap();
+        }
+        let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+
+        let walk = crawler.walk(index, &source).await.unwrap();
+
+        assert!(walk.finished);
+        assert_eq!(store.count_works().await.unwrap(), 14);
+        // pages 1, 2, 7 and the empty page(s) after: not pages 3 to 6 again
+        let asked = hits.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(asked <= 6, "pages 3 to 6 are not read again: {asked} requests");
+    }
+
+    #[test]
+    fn the_oldest_first_address_is_made_for_the_lists_that_have_one() {
+        assert_eq!(oldest_first("https://x/wp-json/wp/v2/posts?page={n}&orderby=date&order=desc"), "https://x/wp-json/wp/v2/posts?page={n}&orderby=date&order=asc");
+        assert_eq!(oldest_first("https://www.dlsite.com/books/fsr/order/release_d/per_page/100/page/{n}/"), "https://www.dlsite.com/books/fsr/order/release/per_page/100/page/{n}/");
+        assert!(can_oldest(&Source::WordPress("https://x/?order=desc".to_string())));
+        assert!(!can_oldest(&Source::Pages("https://wnacg/albums-index-page-{n}.html".to_string())));
+        assert!(!can_oldest(&Source::Cards("https://x".to_string())));
     }
 
     #[tokio::test]

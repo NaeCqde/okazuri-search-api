@@ -206,8 +206,8 @@ min_pause_ms = 5000
 
 # Handing the reading of the sites to other machines (dist.rs). The host (the server that keeps the database) cuts the crawl and the
 # verification into jobs; each worker (a machine with an IP address of its own, with [crawl] and [verify] on and its own small database)
-# asks the sites and gives the pages back. A site is cut in `parts` parts for the crawl (the number of the parts is kept in the state of the crawl, so it is not changed lightly); the
-# workers take the parts as jobs, so workers can come and go at any time, and each worker waits the delay of the site on its own. The host needs the same [crawl] / [verify] settings as always; a worker needs `host` and `token`.
+# asks the sites and gives the pages back. The first walk of a list whose pages are numbered is cut in jobs of `job_pages` pages that the workers take as they are free
+# (up to `workers` * 2 jobs are given out at a time, and the pages that are read are kept as ranges), so workers can come and go at any time, and each worker waits the delay of the site on its own. The host needs the same [crawl] / [verify] settings as always; a worker needs `host` and `token`.
 [distribute]
 role = "off"                       # off, host or worker
 token = ""                         # the same on the host and its workers
@@ -215,4 +215,3 @@ host = ""                          # of a worker: http://<address of the host>:<
 workers = 3                        # of the host: how many workers there are (the verification cuts its pages for them)
 job_seconds = 180                  # of the host: the longest a job of the crawl reads (a slow site gives fewer pages per job)
 job_pages = 10                     # of the host: how many pages a job of the crawl reads before the worker answers (one after another)
-parts = 12                         # of the host: in how many parts the crawl cuts a site (more than the workers; a number that 1, 2, 3, 4, 6 divide)

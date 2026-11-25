@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{crawl_state, listing, search, tag, translation, translation_lookup, uploader, work};
+use crate::entity::{crawl_range, crawl_state, listing, search, tag, translation, translation_lookup, uploader, work};
 use crate::language;
 use crate::query::{outside_key, title_key};
 use crate::sites::toggle_slash;
@@ -254,6 +254,8 @@ impl SearchStore {
         db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS tags_kind_name ON tags (kind, name)").await?;
         db.execute(backend.build(uploaders.if_not_exists())).await?;
         // the names of the numbers a site gives its tags (AsmHentai, HentaiEra): only the ones that works carry are kept
+        // the pages of a list that the first walk of a site has read, as ranges (`lo`..=`hi`): the pages are read in any order, by any worker
+        db.execute_unprepared("CREATE TABLE IF NOT EXISTS crawl_ranges (website TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, PRIMARY KEY (website, lo))").await?;
         db.execute_unprepared("CREATE TABLE IF NOT EXISTS site_tag_names (website TEXT NOT NULL, attribute TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (website, attribute, id))").await?;
         let mut crawls = schema.create_table_from_entity(crawl_state::Entity);
         db.execute(backend.build(searches.if_not_exists())).await?;
@@ -1456,10 +1458,56 @@ impl SearchStore {
 
     /// `save_crawled`, with the walk saved under `key` (a site read in parts by workers has a place for each part: `EHentai#1/3`).
     pub async fn save_crawled_in(&self, key: &str, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>) -> Result<usize> {
+        self.save_crawled_inner(key, website, now, works, state, None).await
+    }
+
+    /// `save_crawled`, and the pages `lo..=hi` of the list are noted as read, in the same transaction as the works.
+    pub async fn save_crawled_range(&self, website: &str, now: i64, works: &[NewWork], lo: u64, hi: u64) -> Result<usize> {
+        self.save_crawled_inner(website, website, now, works, None, Some((lo, hi))).await
+    }
+
+    /// The pages of the list of a site that the first walk has read, as ranges (`lo`, `hi`), the lowest first and joined when they touch.
+    pub async fn crawl_ranges(&self, website: &str) -> Result<Vec<(u64, u64)>> {
+        let rows = crawl_range::Entity::find().filter(crawl_range::Column::Website.eq(website)).order_by_asc(crawl_range::Column::Lo).all(&self.reader).await?;
+        let mut joined: Vec<(u64, u64)> = Vec::new();
+
+        for row in rows {
+            let (lo, hi) = (row.lo as u64, row.hi as u64);
+            match joined.last_mut() {
+                Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+                _ => joined.push((lo, hi)),
+            }
+        }
+
+        Ok(joined)
+    }
+
+    /// Writes the ranges of a site as they are (the rows that a walk adds are one for each job: this joins them).
+    pub async fn save_crawl_ranges(&self, website: &str, ranges: &[(u64, u64)]) -> Result<()> {
+        let transaction = self.db.begin().await?;
+
+        crawl_range::Entity::delete_many().filter(crawl_range::Column::Website.eq(website)).exec(&transaction).await?;
+        for chunk in ranges.chunks(500) {
+            let rows = chunk.iter().map(|(lo, hi)| crawl_range::ActiveModel { website: Set(website.to_string()), lo: Set(*lo as i64), hi: Set(*hi as i64) });
+            crawl_range::Entity::insert_many(rows).exec_without_returning(&transaction).await?;
+        }
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    async fn save_crawled_inner(&self, key: &str, website: &str, now: i64, works: &[NewWork], state: Option<(&str, bool)>, range: Option<(u64, u64)>) -> Result<usize> {
         let transaction = self.db.begin().await?;
         let works = Self::same_pages(&transaction, website, works).await?;
         let new = Self::save_works(&transaction, website, now, &works).await?.len();
 
+        if let Some((lo, hi)) = range {
+            let row = crawl_range::ActiveModel { website: Set(website.to_string()), lo: Set(lo as i64), hi: Set(hi as i64) };
+            crawl_range::Entity::insert(row)
+                .on_conflict(OnConflict::columns([crawl_range::Column::Website, crawl_range::Column::Lo]).update_column(crawl_range::Column::Hi).to_owned())
+                .exec_without_returning(&transaction)
+                .await?;
+        }
         let before = crawl_state::Entity::find_by_id(key.to_string()).one(&transaction).await?;
         let saved = before.as_ref().map_or(0, |row| row.saved) + new as i64;
         let (cursor, done) = match (state, &before) {
