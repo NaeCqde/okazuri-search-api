@@ -230,6 +230,11 @@ pub struct Gallery {
     pub artists: Vec<String>,
     pub groups: Vec<String>,
     pub parodies: Vec<String>,
+    /// The characters and the tags (flat: `female`, `male` are dropped), in lower case.
+    pub characters: Vec<String>,
+    pub tags: Vec<String>,
+    /// When the gallery was posted (seconds since the epoch, UTC).
+    pub posted_at: Option<i64>,
     /// The number of pages.
     pub pages: usize,
 }
@@ -270,8 +275,40 @@ impl Gallery {
             _ => self.title.clone(),
         };
 
-        Link { path: self.path(), title }
+        use crate::sites::{Tag, TagKind};
+
+        let mut tags: Vec<Tag> = Vec::new();
+        let named = |names: &[String], kind: TagKind| names.iter().map(|name| Tag::new(name.clone(), kind)).collect::<Vec<_>>();
+        let all = named(&self.artists, TagKind::Author)
+            .into_iter()
+            .chain(named(&self.groups, TagKind::Circle))
+            .chain(self.kind.iter().map(|kind| Tag::new(kind.clone(), TagKind::Tag)))
+            .chain(named(&self.parodies, TagKind::Tag))
+            .chain(named(&self.characters, TagKind::Tag))
+            .chain(named(&self.tags, TagKind::Tag));
+        for tag in all {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        // Hitomi.La has no uploader: the artists and the circles are tags (the author of a work is not the one who posted it)
+        let extra = crate::sites::Extra { tags, uploader: None, posted_at: self.posted_at, romaji: Vec::new() };
+
+        Link { path: self.path(), title, extra }
     }
+}
+
+/// `2022-12-29 19:23:00-06`: the time of a gallery, with the hours the zone is behind UTC.
+fn posted_at(text: &str) -> Option<i64> {
+    let (date, time) = text.split_once(' ')?;
+    let mut date = date.split('-').map(|part| part.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let (clock, zone) = time.find(['+', '-']).map_or((time, ""), |at| time.split_at(at));
+    let mut clock = clock.split(':').map(|part| part.parse::<i64>().ok());
+    let (hour, minute) = (clock.next()??, clock.next()??);
+    let offset: i64 = if zone.is_empty() { 0 } else { zone.get(1..3)?.parse::<i64>().ok()? * if zone.starts_with('-') { -1 } else { 1 } };
+
+    Some(crate::sites::epoch(year, month, day, hour, minute) - offset * 3600)
 }
 
 /// The gallery that `/galleries/<id>.js` describes. None when it has no title.
@@ -298,6 +335,9 @@ pub fn parse_gallery(id: u32, body: &str) -> Option<Gallery> {
         artists: names("artists", "artist"),
         groups: names("groups", "group"),
         parodies: names("parodys", "parody"),
+        characters: names("characters", "character"),
+        tags: names("tags", "tag"),
+        posted_at: text("date").and_then(posted_at),
         pages: info.get("files").and_then(|files| files.as_array()).map_or(0, Vec::len),
     })
 }
@@ -574,8 +614,8 @@ mod tests {
         assert_eq!(
             search(&mut site, "kyoudai", 10).await.unwrap(),
             [
-                Link { path: "/galleries/30.html".into(), title: "Kyoudai de Shitara Ikemasen | 姉弟でシたらいけません".into() },
-                Link { path: "/galleries/10.html".into(), title: "Kyoudai Comic".into() },
+                Link { path: "/galleries/30.html".into(), title: "Kyoudai de Shitara Ikemasen | 姉弟でシたらいけません".into(), extra: Default::default() },
+                Link { path: "/galleries/10.html".into(), title: "Kyoudai Comic".into(), extra: Default::default() },
             ]
         );
     }
@@ -606,5 +646,34 @@ mod tests {
     #[tokio::test]
     async fn a_broken_site_is_an_error() {
         assert!(gallery_ids(&mut Broken, "kyoudai", 10).await.is_err(), "the version is not a number");
+    }
+
+    #[test]
+    fn a_gallery_gives_its_tags_creators_and_date() {
+        let body = r#"var galleryinfo = {"title":"T","japanese_title":null,"type":"doujinshi","language":"japanese","artists":[{"artist":"Fini"}],"groups":[{"group":"Circle"}],"parodys":[{"parody":"vocaloid"}],"characters":[{"character":"hatsune miku"}],"tags":[{"tag":"big breasts","female":"1"}],"date":"2022-12-29 19:23:00-06","files":[{},{}]}"#;
+        let link = parse_gallery(1, body).unwrap().link();
+
+        let names: Vec<(&str, i64)> = link.extra.tags.iter().map(|tag| (tag.name.as_str(), tag.kind.code())).collect();
+        assert_eq!(names, [("fini", 1), ("circle", 2), ("doujinshi", 0), ("vocaloid", 0), ("hatsune miku", 0), ("big breasts", 0)]);
+        assert_eq!(link.extra.uploader, None, "nobody posted it that the site tells");
+        assert_eq!(link.extra.posted_at, Some(1_672_363_380), "2022-12-30 01:23 UTC");
+    }
+
+    #[test]
+    fn a_gallery_with_no_artist_or_no_group_is_read() {
+        let gallery = |lists: &str| parse_gallery(1, &format!(r#"var galleryinfo = {{"title":"T","files":[{{}}]{lists}}};"#)).unwrap().link().extra;
+        let names = |extra: &crate::sites::Extra| extra.tags.iter().map(|tag| (tag.name.clone(), tag.kind.code())).collect::<Vec<_>>();
+
+        // no artist (the list is null, empty or not there) and a group
+        for lists in [r#","artists":null,"groups":[{"group":"circle"}]"#, r#","artists":[],"groups":[{"group":"circle"}]"#, r#","groups":[{"group":"circle"}]"#] {
+            assert_eq!(names(&gallery(lists)), [("circle".to_string(), 2)], "{lists}");
+        }
+        // an artist and no group
+        assert_eq!(names(&gallery(r#","artists":[{"artist":"fini"}],"groups":null"#)), [("fini".to_string(), 1)]);
+        // neither, no tags, no date, no kind: nothing, and it is still a work
+        let nothing = gallery(r#","artists":null,"groups":null,"tags":null,"date":null"#);
+        assert!(nothing.is_empty());
+        // a date that cannot be read is no date
+        assert_eq!(gallery(r#","date":"yesterday""#).posted_at, None);
     }
 }

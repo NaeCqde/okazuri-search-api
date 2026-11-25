@@ -24,7 +24,10 @@ use crate::query::Matcher;
 use crate::utils::Result;
 
 /// The memory the writer may use (tantivy flushes a segment when it has this much).
-const WRITER_MEMORY: usize = 100_000_000;
+const WRITER_MEMORY: usize = 300_000_000;
+
+/// The threads that index: one buffer of memory for each, and a thread with a small buffer makes thousands of tiny segments (and merges them again).
+const WRITER_THREADS: usize = 2;
 /// The prefixes of a word that `starts` has: from this many letters to the next constant.
 const START_MIN: usize = 3;
 const START_MAX: usize = 6;
@@ -34,7 +37,7 @@ const AUTHOR_BOOST: f32 = 8.0;
 /// What the score of the spelling of the query is multiplied by, against the other spellings of the same word.
 const OWN_SPELLING_BOOST: f32 = 1.5;
 /// The most words of a query that are joined as one word of a title (`rashou mon` is `rashoumon`).
-const MOST_JOINED: usize = 4;
+pub const MOST_JOINED: usize = 4;
 
 #[derive(Clone, Copy)]
 struct Fields {
@@ -42,6 +45,7 @@ struct Fields {
     words: Field,
     starts: Field,
     author: Field,
+    tag_ids: Field,
     rowid: Field,
 }
 
@@ -58,6 +62,10 @@ pub struct Doc<'a> {
     pub key: &'a str,
     pub romaji: &'a str,
     pub title: &'a str,
+    /// The uploader (lower case romaji; empty when none): searched like the author of the title.
+    pub uploader: &'a str,
+    /// The ids of its tags (`tags.id`).
+    pub tags: &'a [u64],
 }
 
 fn text(tokenizer: &str) -> TextOptions {
@@ -71,6 +79,7 @@ fn schema() -> (Schema, Fields) {
         words: builder.add_text_field("words", text("word")),
         starts: builder.add_text_field("starts", text("blank")),
         author: builder.add_text_field("author", text("ng3")),
+        tag_ids: builder.add_u64_field("tag_ids", INDEXED),
         rowid: builder.add_u64_field("rowid", INDEXED | FAST),
     };
 
@@ -112,7 +121,20 @@ impl TextIndex {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let (schema, fields) = schema();
-        let index = Index::open_or_create(MmapDirectory::open(dir)?, schema)?;
+        let index = match Index::open_or_create(MmapDirectory::open(dir)?, schema.clone()) {
+            Ok(index) => index,
+            // an index of an older version of the program has other fields: it is put aside (`<dir>.old`, deleted when the next one is put aside), and the
+            // store fills a new one from the table
+            Err(tantivy::TantivyError::SchemaError(why)) => {
+                let aside = dir.with_extension("old");
+                log::warn!("the text index in {} has another schema ({why}): it is moved to {} and made again", dir.display(), aside.display());
+                let _ = std::fs::remove_dir_all(&aside);
+                std::fs::rename(dir, &aside).map_err(|e| format!("cannot move {} to {}: {e}", dir.display(), aside.display()))?;
+                std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                Index::open_or_create(MmapDirectory::open(dir)?, schema)?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         Self::with(index, fields)
     }
@@ -127,7 +149,7 @@ impl TextIndex {
 
     fn with(index: Index, fields: Fields) -> Result<Self> {
         register(&index)?;
-        let writer = index.writer(WRITER_MEMORY)?;
+        let writer = index.writer_with_num_threads(WRITER_THREADS, WRITER_MEMORY)?;
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
 
         Ok(Self { index, reader, writer: Mutex::new(writer), fields })
@@ -151,13 +173,18 @@ impl TextIndex {
     fn document(&self, doc: &Doc) -> tantivy::TantivyDocument {
         let starts: Vec<String> = words_of(doc.romaji).flat_map(|word| starts_of(&word)).collect();
 
-        doc!(
+        let mut document = doc!(
             self.fields.key => doc.key,
             self.fields.words => doc.romaji,
             self.fields.starts => starts.join(" "),
-            self.fields.author => author_of(doc.title),
+            self.fields.author => format!("{} {}", author_of(doc.title), doc.uploader).trim().to_string(),
             self.fields.rowid => doc.rowid as u64
-        )
+        );
+        for id in doc.tags {
+            document.add_u64(self.fields.tag_ids, *id);
+        }
+
+        document
     }
 
     /// Puts the works in the index in place of the ones that have the same row numbers (`docs`), and takes out the works of `gone`. The
@@ -179,13 +206,25 @@ impl TextIndex {
         Ok(())
     }
 
-    /// Adds works that are not in the index (the first fill: no delete), and commits.
+    /// Adds works that are not in the index (the first fill: no delete) and commits.
     pub fn fill(&self, docs: &[Doc]) -> Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| "the index is poisoned")?;
+        self.add(docs)?;
+        self.commit()
+    }
+
+    /// Adds works that are not in the index, without a commit (the fill of a big table commits every few hundred thousand: a commit is a segment).
+    pub fn add(&self, docs: &[Doc]) -> Result<()> {
+        let writer = self.writer.lock().map_err(|_| "the index is poisoned")?;
 
         for doc in docs {
             writer.add_document(self.document(doc))?;
         }
+
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        let mut writer = self.writer.lock().map_err(|_| "the index is poisoned")?;
 
         writer.commit()?;
         self.reader.reload()?;
@@ -231,7 +270,7 @@ impl TextIndex {
 
     /// The query of a `Matcher`: every piece of its key (the trigrams) and every short word, and, to put the best answers first, the pieces that
     /// start a word of the title and the author that has all the pieces.
-    fn query(&self, matcher: &Matcher) -> Result<Box<dyn Query>> {
+    fn query_of(&self, matcher: &Matcher) -> Result<Box<dyn Query>> {
         let alts = |piece: &String| matcher.alts.get(piece).cloned().unwrap_or_default();
         let mut must: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut boost: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -271,16 +310,33 @@ impl TextIndex {
             boost.push((Occur::Should, Box::new(BoostQuery::new(Box::new(BooleanQuery::new(author)), AUTHOR_BOOST))));
         }
 
+        // the tags that the query names: a match adds the boost of the tag (its weight and its kind)
+        for &(id, milli) in &matcher.tag_boosts {
+            boost.push((Occur::Should, Box::new(BoostQuery::new(Box::new(TermQuery::new(Term::from_field_u64(self.fields.tag_ids, id), IndexRecordOption::Basic)), milli as f32 / 1000.0))));
+        }
+
         must.extend(boost);
 
         Ok(Box::new(BooleanQuery::new(must)))
     }
 
+    /// The query of several matchers (a query and its translation): a work that one of them finds, and the more of them, the higher the score. Each
+    /// has its weight (the query itself 1, its translation less).
+    fn query(&self, matchers: &[(&Matcher, f32)]) -> Result<Box<dyn Query>> {
+        let mut any: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        for &(matcher, weight) in matchers {
+            any.push((Occur::Should, Box::new(BoostQuery::new(self.query_of(matcher)?, weight))));
+        }
+
+        Ok(Box::new(BooleanQuery::new(any)))
+    }
+
     /// The row numbers of the works that the pieces find, the best first, `limit` of them after the first `offset`. The pieces of the key are
     /// found as trigrams: a work may have them apart (`Matcher::accepts` tells).
-    pub fn best(&self, matcher: &Matcher, offset: usize, limit: usize) -> Result<Vec<i64>> {
+    pub fn best(&self, matchers: &[(&Matcher, f32)], offset: usize, limit: usize) -> Result<Vec<i64>> {
         let searcher = self.reader.searcher();
-        let query = self.query(matcher)?;
+        let query = self.query(matchers)?;
         // the same score: the smaller row number (the work that was added first) first
         let collector = TopDocs::with_limit(limit.max(1)).and_offset(offset).tweak_score(move |reader: &SegmentReader| {
             let column = reader.fast_fields().u64("rowid").ok();
@@ -295,7 +351,7 @@ impl TextIndex {
     /// The row numbers of every work that the pieces find, the smallest first.
     pub fn all(&self, matcher: &Matcher) -> Result<Vec<i64>> {
         let searcher = self.reader.searcher();
-        let query = self.query(matcher)?;
+        let query = self.query(&[(matcher, 1.0)])?;
         let mut rows = Vec::new();
 
         let count = searcher.search(&*query, &tantivy::collector::Count)?;
@@ -321,7 +377,7 @@ mod tests {
 
     fn index(works: &[(i64, &str, &str)]) -> TextIndex {
         let index = TextIndex::in_ram().unwrap();
-        let docs: Vec<Doc> = works.iter().map(|&(rowid, title, romaji)| Doc { rowid, key: romaji, romaji, title }).collect();
+        let docs: Vec<Doc> = works.iter().map(|&(rowid, title, romaji)| Doc { rowid, key: romaji, romaji, title, uploader: "", tags: &[] }).collect();
         index.fill(&docs).unwrap();
         index
     }
@@ -330,7 +386,7 @@ mod tests {
     fn the_same_score_is_ordered_by_the_row_number() {
         let index = index(&[(5, "COMIC ExE one", "comicexeone"), (3, "COMIC ExE two", "comicexetwo"), (9, "COMIC ExE three", "comicexethree")]);
 
-        assert_eq!(index.best(&matcher(&["comic", "exe"], &[]), 0, 10).unwrap(), [3, 5, 9]);
+        assert_eq!(index.best(&[(&matcher(&["comic", "exe"], &[]), 1.0)], 0, 10).unwrap(), [3, 5, 9]);
     }
 
     #[test]
@@ -359,20 +415,55 @@ mod tests {
         ]);
 
         // the work 2 starts a word with the piece and is short
-        assert_eq!(index.best(&matcher(&["rashou"], &[]), 0, 10).unwrap(), [2, 1]);
+        assert_eq!(index.best(&[(&matcher(&["rashou"], &[]), 1.0)], 0, 10).unwrap(), [2, 1]);
         // the author is the query: it is first, though its title has nothing
-        let by_author = index.best(&matcher(&["rashou"], &[]), 0, 10);
+        let by_author = index.best(&[(&matcher(&["rashou"], &[]), 1.0)], 0, 10);
         assert!(by_author.is_ok());
+    }
+
+    #[test]
+    fn a_work_that_has_both_the_query_and_its_translation_comes_before_the_one_that_has_one() {
+        let index = index(&[(1, "a", "nine lives"), (2, "b", "kyuu no inochi"), (3, "c", "kyuu no inochi nine lives")]);
+        let (query, translation) = (matcher(&["kyuu", "inochi"], &[]), matcher(&["nine", "lives"], &[]));
+
+        // the query alone: 2 and 3; with its translation: 3 has both, then the query's, then the translation's
+        assert_eq!(index.best(&[(&query, 1.0), (&translation, 0.5)], 0, 10).unwrap(), [3, 2, 1]);
     }
 
     #[test]
     fn a_work_that_is_replaced_or_gone_is_not_found_by_what_it_had() {
         let index = index(&[(1, "a", "rashoumon")]);
-        index.replace(&[Doc { rowid: 1, key: "other", romaji: "other", title: "a" }], &[]).unwrap();
+        index.replace(&[Doc { rowid: 1, key: "other", romaji: "other", title: "a", uploader: "", tags: &[] }], &[]).unwrap();
         assert!(index.all(&matcher(&["rashou"], &[])).unwrap().is_empty());
         assert_eq!(index.all(&matcher(&["other"], &[])).unwrap(), [1]);
 
         index.replace(&[], &[1]).unwrap();
         assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn an_index_with_another_schema_is_put_aside_and_made_again() {
+        let dir = std::env::temp_dir().join(format!("okazuri-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.with_extension("old"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // an index of an older version: other fields
+        let mut builder = Schema::builder();
+        builder.add_text_field("key", text("ng3"));
+        builder.add_u64_field("rowid", INDEXED | FAST);
+        Index::create_in_dir(&dir, builder.build()).unwrap();
+
+        let index = TextIndex::open(&dir).unwrap();
+        assert_eq!(index.len(), 0);
+        assert!(dir.with_extension("old").join("meta.json").exists(), "the old index is kept beside");
+
+        index.fill(&[Doc { rowid: 1, key: "abc", romaji: "abc", title: "a", uploader: "", tags: &[7] }]).unwrap();
+        assert_eq!(index.len(), 1);
+        drop(index);
+        assert_eq!(TextIndex::open(&dir).unwrap().len(), 1, "the new one opens as it is");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.with_extension("old"));
     }
 }

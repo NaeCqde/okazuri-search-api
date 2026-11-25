@@ -19,7 +19,7 @@ use crate::cron::{parse_utc_offset, Minute, Schedule};
 use crate::engine::Engine;
 use crate::sites::{decode, Link, Site};
 use crate::utils::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -45,8 +45,8 @@ pub fn sources() -> Vec<(&'static str, Source)> {
 
     vec![
         ("Hitomi.La", Source::Hitomi),
-        ("momon:GA", Source::WordPress("https://momon-ga.com/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title".to_string())),
-        ("Nya:Hentai", Source::WordPress("https://nyahentai.one/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title".to_string())),
+        ("momon:GA", Source::WordPress("https://momon-ga.com/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
+        ("Nya:Hentai", Source::WordPress("https://nyahentai.one/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
         ("DLsite", pages("https://www.dlsite.com/books/fsr/=/language/jp/sex_category[0]/male/ana_flg/all/order/release_d/per_page/100/page/{n}/")),
         ("Wnacg", pages("https://www.wnacg.com/albums-index-page-{n}.html")),
         ("AsmHentai", pages("https://asmhentai.com/?page={n}")),
@@ -157,6 +157,8 @@ pub struct Crawler {
     ids: (Option<u64>, Option<u64>),
     schedule: Schedule,
     offset_seconds: i64,
+    /// The names of the tags of the WordPress sites, by the index of the site and the id of the tag: asked of the site once, kept in memory.
+    tag_names: std::sync::Mutex<HashMap<(usize, u64), String>>,
 }
 
 impl Crawler {
@@ -193,7 +195,7 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default() })
     }
 
     /// Walks every site, each in a task of its own, for as long as the server runs.
@@ -384,7 +386,8 @@ impl Crawler {
                     Err(e) => return Err(e),
                 };
 
-                let links = wordpress_links(site, &body)?;
+                let mut links = wordpress_links(site, &body)?;
+                self.name_tags(index, &body, &mut links).await;
                 let next = (!links.is_empty()).then(|| (number + shard.1).to_string());
 
                 Ok(Step { links, next })
@@ -483,6 +486,55 @@ impl Crawler {
     }
 }
 
+impl Crawler {
+    /// Puts the names of the tags on the links of a page of the WordPress API (the posts only have their ids). The name of an id is asked of the
+    /// site once (up to 100 ids in a request) and kept in memory; a failed request leaves the tags out, and the works are saved without them.
+    async fn name_tags(&self, index: usize, body: &str, links: &mut [Link]) {
+        let Ok(posts) = serde_json::from_str::<Vec<serde_json::Value>>(body) else { return };
+        let site = self.engine.site(index);
+        let ids_of = |post: &serde_json::Value| -> Vec<u64> { post.get("tags").and_then(|tags| tags.as_array()).map(|tags| tags.iter().filter_map(|id| id.as_u64()).collect()).unwrap_or_default() };
+        let unknown: Vec<u64> = {
+            let names = self.tag_names.lock().unwrap();
+            let mut ids: Vec<u64> = posts.iter().flat_map(ids_of).filter(|id| !names.contains_key(&(index, *id))).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        for chunk in unknown.chunks(100) {
+            let list: Vec<String> = chunk.iter().map(u64::to_string).collect();
+            let url = format!("{}/wp-json/wp/v2/tags?per_page=100&include={}&_fields=id,name", site.def.origin.trim_end_matches('/'), list.join(","));
+            let Ok((_, answer)) = self.engine.get_page(index, &url).await else { continue };
+            let Ok(found) = serde_json::from_str::<Vec<serde_json::Value>>(&answer) else { continue };
+            let mut names = self.tag_names.lock().unwrap();
+
+            for tag in found {
+                if let (Some(id), Some(name)) = (tag.get("id").and_then(|id| id.as_u64()), tag.get("name").and_then(|name| name.as_str())) {
+                    names.insert((index, id), decode(name).trim().to_lowercase());
+                }
+            }
+            // an id the site does not know is not asked again
+            for id in chunk {
+                names.entry((index, *id)).or_default();
+            }
+        }
+
+        let names = self.tag_names.lock().unwrap();
+        for link in links.iter_mut() {
+            let Some(post) = posts.iter().find(|post| post.get("link").and_then(|l| l.as_str()).and_then(|l| site.path_of(l)).is_some_and(|path| path == link.path)) else { continue };
+
+            for id in ids_of(post) {
+                if let Some(name) = names.get(&(index, id)).filter(|name| !name.is_empty()) {
+                    let tag = crate::sites::Tag::new(name.clone(), crate::sites::TagKind::Tag);
+                    if !link.extra.tags.contains(&tag) {
+                        link.extra.tags.push(tag);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The number of the page to read: the first page of this machine, or the one the cursor names.
 fn page_number(cursor: &str, shard: (u64, u64)) -> u64 {
     cursor.parse().unwrap_or(shard.0 + 1)
@@ -503,9 +555,28 @@ fn wordpress_links(site: &Site, body: &str) -> std::result::Result<Vec<Link>, St
             let path = site.path_of(post.get("link")?.as_str()?)?;
             let title = decode(post.get("title")?.get("rendered")?.as_str()?).trim().to_string();
 
-            (!title.is_empty()).then_some(Link { path, title })
+            let mut extra = crate::sites::Extra::default();
+            // `category-fanzine` and `parody-trickcal-revive` of the classes are tags (a number after the name is the id of a term the post only points at)
+            for class in post.get("class_list").and_then(|c| c.as_array()).into_iter().flatten().filter_map(|c| c.as_str()) {
+                if let Some(name) = class.strip_prefix("category-").or_else(|| class.strip_prefix("parody-")).filter(|name| !name.chars().all(|c| c.is_ascii_digit())) {
+                    extra.tags.push(crate::sites::Tag::new(name.replace('-', " "), crate::sites::TagKind::Tag));
+                }
+            }
+            extra.posted_at = post.get("date").and_then(|d| d.as_str()).and_then(wordpress_time);
+
+            (!title.is_empty()).then_some(Link { path, title, extra })
         })
         .collect())
+}
+
+/// `2026-11-25T05:35:44` (the time the site is in, which is not told: taken as UTC) as seconds since the epoch.
+fn wordpress_time(text: &str) -> Option<i64> {
+    let (date, time) = text.split_once('T')?;
+    let number = |part: Option<&str>| part?.parse::<i64>().ok();
+    let mut date = date.split('-');
+    let mut time = time.split(':');
+
+    Some(crate::sites::epoch(number(date.next())?, number(date.next())?, number(date.next())?, number(time.next())?, number(time.next())?))
 }
 
 fn unix_now() -> i64 {

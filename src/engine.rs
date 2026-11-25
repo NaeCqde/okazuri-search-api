@@ -29,6 +29,8 @@ use tokio::sync::{Mutex, Semaphore};
 /// never after more than the longest wait.
 /// An English text with fewer letters (squashed: no spaces or symbols) is not translated with the titles of Hitomi.La.
 const MIN_ENGLISH_KEY_CHARS: usize = 4;
+/// What the score of the works of the other title (the translation of the query) is multiplied by: a work that has the query itself comes first.
+const OTHER_TITLE_WEIGHT: f32 = 0.5;
 /// A Japanese text of no space and this many letters or less is one word (`is_one_word`).
 const ONE_WORD_JAPANESE_CHARS: usize = 5;
 const DEFAULT_RETRY_WAIT_SECS: u64 = 5;
@@ -75,6 +77,14 @@ struct Item {
     /// The index of its site (`Engine::sites`).
     site: u16,
     is_new: bool,
+}
+
+/// The other title of a request.
+struct OtherTitle {
+    text: String,
+    translated: Translated,
+    /// The other title is in Japanese (the query is not).
+    japanese: bool,
 }
 
 /// What the search before this one asked: the indexes (and which words), or the rows one by one.
@@ -549,7 +559,13 @@ impl Engine {
                 let title = crate::language::strip_flags(&link.title);
                 let converted = romaji(&title, &self.romanizer).unwrap_or_else(|_| title.clone());
 
-                NewWork { path: link.path, title, romaji: converted, language }
+                let mut extra = link.extra;
+                if !extra.is_empty() {
+                    // the uploader and the tags are romanized the same way, one line each
+                    extra.romaji = extra.texts().iter().map(|text| romaji(text, &self.romanizer).unwrap_or_else(|_| text.clone())).collect();
+                }
+
+                NewWork { path: link.path, title, romaji: converted, language, extra }
             })
             .collect()
     }
@@ -798,13 +814,71 @@ impl Engine {
     /// `search` with every work in `items`: the works of the English (or Japanese) title are in it, once.
     async fn search_all(self: &Arc<Self>, request: &Request<'_>) -> Result<Merged> {
         let mut laps = crate::utils::Laps::new();
-        let first = self.search_one(request, None).await?;
+
+        // the indexes answer a query and its other title as one search: the works of either, the best score first (a work that has both is the
+        // best, then the ones that have the query, then the ones that have only the other title)
+        if let Some(other) = self.other_title(request).await {
+            laps.lap("other title");
+
+            if self.indexable(request.query) && self.indexable(&other.text) {
+                let first = self.search_one(request, None, Some(&other.text)).await?;
+                laps.lap("search of both titles");
+                let mut merged = Merged { sets: vec![first.set], items: first.items, indexed: first.indexed, meta: first.meta };
+                if other.japanese {
+                    merged.meta.translation_ja = Some(other.translated);
+                } else {
+                    merged.meta.translation = Some(other.translated);
+                }
+                text_log!(info, "timing of the search of {:?} and its other title: {laps}", request.query; "timing of the search of both titles: {laps}");
+
+                return Ok(merged);
+            }
+        }
+
+        let first = self.search_one(request, None, None).await?;
         laps.lap("first search");
         let merged = Merged { sets: vec![first.set], items: first.items, indexed: first.indexed, meta: first.meta };
         let merged = self.search_all_more(request, merged, &mut laps).await;
         text_log!(info, "timing of the two searches of {:?}: {laps}", request.query; "timing of the two searches: {laps}");
 
         merged
+    }
+
+    /// Can the indexes answer the text (it has words of 3 characters or more, or letters)?
+    fn indexable(&self, text: &str) -> bool {
+        let Ok(plan) = self.plan(text) else { return false };
+
+        Terms::new(&plan.words).matcher().is_some() && !self.sites.iter().any(|site| site.def.name.chars().count() < 3)
+    }
+
+    /// The other title of a request: the Japanese title of a query that is not in Japanese, the English title of one that is. None when the
+    /// request does not translate, or the translation is the query itself.
+    async fn other_title(self: &Arc<Self>, request: &Request<'_>) -> Option<OtherTitle> {
+        if request.translator == Translator::None {
+            return None;
+        }
+
+        // a query without Japanese: its Japanese title is searched too (the same as the English title of a query in Japanese)
+        let (found, japanese) = if !crate::query::has_japanese(request.query) {
+            if !request.query.chars().any(|c| c.is_ascii_alphabetic()) {
+                return None;
+            }
+
+            let found = self.japanese_of(request.query, request.translator, request.live).await?;
+
+            (Translated { text: found.japanese.trim().to_string(), source: found.source }, true)
+        } else {
+            // a failure leaves the English search out, not the search
+            let found = self.english_of(request.query, request.translator, request.live).await?;
+
+            (Translated { text: found.english.trim().to_string(), source: found.source }, false)
+        };
+
+        if found.text.is_empty() || crate::hitomi::squash(&found.text) == crate::hitomi::squash(request.query) {
+            return None;
+        }
+
+        Some(OtherTitle { text: found.text.clone(), translated: found, japanese })
     }
 
     /// The search of the other title of a request (`search_all` does it for a query that is not in Japanese, and for one that is): the
@@ -815,7 +889,7 @@ impl Engine {
             indexed: merged.indexed,
             items: merged.items.len(),
         };
-        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after)).await {
+        match self.search_one(&Request { query: text, translator: Translator::None, ..*request }, Some(after), None).await {
             Ok(more) => {
                 // a work that is in the answer already (the same address) is not in it twice
                 let known: HashSet<(&str, &str)> = merged.items.iter().map(|item| self.address_of(&merged.sets, item)).collect();
@@ -849,50 +923,20 @@ impl Engine {
         (self.sites[item.site as usize].def.origin, sets[item.set as usize].works[item.index as usize].path.as_str())
     }
 
-    /// The rest of `search_all`: the other title is looked for, and searched.
+    /// The rest of `search_all` when the indexes cannot answer the query and its other title as one: the other title is searched, and its works are put
+    /// after the answer.
     async fn search_all_more(self: &Arc<Self>, request: &Request<'_>, mut merged: Merged, laps: &mut crate::utils::Laps) -> Result<Merged> {
-        if request.translator == Translator::None {
-            return Ok(merged);
-        }
+        let Some(other) = self.other_title(request).await else { return Ok(merged) };
+        laps.lap("other title");
 
-        // a query without Japanese: its Japanese title is searched too (the same as the English title of a query in Japanese)
-        if !crate::query::has_japanese(request.query) {
-            if !request.query.chars().any(|c| c.is_ascii_alphabetic()) {
-                return Ok(merged);
-            }
-
-            let found = self.japanese_of(request.query, request.translator, request.live).await;
-            laps.lap("japanese title");
-            let Some(found) = found else { return Ok(merged) };
-            let text = found.japanese.trim().to_string();
-
-            if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
-                return Ok(merged);
-            }
-
-            let searched = self.search_title(request, &text, &mut merged).await;
-            laps.lap("search of the Japanese title");
-            if searched {
-                merged.meta.translation_ja = Some(Translated { text, source: found.source });
-            }
-
-            return Ok(merged);
-        }
-
-        // the English title: its works are in the answer too. A failure leaves the English search out, not the search
-        let english = self.english_of(request.query, request.translator, request.live).await;
-        laps.lap("english title");
-        let Some(english) = english else { return Ok(merged) };
-        let text = english.english.trim().to_string();
-
-        if text.is_empty() || crate::hitomi::squash(&text) == crate::hitomi::squash(request.query) {
-            return Ok(merged);
-        }
-
-        let searched = self.search_title(request, &text, &mut merged).await;
-        laps.lap("search of the English title");
+        let searched = self.search_title(request, &other.text, &mut merged).await;
+        laps.lap("search of the other title");
         if searched {
-            merged.meta.translation = Some(Translated { text, source: english.source });
+            if other.japanese {
+                merged.meta.translation_ja = Some(other.translated);
+            } else {
+                merged.meta.translation = Some(other.translated);
+            }
         }
 
         Ok(merged)
@@ -900,7 +944,7 @@ impl Engine {
 
     /// The search of one query (`search` does it for the English title too). The works are places in the candidates (`items`); `meta.results`
     /// is empty.
-    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched>) -> Result<Lite> {
+    async fn search_one(self: &Arc<Self>, request: &Request<'_>, after: Option<Searched>, other: Option<&str>) -> Result<Lite> {
         let mut laps = crate::utils::Laps::new();
         let plan = self.plan(request.query)?;
         let terms = Terms::new(&plan.words);
@@ -925,6 +969,18 @@ impl Engine {
             Live::Force => self.fetch_with(request.query, true, exclude).await?,
         };
 
+        // the sites are asked for the other title too
+        let fetched = match (other, request.live) {
+            (Some(text), Live::Diff | Live::Force) => {
+                let mut fetched = fetched;
+                let more = self.fetch_with(text, request.live == Live::Force, exclude).await?;
+                fetched.asked.extend(more.asked);
+                fetched.new.extend(more.new);
+                fetched
+            }
+            _ => fetched,
+        };
+
         laps.lap("sites asked");
 
         // the indexes answer a search whose words they know (counts and the head of the answer in milliseconds); any other is read row by row.
@@ -938,9 +994,19 @@ impl Engine {
         if matcher.is_none() && after.as_ref().is_some_and(|after| after.indexed) {
             return Err("the indexes cannot answer the other title".into());
         }
+        // the other title as one search with the query (`search_all` checked that the indexes answer it)
+        let other_matcher = match other {
+            Some(text) => Some(Terms::new(&self.plan(text)?.words).matcher().ok_or("the indexes cannot answer the other title")?),
+            None => None,
+        };
 
         let (candidates, items, indexed, rows) = match &matcher {
-            Some(matcher) => self.indexed_items(request, matcher, after.as_ref(), &fetched).await?,
+            Some(matcher) => {
+                let mut matchers = vec![(matcher, 1.0_f32)];
+                matchers.extend(other_matcher.as_ref().map(|other| (other, OTHER_TITLE_WEIGHT)));
+
+                self.indexed_items(request, &matchers, after.as_ref(), &fetched).await?
+            }
             None => {
                 let (candidates, items) = self.scanned_items(&terms, &fetched).await?;
                 laps.lap("candidates and match");
@@ -1053,7 +1119,7 @@ impl Engine {
     async fn indexed_items(
         &self,
         request: &Request<'_>,
-        matcher: &crate::query::Matcher,
+        matchers: &[(&crate::query::Matcher, f32)],
         after: Option<&Searched>,
         fetched: &Fetched,
     ) -> Result<(Arc<Candidates>, Vec<Item>, bool, usize)> {
@@ -1070,7 +1136,7 @@ impl Engine {
             // the works of the earlier search that this one finds again are among the rows, so that many more are read
             // the index gives the best answers first (by score); the answer needs only `left + spare` of them
             let wanted = left + spare;
-            let found = self.store.top_found(matcher, wanted).await?;
+            let found = self.store.top_found(matchers, wanted).await?;
 
             for (name, mut row) in found.into_iter().take(wanted) {
                 // the work of a site that is not in the list (it was removed from the code) is not in the answer
@@ -2144,7 +2210,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_work_whose_romaji_changed_is_written_again_and_its_search_is_forgotten() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None };
+        let work = |path: &str, title: &str, romaji: &str| NewWork { path: path.into(), title: title.into(), romaji: romaji.into(), language: None, extra: Default::default() };
 
         // saved by an older version: the romaji of 彼女を was "kanojo wo"; the second work is the same as now
         store.save("q1", "Good", 7, &Ok(vec![work("/work/1", "彼女を", "kanojo wo")]), false).await.unwrap();
@@ -2155,7 +2221,7 @@ pub(crate) mod tests {
         assert_eq!(done, Reromanized { works: 2, changed: 1, forgotten: 1 });
         let saved = store.candidates_owned(&[]).await.unwrap();
         let one = saved.iter().find(|w| w.path == "/work/1").unwrap();
-        assert_eq!((one.title_romaji.as_str(), one.title_key.as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
+        assert_eq!((one.title_romaji.as_str(), crate::query::outside_key(&one.title_romaji).as_str(), one.updated_at), ("kanojo o", "kanojoo", 7));
         assert!(store.states("q1").await.unwrap().is_empty(), "the search that listed it is done again");
         assert!(!store.states("q2").await.unwrap().is_empty(), "the other one stays");
 
@@ -2168,7 +2234,7 @@ pub(crate) mod tests {
         let (engine, _, store) = setup(&config()).await;
 
         // an earlier search saved a work of the same words that this request will not find again
-        store.save("old", "Good", 1, &Ok(vec![NewWork { path: "/work/77".into(), title: "q earlier".into(), romaji: "q earlier".into(), language: None }]), false).await.unwrap();
+        store.save("old", "Good", 1, &Ok(vec![NewWork { path: "/work/77".into(), title: "q earlier".into(), romaji: "q earlier".into(), language: None, extra: Default::default() }]), false).await.unwrap();
 
         let outcome = engine.search(&Request::new("q")).await.unwrap();
         let by_path = |path: &str| outcome.results.iter().find(|h| h.path == path).map(|h| h.is_new);
@@ -2216,7 +2282,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_page_of_the_answer_is_a_part_of_the_whole_answer() {
         let (engine, _, _) = setup(&config()).await;
-        let works: Vec<NewWork> = (1..=7).map(|n| NewWork { path: format!("/work/{n}"), title: format!("Alpha {n}"), romaji: format!("alpha {n}"), language: None }).collect();
+        let works: Vec<NewWork> = (1..=7).map(|n| NewWork { path: format!("/work/{n}"), title: format!("Alpha {n}"), romaji: format!("alpha {n}"), language: None, extra: Default::default() }).collect();
         engine.store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
 
         let whole = engine.search(&Request { live: Live::Off, limit: 100, ..Request::new("alpha") }).await.unwrap();
@@ -2294,7 +2360,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_saved_work_answers_whatever_the_address_carries_besides_the_page() {
         let (engine, hits, _) = setup(&config()).await;
-        engine.store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/12".into(), title: "Saved title".into(), romaji: "saved title".into(), language: None }]), false).await.unwrap();
+        engine.store.save("q", "Good", 1, &Ok(vec![NewWork { path: "/work/12".into(), title: "Saved title".into(), romaji: "saved title".into(), language: None, extra: Default::default() }]), false).await.unwrap();
         let origin = engine.sites[0].search_url("q").unwrap().split("/ok").next().unwrap().to_string();
         let page = format!("{origin}/work/12");
 
@@ -2451,7 +2517,7 @@ pub(crate) mod tests {
             .filter(|w| {
                 words.iter().all(|word| {
                     if word.chars().count() >= 3 {
-                        w.title_key.contains(word.as_str())
+                        crate::query::outside_key(&w.title_romaji).contains(word.as_str())
                     } else {
                         w.title_romaji.split(|c: char| !c.is_ascii_alphanumeric()).any(|piece| piece == word)
                     }
@@ -2464,7 +2530,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_answers_that_start_words_come_before_the_ones_that_have_the_words_in_the_middle() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         // the first one has `rashou` and `mon` in the middle of its words, and is the first row
         let titles = ["Kimera Shoujo ga Hoshii Mono", "Rashoumon", "rashou mon", "Hoge Rashoumon no Hanashi"];
         let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(n, title)).collect();
@@ -2480,7 +2546,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_spellings_that_are_one_word_are_found_and_the_spelling_of_the_query_comes_first() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         let titles = ["Jinsei o Dainashi", "Jinsei wo Dainashi", "Jinsei Oneesan Dainashi", "Shimbun no Hanashi", "Shinbun no Hanashi"];
         let works: Vec<NewWork> = titles.iter().enumerate().map(|(n, title)| work(n, title)).collect();
         store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
@@ -2503,7 +2569,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_indexes_answer_as_the_words_are_defined() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |n: usize, title: &str| NewWork { path: format!("/work/{n}"), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         let titles = ["Maid ai", "work (COMIC kairakuten 2018 8)", "COMIC kairakuten 2026 11", "ai no uta", "main maid", "kairakuten (ai)", "tokyo kairakuten", "Maid kairakuten ai", "ai"];
 
         // the same titles on two sites
@@ -2567,18 +2633,18 @@ pub(crate) mod tests {
         // the romaji of the Japanese title is what is searched; one work has the English words, one the Japanese ones, one both
         let japanese = engine.plan("九つの命").unwrap().query;
         assert!(Terms::new(&japanese).matcher().is_some() && Terms::new("Nine Lives").matcher().is_some());
-        let work = |n: usize, romaji: String| NewWork { path: format!("/work/{n}"), title: romaji.clone(), romaji, language: None };
+        let work = |n: usize, romaji: String| NewWork { path: format!("/work/{n}"), title: romaji.clone(), romaji, language: None, extra: Default::default() };
         let works = vec![work(1, "nine lives one".into()), work(2, format!("{japanese} two")), work(3, format!("nine lives {japanese} three")), work(4, "other".into())];
         store.save("q", "Good", 1, &Ok(works), false).await.unwrap();
 
         let titles = |outcome: &Outcome| outcome.results.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
         let whole = engine.search(&Request { live: Live::Off, translator: Translator::Auto, ..Request::new("Nine Lives") }).await.unwrap();
-        // the English title's works (the best score first), and then the works of the Japanese title that are not in the answer yet
-        assert_eq!(titles(&whole), ["/work/1", "/work/3", "/work/2"]);
+        // one search of both titles: the work that has both first, then the work that has the query, then the one that has only the other title
+        assert_eq!(titles(&whole), ["/work/3", "/work/1", "/work/2"]);
         assert_eq!(whole.results.len(), 3, "the work of both titles is in the answer once");
 
         // a page that is cut inside the first title, and one that is cut at its end: the page says that the answer goes on
-        for (limit, expected) in [(1, vec!["/work/1"]), (2, vec!["/work/1", "/work/3"])] {
+        for (limit, expected) in [(1, vec!["/work/3"]), (2, vec!["/work/3", "/work/1"])] {
             let page = engine.search(&Request { live: Live::Off, translator: Translator::Auto, limit, ..Request::new("Nine Lives") }).await.unwrap();
             assert_eq!((titles(&page), page.has_more), (expected.into_iter().map(String::from).collect::<Vec<_>>(), true), "limit {limit}");
         }
@@ -2607,7 +2673,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_same_address_is_one_result() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: None, extra: Default::default() };
 
         // one page saved with and without the slash at the end, and a different page
         store.save("a", "Good", 1, &Ok(vec![work("/work/10/", "alpha one"), work("/work/11", "alpha two")]), false).await.unwrap();
@@ -2625,8 +2691,8 @@ pub(crate) mod tests {
         let (engine, _, store) = setup(&config()).await;
 
         // pages that are not the same page, as different queries find them
-        store.save("a", "Good", 1, &Ok(vec![NewWork { path: "/work/10".into(), title: "alpha beta one".into(), romaji: "alpha beta one".into(), language: None }]), false).await.unwrap();
-        store.save("b", "Good", 2, &Ok(vec![NewWork { path: "/work/11".into(), title: "gamma one".into(), romaji: "gamma one".into(), language: None }]), false).await.unwrap();
+        store.save("a", "Good", 1, &Ok(vec![NewWork { path: "/work/10".into(), title: "alpha beta one".into(), romaji: "alpha beta one".into(), language: None, extra: Default::default() }]), false).await.unwrap();
+        store.save("b", "Good", 2, &Ok(vec![NewWork { path: "/work/11".into(), title: "gamma one".into(), romaji: "gamma one".into(), language: None, extra: Default::default() }]), false).await.unwrap();
 
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("beta alpha") }).await.unwrap();
         assert_eq!(outcome.results.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["alpha beta one"], "any order");
@@ -2764,7 +2830,7 @@ pub(crate) mod tests {
     async fn a_title_that_has_the_query_in_parentheses_is_not_an_answer() {
         let (engine, _, store) = setup(&config()).await;
 
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: None };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.to_lowercase(), language: None, extra: Default::default() };
         store
             .save(
                 "q",
@@ -2882,7 +2948,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_saved_works_of_a_site_that_is_off_or_excluded_are_in_the_answer() {
         let (engine, _, store) = setup(&SearchConfig { disabled_sites: vec!["good".into()], ..config() }).await;
-        let work = |n: usize| NewWork { path: format!("/work/{n}"), title: format!("saved title {n}"), romaji: format!("saved title {n}"), language: None };
+        let work = |n: usize| NewWork { path: format!("/work/{n}"), title: format!("saved title {n}"), romaji: format!("saved title {n}"), language: None, extra: Default::default() };
         store.save("q", "Good", 1, &Ok(vec![work(1)]), false).await.unwrap();
         store.save("q", "Failing", 1, &Ok(vec![work(2)]), false).await.unwrap();
 
@@ -2945,7 +3011,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_language_of_a_result_is_a_list_and_empty_when_the_title_names_none() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title) };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title), extra: Default::default() };
 
         store.save_crawled("Good", 1, &[work("/work/1", "kanojo [CN,EN,JP,KR]"), work("/work/2", "kanojo plain")], None).await.unwrap();
         let outcome = engine.search(&Request { live: Live::Off, ..Request::new("kanojo") }).await.unwrap();
@@ -2959,7 +3025,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_english_title_of_a_result_is_the_title_a_pair_or_a_saved_translation_and_says_where_it_is_from() {
         let (engine, _, store) = setup(&config()).await;
-        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title) };
+        let work = |path: &str, title: &str| NewWork { path: path.into(), title: title.into(), romaji: title.into(), language: crate::language::detect(title), extra: Default::default() };
         let row = |english: &str, japanese: &str, source: &str| crate::entity::translation::Model {
             key: crate::hitomi::squash(japanese),
             gallery_id: 0,

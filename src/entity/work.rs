@@ -14,8 +14,6 @@ pub struct Model {
     pub title: String,
     /// Its romaji: what a query (which is always romaji) is matched with.
     pub title_romaji: String,
-    /// The romaji as it is compared (case, width and white space folded), to narrow a search in SQL.
-    pub title_key: String,
     pub first_seen: i64,
     pub updated_at: i64,
     /// The language the title says the work is in (`language.rs`): a two-letter code; NULL when the title says none.
@@ -25,6 +23,13 @@ pub struct Model {
     pub deleted: bool,
     /// When the page of the work was last looked at (`verify.rs`); NULL: never.
     pub checked_at: Option<i64>,
+    /// The ids (`tag.id`) of the tags the list page shows, in a line with a space between (` 12 45 `, a space at both ends so that `LIKE '% 12 %'` finds
+    /// an id); NULL when the site shows none.
+    pub tags: Option<String>,
+    /// The account that posted the work (`uploader.id` of this site), when the list page shows it.
+    pub uploader: Option<String>,
+    /// When the work was posted (seconds since the epoch, UTC), when the list page shows it.
+    pub posted_at: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

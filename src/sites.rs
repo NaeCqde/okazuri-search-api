@@ -12,6 +12,7 @@
 
 use crate::query::has_japanese;
 use regex::{Regex, RegexBuilder};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use url::Url;
 
@@ -439,6 +440,247 @@ pub struct Link {
     pub path: String,
     /// The title as the list page writes it.
     pub title: String,
+    /// What else the list page shows of the work (tags, uploader, posted date); empty when the site shows none.
+    pub extra: Extra,
+}
+
+/// What a list page shows of a work besides its title. Every part is optional: a site shows what it shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extra {
+    /// The tags, flat: the namespace of E-Hentai (`female:`) is dropped, the category (`Cosplay`) is a tag, the hashtags of other sites are tags.
+    pub tags: Vec<Tag>,
+    /// The account that posted the work (not its author: the artist and the circle are tags).
+    pub uploader: Option<Account>,
+    /// When the work was posted, in seconds since the epoch (UTC).
+    pub posted_at: Option<i64>,
+    /// The romaji of the tags and then of the name of the account (one line each, in this order), made with the title: what a query is matched with.
+    pub romaji: Vec<String>,
+}
+
+/// What a tag is (`tags.kind`): the score of a match depends on it (`store.rs`, `KIND_BOOST`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TagKind {
+    #[default]
+    Tag = 0,
+    /// The artist, the author.
+    Author = 1,
+    /// The circle, the group.
+    Circle = 2,
+    /// A tag the site shows as weak (E-Hentai's dotted tags: few votes).
+    Weak = 3,
+}
+
+impl TagKind {
+    pub fn code(self) -> i64 {
+        self as i64
+    }
+
+    /// The kind of a code (`tags.kind`); a code that is not known is a plain tag.
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            1 => Self::Author,
+            2 => Self::Circle,
+            3 => Self::Weak,
+            _ => Self::Tag,
+        }
+    }
+}
+
+/// A tag of a work: its name (flat, lower case) and what it is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tag {
+    pub name: String,
+    pub kind: TagKind,
+}
+
+impl Tag {
+    pub fn new(name: impl Into<String>, kind: TagKind) -> Self {
+        Self { name: name.into(), kind }
+    }
+}
+
+/// An account of a site (`entity/uploader.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// The id on the site.
+    pub id: String,
+    pub name: String,
+}
+
+impl Extra {
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.uploader.is_none() && self.posted_at.is_none()
+    }
+
+    /// The texts that are romanized: the tags, then the name of the account.
+    pub fn texts(&self) -> Vec<String> {
+        self.tags.iter().map(|tag| tag.name.clone()).chain(self.uploader.iter().map(|account| account.name.clone())).collect()
+    }
+}
+
+/// Seconds since the epoch of a date and a time (UTC, the civil calendar).
+pub fn epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64) -> i64 {
+    let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+
+    days * 86400 + hour * 3600 + minute * 60
+}
+
+/// The works of a DLsite list page, by product id: the circle (maker: the account, by its id on the site), the kind (CG・イラスト) and the age mark
+/// (全年齢) as tags. The list shows no date.
+fn dlsite_extras(html: &str) -> HashMap<String, Extra> {
+    static MAKER: OnceLock<Regex> = OnceLock::new();
+    static KIND: OnceLock<Regex> = OnceLock::new();
+    static MARK: OnceLock<Regex> = OnceLock::new();
+    let maker = MAKER.get_or_init(|| Regex::new(r#"(?s)class="maker_name">\s*<a href="[^"]*/maker_id/([A-Z0-9]+)\.html">([^<]+)</a>"#).unwrap());
+    let kind = KIND.get_or_init(|| Regex::new(r#"(?s)class="work_category[^"]*">\s*<a [^>]*>([^<]+)</a>"#).unwrap());
+    let mark = MARK.get_or_init(|| Regex::new(r#"<span class="icon_[A-Za-z]+" title="([^"]+)""#).unwrap());
+    let mut found = HashMap::new();
+
+    for item in html.split("<li data-list_item_product_id=\"").skip(1) {
+        let Some(id) = item.split('"').next().filter(|id| !id.is_empty()) else { continue };
+        let mut extra = Extra::default();
+
+        if let Some(c) = kind.captures(item) {
+            extra.tags.push(Tag::new(decode(c[1].trim()), TagKind::Tag));
+        }
+        for c in mark.captures_iter(item) {
+            let tag = Tag::new(decode(c[1].trim()), TagKind::Tag);
+            if !tag.name.is_empty() && !extra.tags.contains(&tag) {
+                extra.tags.push(tag);
+            }
+        }
+        if let Some(c) = maker.captures(item) {
+            let tag = Tag::new(decode(c[2].trim()), TagKind::Circle);
+            extra.tags.push(tag.clone());
+            extra.uploader = Some(Account { id: c[1].to_string(), name: tag.name });
+        }
+        if !extra.is_empty() {
+            found.insert(id.to_string(), extra);
+        }
+    }
+
+    found
+}
+
+/// The works of a HentaiEnvy list page, by gallery id: the category (`Artist CG`) as a tag and the time.
+fn hentaienvy_extras(html: &str) -> HashMap<String, Extra> {
+    static ID: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY: OnceLock<Regex> = OnceLock::new();
+    static TIME: OnceLock<Regex> = OnceLock::new();
+    let id = ID.get_or_init(|| Regex::new(r#"href="/gallery/(\d+)/""#).unwrap());
+    let category = CATEGORY.get_or_init(|| Regex::new(r#"hnv-gallery-card__category"[^>]*>([^<]+)</a>"#).unwrap());
+    let time = TIME.get_or_init(|| Regex::new(r#"<time datetime="(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)"#).unwrap());
+    let mut found = HashMap::new();
+
+    for card in html.split("<article class=\"hnv-gallery-card\"").skip(1) {
+        let Some(gallery) = id.captures(card).map(|c| c[1].to_string()) else { continue };
+        let mut extra = Extra::default();
+
+        if let Some(c) = category.captures(card) {
+            extra.tags.push(Tag::new(decode(c[1].trim()).to_lowercase(), TagKind::Tag));
+        }
+        extra.posted_at = time.captures(card).and_then(|c| {
+            let number = |n: usize| c[n].parse::<i64>().ok();
+            Some(epoch(number(1)?, number(2)?, number(3)?, number(4)?, number(5)?))
+        });
+        if !extra.is_empty() {
+            found.insert(gallery, extra);
+        }
+    }
+
+    found
+}
+
+/// The works of a Wnacg list page, by album id: the day it was created (`創建於2026-11-25`).
+fn wnacg_extras(html: &str) -> HashMap<String, Extra> {
+    static ITEM: OnceLock<Regex> = OnceLock::new();
+    let item = ITEM.get_or_init(|| Regex::new(r#"(?s)href="/photos-index-aid-(\d+)\.html".*?創建於(\d{4})-(\d\d)-(\d\d)"#).unwrap());
+    let mut found = HashMap::new();
+
+    for c in item.captures_iter(html) {
+        let number = |n: usize| c[n].parse::<i64>().ok();
+        if let (Some(y), Some(m), Some(d)) = (number(2), number(3), number(4)) {
+            found.entry(c[1].to_string()).or_insert_with(|| Extra { posted_at: Some(epoch(y, m, d, 0, 0)), ..Default::default() });
+        }
+    }
+
+    found
+}
+
+/// The works of a RokuHentai answer, by id: the time of a card (`Nov 24, 2026,  9:00 pm`).
+fn rokuhentai_extras(html: &str) -> HashMap<String, Extra> {
+    static CARD: OnceLock<Regex> = OnceLock::new();
+    let card = CARD.get_or_init(|| Regex::new(r#"(?s)id="site-manga-card-([a-z0-9]+)".*?([A-Z][a-z]{2}) (\d{1,2}), (\d{4}),\s+(\d{1,2}):(\d\d) ([ap])m"#).unwrap());
+    let mut found = HashMap::new();
+
+    for c in card.captures_iter(html) {
+        let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|name| *name == &c[2]).map(|m| m as i64 + 1);
+        let number = |n: usize| c[n].parse::<i64>().ok();
+        if let (Some(month), Some(day), Some(year), Some(hour), Some(minute)) = (month, number(3), number(4), number(5), number(6)) {
+            let hour = hour % 12 + if &c[7] == "p" { 12 } else { 0 };
+            found.entry(c[1].to_string()).or_insert_with(|| Extra { posted_at: Some(epoch(year, month, day, hour, minute)), ..Default::default() });
+        }
+    }
+
+    found
+}
+
+/// The works of an E-Hentai list page (the extended view the crawl reads), by gallery id: the category and the tags (flat), the uploader and the
+/// posted date, which the page shows for every row.
+fn ehentai_extras(html: &str) -> HashMap<String, Extra> {
+    static GID: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY: OnceLock<Regex> = OnceLock::new();
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    static UPLOADER: OnceLock<Regex> = OnceLock::new();
+    static POSTED: OnceLock<Regex> = OnceLock::new();
+    let gid = GID.get_or_init(|| Regex::new(r#"/g/(\d+)/"#).unwrap());
+    let category = CATEGORY.get_or_init(|| Regex::new(r#"<div class="cn c[a-z]+"[^>]*>([^<]+)</div>"#).unwrap());
+    let tag = TAG.get_or_init(|| Regex::new(r#"<div class="(gt[a-z]*)" title="([^"]+)""#).unwrap());
+    let uploader = UPLOADER.get_or_init(|| Regex::new(r#"/uploader/([^"/]+)">([^<]+)</a>"#).unwrap());
+    let posted = POSTED.get_or_init(|| Regex::new(r#"id="posted_\d+">(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)</div>"#).unwrap());
+    let mut found = HashMap::new();
+
+    for row in html.split("<tr>").skip(1) {
+        let Some(id) = gid.captures(row).map(|c| c[1].to_string()) else { continue };
+        let mut extra = Extra::default();
+
+        if let Some(c) = category.captures(row) {
+            extra.tags.push(Tag::new(decode(c[1].trim()).to_lowercase(), TagKind::Tag));
+        }
+        for c in tag.captures_iter(row) {
+            let label = decode(&c[2]);
+            // `female:big breasts` is `big breasts`; a tag that is the same twice (other namespaces) is kept once. `artist:` and `group:` say what
+            // the tag is, and a dotted tag (class `gtl`: few votes) is a weak one.
+            let (space, name) = label.split_once(':').unwrap_or(("", label.as_str()));
+            let kind = match space {
+                "artist" => TagKind::Author,
+                "group" => TagKind::Circle,
+                _ if &c[1] == "gtl" => TagKind::Weak,
+                _ => TagKind::Tag,
+            };
+            let tag = Tag::new(name.trim().to_lowercase(), kind);
+
+            if !tag.name.is_empty() && !extra.tags.contains(&tag) {
+                extra.tags.push(tag);
+            }
+        }
+        extra.uploader = uploader.captures(row).map(|c| Account { id: c[1].to_string(), name: decode(c[2].trim()) }).filter(|account| !account.name.is_empty());
+        extra.posted_at = posted.captures(row).and_then(|c| {
+            let number = |n: usize| c[n].parse::<i64>().ok();
+            let (year, month, day) = (number(1)?, number(2)?, number(3)?);
+            Some(epoch(year, month, day, number(4)?, number(5)?))
+        });
+
+        if !extra.is_empty() {
+            found.insert(id, extra);
+        }
+    }
+
+    found
 }
 
 impl Site {
@@ -591,7 +833,25 @@ impl Site {
                         known.path = path;
                     }
                 }
-                None => links.push(Link { path, title }),
+                None => links.push(Link { path, title, extra: Extra::default() }),
+            }
+        }
+
+        // what the list page shows besides the title, found by a part of the path of the work that names it
+        type Key = fn(&str) -> Option<String>;
+        let site_extras: Option<(HashMap<String, Extra>, Key)> = match self.def.name {
+            "EHentai" => Some((ehentai_extras(html), |path| path.split('/').filter(|part| !part.is_empty()).nth(1).map(str::to_string))),
+            "DLsite" => Some((dlsite_extras(html), |path| path.rsplit('/').next()?.strip_suffix(".html").map(str::to_string))),
+            "HentaiEnvy" => Some((hentaienvy_extras(html), |path| path.split('/').filter(|part| !part.is_empty()).nth(1).map(str::to_string))),
+            "Wnacg" => Some((wnacg_extras(html), |path| path.rsplit_once("aid-")?.1.strip_suffix(".html").map(str::to_string))),
+            "RokuHentai" => Some((rokuhentai_extras(html), |path| path.split('/').find(|part| !part.is_empty()).map(str::to_string))),
+            _ => None,
+        };
+        if let Some((mut extras, key)) = site_extras {
+            for link in &mut links {
+                if let Some(extra) = key(&link.path).and_then(|id| extras.remove(&id)) {
+                    link.extra = extra;
+                }
             }
         }
 
@@ -778,7 +1038,7 @@ mod tests {
     }
 
     fn link(path: &str, title: &str) -> Link {
-        Link { path: path.into(), title: title.into() }
+        Link { path: path.into(), title: title.into(), extra: Default::default() }
     }
 
     #[test]
@@ -997,5 +1257,68 @@ mod tests {
     fn character_references_are_decoded() {
         assert_eq!(decode("a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x3042;"), "a & b <c> \"d\" 'e' あ");
         assert_eq!(decode("&unknown; stays"), "&unknown; stays");
+    }
+
+    #[test]
+    fn an_ehentai_list_page_gives_the_category_the_tags_the_uploader_and_the_date() {
+        let html = r#"<table><tr><td class="gl1c glcat"><div class="cn cta" onclick="x">Cosplay</div></td><td class="gl2c"><div id="posted_3499941">2025-08-23 13:05</div></td><td class="gl3c glname"><a href="https://e-hentai.org/g/3499941/b977883039/"><div class="glink">[Reiki] To Grow</div><div><div class="gt" title="language:english">english</div><div class="gt" title="female:big ass">f:big ass</div><div class="gtl" title="other:glasses">glasses</div><div class="gt" title="male:big ass">m:big ass</div><div class="gt" title="artist:reiki">reiki</div></div></a></td><td class="gl4c glhide"><div><a href="https://e-hentai.org/uploader/masterreviewer1000">masterreviewer1000</a></div></td></tr></table>"#;
+        let site = Site::new(SITES.iter().find(|d| d.name == "EHentai").unwrap());
+        let links = site.extract("https://e-hentai.org/", html, 10);
+
+        assert_eq!(links.len(), 1);
+        let extra = &links[0].extra;
+        let names: Vec<(&str, TagKind)> = extra.tags.iter().map(|tag| (tag.name.as_str(), tag.kind)).collect();
+        assert_eq!(names, [("cosplay", TagKind::Tag), ("english", TagKind::Tag), ("big ass", TagKind::Tag), ("glasses", TagKind::Weak), ("reiki", TagKind::Author)], "flat, the category first, no repeats");
+        assert_eq!(extra.uploader, Some(Account { id: "masterreviewer1000".into(), name: "masterreviewer1000".into() }));
+        assert_eq!(extra.posted_at, Some(1_755_954_300), "2025-08-23 13:05 UTC");
+    }
+
+    #[test]
+    fn an_ehentai_row_with_no_tags_no_uploader_or_no_date_is_read() {
+        let site = Site::new(SITES.iter().find(|d| d.name == "EHentai").unwrap());
+        // the uploader is gone (no link), no tag, a date
+        let row = |inner: &str| format!(r#"<table><tr><td class="gl2c"><div id="posted_7">2025-01-02 03:04</div></td><td class="gl3c glname"><a href="https://e-hentai.org/g/7/abc/"><div class="glink">T</div>{inner}</a></td></tr></table>"#);
+        let links = site.extract("https://e-hentai.org/", &row(""), 10);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].extra.uploader, None);
+        assert!(links[0].extra.tags.is_empty());
+        assert_eq!(links[0].extra.posted_at, Some(epoch(2025, 1, 2, 3, 4)));
+
+        // nothing at all but the title: the work has an empty extra
+        let bare = r#"<table><tr><td class="gl3c glname"><a href="https://e-hentai.org/g/8/abc/"><div class="glink">T</div></a></td></tr></table>"#;
+        let links = site.extract("https://e-hentai.org/", bare, 10);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].extra.is_empty());
+    }
+
+    #[test]
+    fn the_list_pages_of_the_other_sites_give_what_they_show() {
+        let read = |name: &str, url: &str, html: &str| Site::new(SITES.iter().find(|d| d.name == name).unwrap()).extract(url, html, 10);
+
+        let dlsite = r#"<li data-list_item_product_id="RJ01592598" class="x"><dd class="work_category_free_sample"><div class="work_category type_ICG"><a href="https://www.dlsite.com/books/fsr/=/work_type/ICG">CG・イラスト</a></div></dd><dd class="work_name"><div class="multiline_truncate"><a href="https://www.dlsite.com/maniax/work/=/product_id/RJ01592598.html" title="作品">作品</a></div></dd><dd class="maker_name"><a href="https://www.dlsite.com/maniax/circle/profile/=/maker_id/RG01015077.html">ユメミ</a></dd><dd class="work_genre"><span class="icon_GEN" title="全年齢">全年齢</span></dd></li>"#;
+        let links = read("DLsite", "https://www.dlsite.com/books/fsr/", dlsite);
+        assert_eq!(links.len(), 1);
+        let names: Vec<(&str, i64)> = links[0].extra.tags.iter().map(|t| (t.name.as_str(), t.kind.code())).collect();
+        assert_eq!(names, [("CG・イラスト", 0), ("全年齢", 0), ("ユメミ", 2)]);
+        assert_eq!(links[0].extra.uploader, Some(Account { id: "RG01015077".into(), name: "ユメミ".into() }));
+
+        let envy = r#"<article class="hnv-gallery-card" data-tags="1"><a class="hnv-gallery-card__cover" href="/gallery/1654751/"></a><h2 class="hnv-gallery-card__title"><a href="/gallery/1654751/">[中村] Himari</a></h2><a class="hnv-gallery-card__category" href="/category/artist-cg/">Artist CG</a><time datetime="2026-11-24T21:05:00+00:00">1 hour ago</time></article>"#;
+        let links = read("HentaiEnvy", "https://hentaienvy.com/", envy);
+        assert_eq!(links[0].extra.tags, [Tag::new("artist cg", TagKind::Tag)]);
+        assert_eq!(links[0].extra.posted_at, Some(epoch(2026, 11, 24, 21, 5)));
+
+        let wnacg = r#"<li class="li gallary_item"><div class="pic_box"><a href="/photos-index-aid-407198.html" title="[A] B">x</a></div><div class="info"><div class="title"><a href="/photos-index-aid-407198.html" title="[A] B">[A] B</a></div><div class="info_col">76張圖片， 創建於2026-11-25</div></div></li>"#;
+        let links = read("Wnacg", "https://www.wnacg.com/albums-index-page-2.html", wnacg);
+        assert_eq!(links[0].extra.posted_at, Some(epoch(2026, 11, 25, 0, 0)));
+
+        let roku = r#"<div id="site-manga-card-gk7aha"><a href="https://rokuhentai.com/gk7aha/0"><div class="mdc-typography--body1 site-manga-card__title--primary">タイトル</div><div class="mdc-typography--caption">14 images <span></span> Nov 24, 2026,  9:00 pm</div></a></div>"#;
+        let links = read("RokuHentai", "https://rokuhentai.com/", roku);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].extra.posted_at, Some(epoch(2026, 11, 24, 21, 0)));
+
+        // the same pages without any of it: the works are still read
+        let links = read("Wnacg", "https://www.wnacg.com/albums-index-page-2.html", r#"<a href="/photos-index-aid-5.html" title="T">T</a>"#);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].extra.is_empty());
     }
 }
