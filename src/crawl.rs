@@ -159,6 +159,23 @@ pub struct Crawler {
     offset_seconds: i64,
     /// The names of the tags of the WordPress sites, by the index of the site and the id of the tag: asked of the site once, kept in memory.
     tag_names: std::sync::Mutex<HashMap<(usize, u64), String>>,
+    /// What is learned of the numbers of the tags of AsmHentai and HentaiEra, by the index of the site.
+    learners: std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<Learner>>>>,
+}
+
+/// How many pages of tags (`/tag/big-breasts/`) are read for each page of the list while a number that works carry has no name.
+const LEARN_PER_PAGE: usize = 3;
+
+/// The names of the numbers a site gives its tags (`data-tags="29 39"`). The site does not tell them: a page of one tag lists galleries that all
+/// carry its number, so the number that every card of the page has (and no name has yet) is the number of the tag. Only the numbers that the works
+/// read so far carry are looked for and kept.
+#[derive(Default)]
+struct Learner {
+    loaded: bool,
+    names: HashMap<(&'static str, u64), String>,
+    used: HashSet<(&'static str, u64)>,
+    /// By attribute: the next page of the listing, the slugs read from it and not asked yet, and whether the listing is read to its end.
+    queues: HashMap<&'static str, (u64, std::collections::VecDeque<String>, bool)>,
 }
 
 impl Crawler {
@@ -195,7 +212,7 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default() })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), learners: Default::default() })
     }
 
     /// Walks every site, each in a task of its own, for as long as the server runs.
@@ -400,7 +417,10 @@ impl Crawler {
                     Err(e) if e == "HTTP 404" && number > 1 => return Ok(Step { links: Vec::new(), next: None }),
                     Err(e) => return Err(e),
                 };
-                let links = site.read(&page_url, &body, MOST_LINKS)?;
+                let mut links = site.read(&page_url, &body, MOST_LINKS)?;
+                if matches!(site.def.name, "AsmHentai" | "HentaiEra") {
+                    self.name_cards(index, &body, &mut links).await;
+                }
                 let next = (!links.is_empty()).then(|| (number + shard.1).to_string());
 
                 Ok(Step { links, next })
@@ -487,6 +507,103 @@ impl Crawler {
 }
 
 impl Crawler {
+    /// Puts the tags, the artists and the groups on the links of a list page of AsmHentai or HentaiEra, which only carry numbers. A number whose
+    /// name is not learned yet is left out (the work is saved without it).
+    async fn name_cards(&self, index: usize, body: &str, links: &mut [Link]) {
+        let cards = crate::sites::card_ids(body);
+        let learner = self.learners.lock().unwrap().entry(index).or_default().clone();
+        let mut learner = learner.lock().await;
+        let website = self.engine.site(index).def.name;
+
+        if !learner.loaded {
+            learner.loaded = true;
+            for (attribute, id, name) in self.engine.store().site_tag_names(website).await.unwrap_or_default() {
+                if let Some((attribute, ..)) = crate::sites::CARD_ATTRIBUTES.iter().find(|(known, ..)| *known == attribute) {
+                    learner.names.insert((*attribute, id), name);
+                }
+            }
+        }
+        for (_, ids) in &cards {
+            learner.used.extend(ids.iter().copied());
+        }
+        for _ in 0..LEARN_PER_PAGE {
+            if !self.learn_one(index, &mut learner).await {
+                break;
+            }
+        }
+
+        for link in links.iter_mut() {
+            let Some(gallery) = link.path.split('/').find(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())) else { continue };
+            let Some((_, ids)) = cards.iter().find(|(id, _)| id == gallery) else { continue };
+
+            for (attribute, id) in ids {
+                let Some(name) = learner.names.get(&(*attribute, *id)) else { continue };
+                let kind = crate::sites::CARD_ATTRIBUTES.iter().find(|(known, ..)| known == attribute).map_or(crate::sites::TagKind::Tag, |entry| entry.3);
+                let tag = crate::sites::Tag::new(name.clone(), kind);
+                if !link.extra.tags.contains(&tag) {
+                    link.extra.tags.push(tag);
+                }
+            }
+        }
+    }
+
+    /// Reads one page of a tag (or artist, group, ...) to learn the number of it. False when there is nothing left to learn.
+    async fn learn_one(&self, index: usize, learner: &mut Learner) -> bool {
+        let site = self.engine.site(index);
+        let origin = site.def.origin.trim_end_matches('/').to_string();
+
+        // the attribute with the most numbers that works carry and that have no name yet
+        let wanted = crate::sites::CARD_ATTRIBUTES
+            .iter()
+            .filter(|(attribute, ..)| !learner.queues.get(attribute).is_some_and(|(_, slugs, done)| *done && slugs.is_empty()))
+            .map(|entry| (learner.used.iter().filter(|(a, id)| a == &entry.0 && !learner.names.contains_key(&(entry.0, *id))).count(), entry))
+            .filter(|(missing, _)| *missing > 0)
+            .max_by_key(|(missing, _)| *missing);
+        let Some((_, (attribute, list, word, _))) = wanted else { return false };
+        let queue = learner.queues.entry(attribute).or_insert((1, Default::default(), false));
+
+        if queue.1.is_empty() {
+            let url = format!("{origin}{list}?page={}", queue.0);
+            queue.0 += 1;
+            match self.engine.get_page(index, &url).await {
+                Ok((_, page)) => {
+                    let slugs = crate::sites::listed_slugs(&page, word);
+                    if slugs.is_empty() {
+                        queue.2 = true;
+                    }
+                    queue.1.extend(slugs);
+                }
+                Err(_) => queue.2 = true,
+            }
+            return true;
+        }
+
+        let Some(slug) = queue.1.pop_front() else { return true };
+        let Ok((_, page)) = self.engine.get_page(index, &format!("{origin}/{word}/{slug}/")).await else { return true };
+        let cards: Vec<Vec<u64>> = crate::sites::card_ids(&page).into_iter().map(|(_, ids)| ids.into_iter().filter(|(a, _)| a == attribute).map(|(_, id)| id).collect()).collect();
+
+        if cards.len() < 2 {
+            return true;
+        }
+        let mut common: HashSet<u64> = cards[0].iter().copied().collect();
+        for card in &cards[1..] {
+            common.retain(|id| card.contains(id));
+        }
+        common.retain(|id| !learner.names.contains_key(&(*attribute, *id)));
+
+        // the one number left is the tag's; a number that no work read carries is not kept
+        if let [id] = common.into_iter().collect::<Vec<_>>()[..] {
+            if learner.used.contains(&(*attribute, id)) {
+                let name = slug.replace('-', " ");
+                if self.engine.store().save_site_tag_name(site.def.name, attribute, id, &name).await.is_ok() {
+                    learner.names.insert((*attribute, id), name);
+                }
+            }
+        }
+
+        true
+    }
+
     /// Puts the names of the tags on the links of a page of the WordPress API (the posts only have their ids). The name of an id is asked of the
     /// site once (up to 100 ids in a request) and kept in memory; a failed request leaves the tags out, and the works are saved without them.
     async fn name_tags(&self, index: usize, body: &str, links: &mut [Link]) {
