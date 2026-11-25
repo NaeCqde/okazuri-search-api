@@ -1289,6 +1289,18 @@ impl SearchStore {
         Ok(names)
     }
 
+    /// The names of the numbers of every site (for `transfer export`): (website, attribute, id, name).
+    pub async fn all_site_tag_names(&self) -> Result<Vec<(String, String, u64, String)>> {
+        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT website, attribute, id, name FROM site_tag_names ORDER BY website, attribute, id")).await?;
+        let mut names = Vec::new();
+
+        for row in rows {
+            names.push((row.try_get::<String>("", "website")?, row.try_get::<String>("", "attribute")?, row.try_get::<i64>("", "id")? as u64, row.try_get::<String>("", "name")?));
+        }
+
+        Ok(names)
+    }
+
     /// Keeps the name of one number of a site.
     pub async fn save_site_tag_name(&self, website: &str, attribute: &str, id: u64, name: &str) -> Result<()> {
         self.db
