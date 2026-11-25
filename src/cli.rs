@@ -638,6 +638,7 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         romanizer: romanizer.clone(),
         max_query_chars: config.romaji.max_query_chars,
         search: engine.clone().filter(|_| !lean),
+        crawling: if config.crawl.enabled { crate::crawl::crawled_sites(&config.crawl) } else { Default::default() },
         mirror_path: (!lean && (config.magazine.enabled || config.magazine.mirror_path.exists())).then(|| config.magazine.mirror_path.clone()),
     });
 

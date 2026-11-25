@@ -23,8 +23,8 @@ pub enum Support {
     Ready,
     /// Answers with a Cloudflare challenge ("Just a moment..."), which needs a browser.
     Cloudflare,
-    /// The page is made by JavaScript, or the search is a POST with a token.
-    JavaScript,
+    /// The search needs an account: it is a POST with a token, or the site answers a guest with its own error page.
+    Account,
     /// The site is closed, or does not answer.
     Closed,
 }
@@ -34,7 +34,7 @@ impl Support {
         match self {
             Support::Ready => "ready",
             Support::Cloudflare => "cloudflare",
-            Support::JavaScript => "javascript",
+            Support::Account => "account",
             Support::Closed => "closed",
         }
     }
@@ -202,7 +202,7 @@ pub const SITES: &[SiteDef] = &[
         "https://www.anime-sharing.com",
         r"^https://www\.anime-sharing\.com/threads/.+",
         None,
-        Support::JavaScript,
+        Support::Account,
         "analysed (2026-10): the search is a POST with a token (XenForo), and the site answers a guest with its own 503 page, so it cannot be searched without logging in",
     ),
     SiteDef {
@@ -529,7 +529,7 @@ pub fn epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64) -> i64 {
     days * 86400 + hour * 3600 + minute * 60
 }
 
-/// The works of a DLsite list page, by product id: the circle (maker: the account, by its id on the site), the kind (CG・イラスト) and the age mark
+/// The works of a DLsite list page, by product id: the circle (maker, a tag), the kind (CG・イラスト) and the age mark
 /// (全年齢) as tags. The list shows no date.
 fn dlsite_extras(html: &str) -> HashMap<String, Extra> {
     static MAKER: OnceLock<Regex> = OnceLock::new();
@@ -554,9 +554,8 @@ fn dlsite_extras(html: &str) -> HashMap<String, Extra> {
             }
         }
         if let Some(c) = maker.captures(item) {
-            let tag = Tag::new(decode(c[2].trim()), TagKind::Circle);
-            extra.tags.push(tag.clone());
-            extra.uploader = Some(Account { id: c[1].to_string(), name: tag.name });
+            // the maker is the circle (or the artist), not the one who posted the work: it is a tag, and DLsite has no uploader
+            extra.tags.push(Tag::new(decode(c[2].trim()), TagKind::Circle));
         }
         if !extra.is_empty() {
             found.insert(id.to_string(), extra);
@@ -1395,7 +1394,7 @@ mod tests {
         assert_eq!(links.len(), 1);
         let names: Vec<(&str, i64)> = links[0].extra.tags.iter().map(|t| (t.name.as_str(), t.kind.code())).collect();
         assert_eq!(names, [("CG・イラスト", 0), ("全年齢", 0), ("ユメミ", 2)]);
-        assert_eq!(links[0].extra.uploader, Some(Account { id: "RG01015077".into(), name: "ユメミ".into() }));
+        assert_eq!(links[0].extra.uploader, None, "the maker is the circle, not an uploader");
 
         let envy = r#"<article class="hnv-gallery-card" data-tags="1"><a class="hnv-gallery-card__cover" href="/gallery/1654751/"></a><h2 class="hnv-gallery-card__title"><a href="/gallery/1654751/">[中村] Himari</a></h2><a class="hnv-gallery-card__category" href="/category/artist-cg/">Artist CG</a><time datetime="2026-11-24T21:05:00+00:00">1 hour ago</time></article>"#;
         let links = read("HentaiEnvy", "https://hentaienvy.com/", envy);
@@ -1422,7 +1421,7 @@ mod tests {
         let html = "<li\n    data-list_item_product_id=\"RJ01774529\"\n class=\"search_result_img_box_inner\"><dd class=\"work_category_free_sample\"><div class=\"work_category type_ICG\">\n<a href=\"https://www.dlsite.com/books/fsr/=/work_type/ICG\">CG・イラスト</a></div></dd><dd class=\"maker_name\">\n<a href=\"https://www.dlsite.com/aix/circle/profile/=/maker_id/RG01004518.html\">RELEASE SOFT</a></dd></li>";
         let extras = dlsite_extras(html);
 
-        assert_eq!(extras["RJ01774529"].uploader, Some(Account { id: "RG01004518".into(), name: "RELEASE SOFT".into() }));
+        assert_eq!(extras["RJ01774529"].uploader, None);
         assert_eq!(extras["RJ01774529"].tags.len(), 2);
     }
 

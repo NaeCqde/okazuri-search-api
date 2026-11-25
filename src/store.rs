@@ -354,6 +354,10 @@ impl SearchStore {
             db.execute_unprepared(sql).await?;
         }
 
+        // (after the triggers: the index takes the changed rows in) DLsite has no uploader: what was saved as one is the circle, which is a tag of the work (removed once the databases are migrated)
+        db.execute_unprepared("UPDATE works SET uploader = NULL WHERE website = 'DLsite' AND uploader IS NOT NULL").await?;
+        db.execute_unprepared("DELETE FROM uploaders WHERE website = 'DLsite'").await?;
+
         db.execute_unprepared(&format!("PRAGMA user_version = {INDEX_VERSION}")).await?;
 
         Ok(())
