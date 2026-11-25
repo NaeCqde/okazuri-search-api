@@ -40,6 +40,9 @@ const MAX_RETRY_WAIT_SECS: u64 = 30;
 /// prefetch leaves it out (a round would wait for it at every query). A request asks it like the others.
 const SLOW_SITE_MS: u64 = 10_000;
 
+/// The User-Agent of a plain client, for the sites that challenge the ones of browsers (`plain_agent`).
+const PLAIN_USER_AGENT: &str = "okazuri-search-api/1.0";
+
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -1360,7 +1363,7 @@ impl Engine {
         let mut found = Vec::new();
 
         for (index, site) in self.sites.iter().enumerate() {
-            if site.def.support == Support::Cloudflare {
+            if site.def.support == Support::Cloudflare || site.def.plain_agent {
                 found.push((site.def.name, self.get_page(index, site.def.origin).await.map(|(_, body)| body.len())));
             }
         }
@@ -1394,19 +1397,23 @@ impl Engine {
             self.wait_turn(index).await;
 
             let (client, passport_cookie) = self.client_of(site).await?;
-            // the headers a browser sends for a page: Cloudflare reads them with the TLS and HTTP/2 of the client
-            let mut request = client
-                .get(url)
-                .header("Accept-Language", "ja,en;q=0.8")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-                .header("Sec-CH-UA", "\"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\", \"Not-A.Brand\";v=\"24\"")
-                .header("Sec-CH-UA-Mobile", "?0")
-                .header("Sec-CH-UA-Platform", "\"Windows\"")
-                .header("Upgrade-Insecure-Requests", "1")
-                .header("Sec-Fetch-Dest", "document")
-                .header("Sec-Fetch-Mode", "navigate")
-                .header("Sec-Fetch-Site", "none")
-                .header("Sec-Fetch-User", "?1");
+            let mut request = client.get(url).header("Accept-Language", "ja,en;q=0.8");
+            request = if site.def.plain_agent {
+                // a browser's User-Agent is what this site's Cloudflare rule challenges
+                request.header("User-Agent", PLAIN_USER_AGENT).header("Accept", "text/html,*/*;q=0.8")
+            } else {
+                // the headers a browser sends for a page: Cloudflare reads them with the TLS and HTTP/2 of the client
+                request
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                    .header("Sec-CH-UA", "\"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\", \"Not-A.Brand\";v=\"24\"")
+                    .header("Sec-CH-UA-Mobile", "?0")
+                    .header("Sec-CH-UA-Platform", "\"Windows\"")
+                    .header("Upgrade-Insecure-Requests", "1")
+                    .header("Sec-Fetch-Dest", "document")
+                    .header("Sec-Fetch-Mode", "navigate")
+                    .header("Sec-Fetch-Site", "none")
+                    .header("Sec-Fetch-User", "?1")
+            };
             if let Some(cookie) = &passport_cookie {
                 request = request.header("Cookie", cookie.as_str());
             } else if let Some(cookie) = site.def.cookie {
@@ -2146,6 +2153,7 @@ pub(crate) mod tests {
             keep_times: false,
             support: Support::Ready,
             note: "",
+            plain_agent: false,
         }
     }
 

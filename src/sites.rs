@@ -122,6 +122,9 @@ pub struct SiteDef {
     pub keep_times: bool,
     pub support: Support,
     pub note: &'static str,
+    /// Cloudflare challenges a browser that is not one (HentaiName, checked 2026-11-26) but lets a plain client through: the pages
+    /// are asked with the User-Agent of this program and without the headers of a browser.
+    pub plain_agent: bool,
 }
 
 const AGE: &str = "adultchecked=1; age_check_done=1; nw=1; ckcy=1; is_intarnal=true";
@@ -151,6 +154,7 @@ const fn site(
         keep_times: false,
         support,
         note,
+        plain_agent: false,
     }
 }
 
@@ -374,15 +378,18 @@ pub const SITES: &[SiteDef] = &[
         Support::Ready,
         "the pages of albums are /photos-index-aid-N.html",
     ),
-    site(
-        "HentaiName",
-        false,
-        "https://www.hentai.name",
-        r"^https://www\.hentai\.name/[a-z]+/\d+.*",
-        None,
-        Support::Cloudflare,
-        "",
-    ),
+    SiteDef {
+        plain_agent: true,
+        ..site(
+            "HentaiName",
+            false,
+            "https://www.hentai.name",
+            r"^https://www\.hentai\.name/[a-z]+/\d+.*",
+            None,
+            Support::Cloudflare,
+            "Cloudflare challenges a browser's User-Agent here, not a plain client; there is no search page to ask yet",
+        )
+    },
     site(
         "HentaiDesi",
         false,
