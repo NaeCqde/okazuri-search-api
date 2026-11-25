@@ -1355,6 +1355,19 @@ impl Engine {
         site.read(&page_url, &body, self.config.max_results_per_site)
     }
 
+    /// Asks the top page of every site of Support::Cloudflare: its name and the size of the page, or why not (for `cloudflare-check`).
+    pub async fn check_cloudflare_sites(&self) -> Vec<(&'static str, std::result::Result<usize, String>)> {
+        let mut found = Vec::new();
+
+        for (index, site) in self.sites.iter().enumerate() {
+            if site.def.support == Support::Cloudflare {
+                found.push((site.def.name, self.get_page(index, site.def.origin).await.map(|(_, body)| body.len())));
+            }
+        }
+
+        found
+    }
+
     /// Is the site behind a Cloudflare challenge that `[cloudflare]` gets past?
     fn reads_through_cloudflare(&self, site: &Site) -> bool {
         site.def.support == Support::Cloudflare && self.cloudflare.is_some()
@@ -3138,12 +3151,8 @@ pub(crate) mod tests {
     #[ignore = "asks the real sites"]
     async fn live_cloudflare() {
         let engine = Engine::new(&config(), Arc::new(SearchStore::in_memory().await.unwrap()), crate::testing::romanizer_arc());
-        for (index, site) in engine.sites.iter().enumerate() {
-            if site.def.support != Support::Cloudflare {
-                continue;
-            }
-            let result = engine.get_page(index, site.def.origin).await;
-            println!("LIVE {} {}", site.def.name, match &result { Ok((_, body)) => format!("ok {} bytes", body.len()), Err(e) => e.clone() });
+        for (name, result) in engine.check_cloudflare_sites().await {
+            println!("LIVE {name} {result:?}");
         }
     }
 }

@@ -53,6 +53,9 @@ search <words>...                      Search the sites for the words (in romaji
 count <words>...                       Count the saved works whose title has all the words (the search itself only tells whether
                                        there is a next page), and how many each site has
     --config <path>      Config file
+cloudflare-check                       Ask the top page of each site behind Cloudflare, to see which ones this machine
+                                       gets through to
+    --config <path>      Config file
 stats                                  Print what the database holds: the works of each site (gone, not yet looked at by the
                                        verification), the crawl of each site, the translations by source. Safe while the server runs
     --config <path>      Config file
@@ -116,6 +119,7 @@ pub enum Command {
     Works { issue: String, config: Option<PathBuf> },
     Count { query: String, config: Option<PathBuf> },
     Stats { config: Option<PathBuf> },
+    CloudflareCheck { config: Option<PathBuf> },
     BuildIndex { config: Option<PathBuf> },
     DropLegacyIndex { config: Option<PathBuf> },
     Sync { config: Option<PathBuf> },
@@ -147,6 +151,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "works" => parse_works(rest),
         "count" => parse_count(rest),
         "stats" => parse_config_only(rest, "stats").map(|config| Command::Stats { config }),
+        "cloudflare-check" => parse_config_only(rest, "cloudflare-check").map(|config| Command::CloudflareCheck { config }),
         "build-index" => parse_config_only(rest, "build-index").map(|config| Command::BuildIndex { config }),
         "drop-legacy-index" => parse_config_only(rest, "drop-legacy-index").map(|config| Command::DropLegacyIndex { config }),
         "sync" => parse_sync(rest),
@@ -491,6 +496,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Works { issue, config } => works(issue, config).await,
         Command::Count { query, config } => count(query, config).await,
         Command::Stats { config } => stats(config).await,
+        Command::CloudflareCheck { config } => cloudflare_check(config).await,
         Command::BuildIndex { config } => build_index(config).await,
         Command::DropLegacyIndex { config } => drop_legacy_index(config).await,
         Command::Sync { config } => sync(config).await,
@@ -817,6 +823,22 @@ async fn title(urls: Vec<String>, live: Live, config: Option<PathBuf>) -> Result
             }
             Err(None) => println!("  unsupported website"),
             Err(Some(why)) => println!("  {why}"),
+        }
+    }
+
+    Ok(())
+}
+
+/// Asks the top page of each site behind Cloudflare, to see which ones this machine gets through to.
+async fn cloudflare_check(config: Option<PathBuf>) -> Result<()> {
+    let mut config = load(config).await?;
+    config.search.enabled = true;
+    let engine = open_engine(&config, Arc::new(Romanizer::new(&config.romaji.exceptions)?)).await?;
+
+    for (name, result) in engine.check_cloudflare_sites().await {
+        match result {
+            Ok(size) => println!("{name}: ok ({size} bytes)"),
+            Err(why) => println!("{name}: {why}"),
         }
     }
 
