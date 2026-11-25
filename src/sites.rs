@@ -540,7 +540,7 @@ fn dlsite_extras(html: &str) -> HashMap<String, Extra> {
     let mark = MARK.get_or_init(|| Regex::new(r#"<span class="icon_[A-Za-z]+" title="([^"]+)""#).unwrap());
     let mut found = HashMap::new();
 
-    for item in html.split("<li data-list_item_product_id=\"").skip(1) {
+    for item in html.split("data-list_item_product_id=\"").skip(1) {
         let Some(id) = item.split('"').next().filter(|id| !id.is_empty()) else { continue };
         let mut extra = Extra::default();
 
@@ -1320,5 +1320,14 @@ mod tests {
         let links = read("Wnacg", "https://www.wnacg.com/albums-index-page-2.html", r#"<a href="/photos-index-aid-5.html" title="T">T</a>"#);
         assert_eq!(links.len(), 1);
         assert!(links[0].extra.is_empty());
+    }
+
+    #[test]
+    fn a_dlsite_item_whose_li_breaks_the_line_before_its_attributes_is_read() {
+        let html = "<li\n    data-list_item_product_id=\"RJ01774529\"\n class=\"search_result_img_box_inner\"><dd class=\"work_category_free_sample\"><div class=\"work_category type_ICG\">\n<a href=\"https://www.dlsite.com/books/fsr/=/work_type/ICG\">CG・イラスト</a></div></dd><dd class=\"maker_name\">\n<a href=\"https://www.dlsite.com/aix/circle/profile/=/maker_id/RG01004518.html\">RELEASE SOFT</a></dd></li>";
+        let extras = dlsite_extras(html);
+
+        assert_eq!(extras["RJ01774529"].uploader, Some(Account { id: "RG01004518".into(), name: "RELEASE SOFT".into() }));
+        assert_eq!(extras["RJ01774529"].tags.len(), 2);
     }
 }
