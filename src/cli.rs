@@ -688,6 +688,11 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
             }
             tasks.push(tokio::spawn(crate::dist::work(engine.clone(), crawler, config.distribute.clone(), verified)));
         } else {
+            // the host reads pages too (as one of the workers)
+            if let Some(hub) = &hub {
+                let verified = verifier.as_ref().map(|verifier| verifier.site_names()).unwrap_or_default();
+                tasks.push(tokio::spawn(crate::dist::work_local(hub.clone(), engine.clone(), crawler.clone(), verified)));
+            }
             tasks.push(tokio::spawn(crawler.run()));
             if let Some(verifier) = verifier {
                 tasks.push(tokio::spawn(Arc::new(verifier).run()));
