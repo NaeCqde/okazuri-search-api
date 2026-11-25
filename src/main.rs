@@ -11,6 +11,7 @@ macro_rules! text_log {
 }
 
 mod api;
+mod cloudflare;
 mod cli;
 mod config;
 mod crawl;

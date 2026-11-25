@@ -226,7 +226,7 @@ Hitomi.La の保存済みの行と Google の保存済みの行は別です(`tra
 | JavaScript | Anime-Sharing(分析済み。下を見てください) |
 | 閉鎖 | MasDr、JMwu、BatoTo、HentaiDesi |
 
-検索できないサイトは対象から外します(`try_unsupported = true` なら試しますが、失敗します)。サイトは `src/sites.rs` の `SITES` の 1 項目で、
+検索できないサイトは対象から外します(Cloudflare のチャレンジの向こうのサイトは、`[cloudflare]` を有効にすると、サーバーが返すクッキーで読みます)。サイトは `src/sites.rs` の `SITES` の 1 項目で、
 `websites.ts` のパターン、`{q}` を含む検索 URL(`{q+}` は空白を `+` にします。DLsite はパスの `%20` に 403 を返します)、
 そして、タイトルがリンクのテキストではないときは、その場所(`TITLES`)から成ります。
 

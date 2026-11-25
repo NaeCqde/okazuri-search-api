@@ -112,7 +112,7 @@ GET /okazuri/title?url=https%3A%2F%2Fwww.dlsite.com%2Fbooks%2Fwork%2F%3D%2Fprodu
 `support` は `ready`、`cloudflare`(ブラウザが要るチャレンジ)、`account`(検索にアカウントが要る)、`closed` のどれかです。`japanese` は、そのサイトが
 日本語のタイトルで作品を見つけられるかどうかで、`true` なら、日本語を含むクエリを、書かれたとおりの形とローマ字の両方で尋ねます。
 `crawl` は、サイトの一覧を全件読むクロールの状態で、`complete`(最後まで読み終えた)、`running`(読んでいる途中)、`disabled`(読める一覧はあるが、`[crawl]` がオフ、または `[crawl] disabled_sites` で外している)、`unsupported`(読める一覧がない)のどれかです。
-`active` は、検索(`[search]` の `disabled_sites`、`try_unsupported`)がこのサイトに尋ねるか、または `support` が `ready` でクロール(`crawl` が `running` か `complete`)が生きているときに `true` です。`false` のサイトの保存済みの作品も、応答には入ります(尋ねたサイトの作品の後ろです)。
+`active` は、検索(`[search]` の `disabled_sites`)がこのサイトに尋ねるか、または `support` が `ready` でクロール(`crawl` が `running` か `complete`)が生きているときに `true` です。`false` のサイトの保存済みの作品も、応答には入ります(尋ねたサイトの作品の後ろです)。
 
 ## カタログの検索(`[magazine]`)
 

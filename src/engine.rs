@@ -433,6 +433,8 @@ pub struct Engine {
     delays: Vec<Duration>,
     store: Arc<SearchStore>,
     client: reqwest::Client,
+    /// The cookies of the sites behind a Cloudflare challenge (`[cloudflare]`).
+    cloudflare: Option<crate::cloudflare::Solver>,
     config: SearchConfig,
     permits: Semaphore,
     romanizer: Arc<Romanizer>,
@@ -450,12 +452,13 @@ impl Engine {
         romanizer: Arc<Romanizer>,
     ) -> Arc<Self> {
         let disabled: HashSet<String> = config.disabled_sites.iter().map(|n| n.to_lowercase()).collect();
+        // `[cloudflare]`: the sites behind a challenge are read with the cookie of the server of the cookies (a missing address is checked when the engine is opened)
+        let solver = crate::cloudflare::Solver::new(&config.cloudflare, Duration::from_secs(config.timeout_secs.max(1)), USER_AGENT).ok().flatten();
         let active: Vec<usize> = sites
             .iter()
             .enumerate()
             .filter(|(_, site)| {
-                let searchable = site.def.search.is_some()
-                    && (site.def.support == Support::Ready || config.try_unsupported);
+                let searchable = site.def.search.is_some() && (site.def.support == Support::Ready || (site.def.support == Support::Cloudflare && solver.is_some()));
 
                 searchable && !disabled.contains(&site.def.name.to_lowercase())
             })
@@ -482,6 +485,7 @@ impl Engine {
             order,
             store,
             client,
+            cloudflare: solver,
             config: config.clone(),
             permits: Semaphore::new(config.concurrency.max(1)),
             romanizer,
@@ -646,10 +650,10 @@ impl Engine {
                 SiteInfo {
                     name,
                     is_legal: site.def.legal,
-                    support: site.def.support.as_str(),
+                    support: if self.reads_through_cloudflare(site) { Support::Ready.as_str() } else { site.def.support.as_str() },
                     has_search: site.def.search.is_some(),
                     japanese: site.def.japanese,
-                    active: self.active.contains(&index) || (site.def.support == Support::Ready && matches!(crawl, "complete" | "running")),
+                    active: self.active.contains(&index) || ((site.def.support == Support::Ready || self.reads_through_cloudflare(site)) && matches!(crawl, "complete" | "running")),
                     crawl,
                     note: site.def.note,
                 }
@@ -1351,19 +1355,39 @@ impl Engine {
         site.read(&page_url, &body, self.config.max_results_per_site)
     }
 
+    /// Is the site behind a Cloudflare challenge that `[cloudflare]` gets past?
+    fn reads_through_cloudflare(&self, site: &Site) -> bool {
+        site.def.support == Support::Cloudflare && self.cloudflare.is_some()
+    }
+
+    /// The client to ask a site with, and the cookie it needs: the passport of `[cloudflare]` for a site behind a challenge, the plain client for the others.
+    async fn client_of(&self, site: &Site) -> std::result::Result<(reqwest::Client, Option<String>), String> {
+        match &self.cloudflare {
+            Some(solver) if site.def.support == Support::Cloudflare => {
+                let (client, cookie) = solver.client_for(site.def.origin).await?;
+                Ok((client, Some(cookie)))
+            }
+            _ => Ok((self.client.clone(), None)),
+        }
+    }
+
     /// A page of a site (the address it ended at, and its text), after the turn of the site. A 429 is waited for once. A
     /// Cloudflare challenge and any status but 200 are errors.
     pub(crate) async fn get_page(&self, index: usize, url: &str) -> std::result::Result<(String, String), String> {
         let site = &self.sites[index];
         let mut asked_again = false;
+        let mut renewed = false;
         let (status, page_url, body) = loop {
             self.wait_turn(index).await;
 
-            let mut request = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").header(
+            let (client, passport_cookie) = self.client_of(site).await?;
+            let mut request = client.get(url).header("Accept-Language", "ja,en;q=0.8").header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             );
-            if let Some(cookie) = site.def.cookie {
+            if let Some(cookie) = &passport_cookie {
+                request = request.header("Cookie", cookie.as_str());
+            } else if let Some(cookie) = site.def.cookie {
                 request = request.header("Cookie", cookie);
             }
 
@@ -1390,6 +1414,16 @@ impl Engine {
             let page_url = response.url().to_string();
             let bytes = response.bytes().await.map_err(|e| e.without_url().to_string())?;
 
+            // Cloudflare turned the page away although the cookie was sent: the passport is old, the server of the cookies is asked for a new one (once)
+            if passport_cookie.is_some() && !renewed && matches!(status, 403 | 429 | 503) {
+                if let Some(solver) = &self.cloudflare {
+                    log::debug!("search {}: HTTP {status} with the cookie of [cloudflare], asking for a new one", site.def.name);
+                    solver.forget(site.def.origin).await;
+                    renewed = true;
+                    continue;
+                }
+            }
+
             break (status, page_url, String::from_utf8_lossy(&bytes).into_owned());
         };
 
@@ -1414,7 +1448,12 @@ impl Engine {
     pub(crate) async fn probe(&self, index: usize, url: &str, rule: GoneRule) -> Option<bool> {
         self.wait_turn(index).await;
 
-        let response = self.client.get(url).header("Accept-Language", "ja,en;q=0.8").send().await.ok()?;
+        let (client, passport_cookie) = self.client_of(&self.sites[index]).await.ok()?;
+        let mut request = client.get(url).header("Accept-Language", "ja,en;q=0.8");
+        if let Some(cookie) = &passport_cookie {
+            request = request.header("Cookie", cookie.as_str());
+        }
+        let response = request.send().await.ok()?;
         let status = response.status().as_u16();
         let final_path = response.url().path().to_string();
         let body = response.text().await.ok()?;
@@ -2903,13 +2942,17 @@ pub(crate) mod tests {
         assert!(info.iter().any(|s| s.name == "IMHentai" && !s.active && s.support == "cloudflare"));
         assert!(info.iter().find(|s| s.name == "Hitomi.La").unwrap().active, "it is searched through its index files");
 
-        let trying = Engine::new(
-            &SearchConfig { try_unsupported: true, ..config() },
+        // [cloudflare] is on: the sites behind a challenge are read, so they are "ready" and searched
+        let through = Engine::new(
+            &SearchConfig { cloudflare: crate::config::CloudflareConfig { enabled: true, api: "http://127.0.0.1:1/".into(), cache_minutes: 30 }, ..config() },
             Arc::new(SearchStore::in_memory().await.unwrap()),
             crate::testing::romanizer_arc(),
         );
-        assert!(trying.sites_info(&Default::default(), &Default::default()).iter().find(|s| s.name == "IMHentai").unwrap().active);
-        assert!(!trying.sites_info(&Default::default(), &Default::default()).iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
+        let info = through.sites_info(&Default::default(), &Default::default());
+        let imhentai = info.iter().find(|s| s.name == "IMHentai").unwrap();
+        assert!(imhentai.active && imhentai.support == "ready");
+        assert!(!info.iter().find(|s| s.name == "NijiGazo").unwrap().active, "no search URL");
+        assert!(info.iter().find(|s| s.name == "Anime-Sharing").is_some_and(|s| !s.active && s.support == "account"), "an account is not a cookie");
     }
 
     #[test]

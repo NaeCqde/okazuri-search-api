@@ -80,8 +80,6 @@ skip_crawled = true
 # it grows or is replaced by another file (its inode changes). It needs the right to lock that much memory: in Docker, `cap_add: [IPC_LOCK]` and `ulimits: memlock: {soft: -1, hard: -1}`;
 # without it the server only warns and goes on. Unix only.
 pin_db = false
-# Also try the sites that cannot be searched with a plain request (Cloudflare challenge, JavaScript). They fail.
-try_unsupported = false
 # A copy of the magazine tables (magazines, numbers, authors and works) of the Worker's D1 database. The server asks D1 whether
 # the data changed (the Time Travel bookmark: no rows are read), and when it did, downloads the SQL that D1
 # exports for those tables and loads it into the second SQLite file. The whole database cannot be exported
@@ -205,6 +203,15 @@ sites = []
 interval_days = 30
 # A site is never asked two pages closer than this, so a site with more works than interval_days allows is looked at over more days.
 min_pause_ms = 5000
+
+# The sites behind a Cloudflare challenge (support "cloudflare" in GET /okazuri/sites) are read like the others when this is on: the server at `api` is
+# asked `GET {api}?url=https://the-site` and answers the cookie that gets past the challenge, the User-Agent the cookie was made with and the address of the proxy
+# it was made behind (null for none): {"cookie": "cf_clearance=...", "user_agent": "Mozilla/5.0 ...", "proxy": null}. The site then answers as "ready".
+[cloudflare]
+enabled = false
+api = ""
+# How long an answer is kept (a page that Cloudflare still turns away makes the server ask for a new one once).
+cache_minutes = 30
 
 # Handing the reading of the sites to other machines (dist.rs). The host (the server that keeps the database) cuts the crawl and the
 # verification into jobs; each worker (a machine with an IP address of its own, with [crawl] and [crawl.verify] on and its own small database)
