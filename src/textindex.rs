@@ -24,7 +24,10 @@ use crate::query::Matcher;
 use crate::utils::Result;
 
 /// The memory the writer may use (tantivy flushes a segment when it has this much).
-const WRITER_MEMORY: usize = 100_000_000;
+const WRITER_MEMORY: usize = 300_000_000;
+
+/// The threads that index: one buffer of memory for each, and a thread with a small buffer makes thousands of tiny segments (and merges them again).
+const WRITER_THREADS: usize = 2;
 /// The prefixes of a word that `starts` has: from this many letters to the next constant.
 const START_MIN: usize = 3;
 const START_MAX: usize = 6;
@@ -146,7 +149,7 @@ impl TextIndex {
 
     fn with(index: Index, fields: Fields) -> Result<Self> {
         register(&index)?;
-        let writer = index.writer(WRITER_MEMORY)?;
+        let writer = index.writer_with_num_threads(WRITER_THREADS, WRITER_MEMORY)?;
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
 
         Ok(Self { index, reader, writer: Mutex::new(writer), fields })
@@ -203,13 +206,25 @@ impl TextIndex {
         Ok(())
     }
 
-    /// Adds works that are not in the index (the first fill: no delete), and commits.
+    /// Adds works that are not in the index (the first fill: no delete) and commits.
     pub fn fill(&self, docs: &[Doc]) -> Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| "the index is poisoned")?;
+        self.add(docs)?;
+        self.commit()
+    }
+
+    /// Adds works that are not in the index, without a commit (the fill of a big table commits every few hundred thousand: a commit is a segment).
+    pub fn add(&self, docs: &[Doc]) -> Result<()> {
+        let writer = self.writer.lock().map_err(|_| "the index is poisoned")?;
 
         for doc in docs {
             writer.add_document(self.document(doc))?;
         }
+
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        let mut writer = self.writer.lock().map_err(|_| "the index is poisoned")?;
 
         writer.commit()?;
         self.reader.reload()?;

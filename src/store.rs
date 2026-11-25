@@ -68,6 +68,9 @@ const INDEX_VERSION: i64 = 2;
 /// How many works are put in the text index at a time.
 const INDEX_FILL_CHUNK: i64 = 50_000;
 
+/// The text index is committed after about this many works of a fill.
+const FILL_COMMIT_EVERY: u64 = 1_000_000;
+
 /// The candidates of the words asked lately (`SearchStore::candidates`), the oldest first.
 /// A work the index found, with its row number.
 #[derive(Debug, sea_orm::FromQueryResult)]
@@ -394,9 +397,13 @@ impl SearchStore {
                 .collect::<Result<_>>()?;
             let keys = self.keys_of(&rows).await?;
             let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader, tags))| Doc { rowid: *rowid, key, romaji, title, uploader, tags }).collect();
-            self.text.fill(&docs)?;
+            self.text.add(&docs)?;
             filled += docs.len() as u64;
+            if filled % FILL_COMMIT_EVERY < INDEX_FILL_CHUNK as u64 {
+                self.text.commit()?;
+            }
         }
+        self.text.commit()?;
 
         if let Some(last) = last {
             self.db.execute(Statement::from_sql_and_values(self.db.get_database_backend(), "DELETE FROM index_queue WHERE seq <= ?", [last.into()])).await?;
