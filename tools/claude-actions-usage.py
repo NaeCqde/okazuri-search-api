@@ -87,7 +87,8 @@ def run_cost(repo, run_id):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--owner", help="whose repositories (default: the logged in user)")
+    parser.add_argument("--owner", help="whose repositories (default: the logged in user); private ones are included when the token of gh can read them")
+    parser.add_argument("--orgs", action="store_true", help="also the repositories of the organizations that the user belongs to")
     parser.add_argument("--repos", nargs="*", help="only these repositories (owner/name)")
     parser.add_argument("--since", help="ISO time, e.g. 2026-11-22T03:00:00Z (default: 7 days ago)")
     parser.add_argument("--workers", type=int, default=8, help="logs read at the same time")
@@ -96,7 +97,8 @@ def main():
 
     since = args.since or (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
     owner = args.owner or gh("api", "user", "--jq", ".login").strip()
-    repos = args.repos or repositories(owner)
+    owners = [owner] + (gh("api", "user/orgs", "--jq", ".[].login").split() if args.orgs else [])
+    repos = args.repos or [repo for name in owners for repo in repositories(name)]
 
     jobs = []  # (repo, run id)
     per_repo = {}
@@ -128,7 +130,7 @@ def main():
         print(json.dumps({"since": since, "repositories": per_repo, "total": total}, indent=2))
         return
 
-    print(f"Claude steps of GitHub Actions since {since} ({owner})\n")
+    print("Claude steps of GitHub Actions since " + since + " (" + ", ".join(owners) + ")\n")
     print(f"{'repository':42} {'runs':>5} {'calls':>6} {'turns':>6} {'minutes':>8} {'USD*':>8}")
     for repo, row in sorted(per_repo.items(), key=lambda item: -item[1]["cost_usd"]):
         print(f"{repo:42} {row['runs']:5} {row['claude_calls']:6} {row['turns']:6} {row['seconds'] / 60:8.1f} {row['cost_usd']:8.2f}")
