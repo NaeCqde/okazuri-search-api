@@ -2,7 +2,7 @@
 //!
 //! A site sees one IP address asking for its pages, and answers a limited number of them. The host (the server that keeps the database) cuts the
 //! work into jobs, and each worker (a machine with an address of its own) asks the sites and gives the answer back:
-//! - a **step** is some pages of a list of the crawl, as many as it takes to have `limit` works (`Crawler::step_local`): the host gets the links and saves the works;
+//! - a **step** is some pages of a list of the crawl, `pages` of them (`Crawler::step_local`): the host gets the links and saves the works;
 //! - a **probe** is a batch of pages of saved works that are looked at for the sign that the work is gone (`Engine::probe`): the host records them.
 //!
 //! The workers keep no state of the crawl: the host has the cursors and the database. A worker asks the host for a job (`GET /dist/claim`,
@@ -36,8 +36,8 @@ const LONG_POLL: Duration = Duration::from_secs(25);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
     /// One page of the list of a site: the cursor, the shard and the ids of E-Hentai (`lo`, `hi`) of the part that is read.
-    /// `limit` works are read before the answer (some pages, 0 is one page).
-    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] limit: usize, #[serde(default)] seconds: u64 },
+    /// `pages` pages are read before the answer (0 is one page).
+    Step { cursor: String, shard: (u64, u64), ids: (Option<u64>, Option<u64>), #[serde(default)] pages: usize, #[serde(default)] seconds: u64 },
     /// Pages of saved works to look at, `spacing_ms` apart.
     Probe { paths: Vec<String>, spacing_ms: u64 },
 }
@@ -260,7 +260,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
         let (Some(id), Some(job)) = (claimed.get("id").and_then(|id| id.as_u64()), claimed.get("job").and_then(|job| serde_json::from_value::<Job>(job.clone()).ok())) else { continue };
 
         let what = match &job {
-            Job::Step { cursor, shard, limit, .. } => format!("step of {limit} works of part {}/{} from {cursor:?}", shard.0, shard.1),
+            Job::Step { cursor, shard, pages, .. } => format!("step of {pages} pages of part {}/{} from {cursor:?}", shard.0, shard.1),
             Job::Probe { paths, .. } => format!("probe of {} pages", paths.len()),
         };
         let started = std::time::Instant::now();
@@ -283,7 +283,7 @@ async fn worker_loop(engine: Arc<Engine>, crawler: Arc<Crawler>, config: Distrib
 
 async fn run(engine: &Arc<Engine>, crawler: &Arc<Crawler>, site: &str, job: Job) -> Done {
     match job {
-        Job::Step { cursor, shard, ids, limit, seconds } => Done::Step(crawler.step_local(site, &cursor, shard, ids, limit, seconds).await),
+        Job::Step { cursor, shard, ids, pages, seconds } => Done::Step(crawler.step_local(site, &cursor, shard, ids, pages, seconds).await),
         Job::Probe { paths, spacing_ms } => Done::Probe(probe(engine, site, paths, Duration::from_millis(spacing_ms)).await),
     }
 }
