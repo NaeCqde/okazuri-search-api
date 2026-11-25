@@ -25,7 +25,7 @@ pub struct Verifier {
 }
 
 /// Every site that has a rule, by name.
-const NAMES: &[&str] = &["RokuHentai", "DLsite", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy"];
+const NAMES: &[&str] = &["RokuHentai", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy"];
 
 impl Verifier {
     /// An unknown site, or one whose pages do not tell, is an error.

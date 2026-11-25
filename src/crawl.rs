@@ -44,6 +44,21 @@ pub enum Source {
 }
 
 /// The lists of the sites (checked in 2026-11). A site that is not here has no list that can be read: it is only searched.
+/// Does `[crawl] sites` (empty: every site) name the site?
+fn is_wanted(config: &CrawlConfig, name: &str) -> bool {
+    config.sites.is_empty() || config.sites.iter().any(|wanted| wanted.eq_ignore_ascii_case(name))
+}
+
+/// The names (lower case) of the sites that a crawl with this `[crawl]` reads.
+pub fn crawled_sites(config: &CrawlConfig) -> HashSet<String> {
+    sources()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| is_wanted(config, name) && !config.disabled_sites.iter().any(|off| off.eq_ignore_ascii_case(name)))
+        .map(str::to_lowercase)
+        .collect()
+}
+
 pub fn sources() -> Vec<(&'static str, Source)> {
     let pages = |template: &str| Source::Pages(template.to_string());
 
@@ -279,12 +294,11 @@ impl Crawler {
             }
         }
 
-        let wanted: HashSet<String> = config.sites.iter().map(|name| name.to_lowercase()).collect();
         let off: HashSet<String> = config.disabled_sites.iter().map(|name| name.to_lowercase()).collect();
         let mut chosen = Vec::new();
 
         for (name, source) in sources {
-            if !wanted.is_empty() && !wanted.contains(&name.to_lowercase()) {
+            if !is_wanted(&config, &name) {
                 continue;
             }
             match engine.site_named(&name) {

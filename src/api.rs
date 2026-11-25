@@ -36,6 +36,8 @@ pub struct AppState {
     pub search: Option<Arc<Engine>>,
     /// The copy of the Worker's D1 database (`[magazine] mirror_path`); `None` when `[magazine]` is off and there is no file.
     pub mirror_path: Option<std::path::PathBuf>,
+    /// The names (lower case) of the sites that the crawl of this server reads (`[crawl]`), for `GET /okazuri/sites`.
+    pub crawling: std::collections::HashSet<String>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -510,7 +512,15 @@ async fn issue_works(State(state): State<Arc<AppState>>, Query(params): Query<Ma
 async fn sites(State(state): State<Arc<AppState>>) -> Response {
     let Some(engine) = &state.search else { return StatusCode::NOT_FOUND.into_response() };
 
-    json(StatusCode::OK, &engine.sites_info())
+    let done = match engine.store().crawl_done().await {
+        Ok(names) => names.into_iter().collect(),
+        Err(e) => {
+            log::error!("sites: cannot read which crawls are done: {e}");
+            return server_error();
+        }
+    };
+
+    json(StatusCode::OK, &engine.sites_info(&state.crawling, &done))
 }
 
 async fn health() -> Response {
@@ -770,7 +780,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
     async fn search_state() -> (Arc<AppState>, Arc<crate::engine::tests::Hits>) {
         let (engine, hits, _) = crate::engine::tests::setup(&SearchConfig { min_delay_ms: 0, ..SearchConfig::default() }).await;
 
-        (Arc::new(AppState { lean: false, hub: None, romanizer: romanizer_state().romanizer.clone(), max_query_chars: 300, search: Some(engine), mirror_path: None }), hits)
+        (Arc::new(AppState { lean: false, hub: None, romanizer: romanizer_state().romanizer.clone(), max_query_chars: 300, search: Some(engine), mirror_path: None, crawling: Default::default() }), hits)
     }
 
     #[tokio::test]
@@ -911,6 +921,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json[0]["name"], "Good");
         assert_eq!(json[0]["active"], true);
+        assert!(["complete", "running", "disabled", "unsupported"].contains(&json[0]["crawl"].as_str().unwrap()));
     }
 
     #[test]
