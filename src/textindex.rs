@@ -139,8 +139,8 @@ impl TextIndex {
         Self::with(index, fields)
     }
 
-    /// An index in memory (the tests, a store in memory, and a process that does not keep the index: `OKAZURI_TEXT_INDEX=off`, which must not take the
-    /// lock of the index of the server that runs on the same database).
+    /// An index in memory (the tests, and a store in memory).
+    #[cfg(test)]
     pub fn in_ram() -> Result<Self> {
         let (schema, fields) = schema();
 

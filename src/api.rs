@@ -24,6 +24,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 pub struct AppState {
+    /// A process that only reads pages for a server (a worker, or `OKAZURI_TEXT_INDEX=off`) answers `/health` and nothing else.
+    pub lean: bool,
     /// The jobs of the workers (`[distribute] role = "host"`).
     pub hub: Option<Arc<crate::dist::Hub>>,
     /// The Japanese to romaji conversion. It is always there: it has no switch.
@@ -37,7 +39,11 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let mut router = Router::new().route("/health", get(health)).route("/romaji", get(romaji));
+    let mut router = Router::new().route("/health", get(health));
+
+    if !state.lean {
+        router = router.route("/romaji", get(romaji));
+    }
 
     if state.search.is_some() {
         router = router.route("/okazuri/search", get(search)).route("/okazuri/sites", get(sites)).route("/okazuri/title", get(title)).route("/hitomila/translate", get(hitomila_translate)).route("/google/translate", get(google_translate)).route("/auto/translate", get(auto_translate));
@@ -764,7 +770,7 @@ INSERT INTO works VALUES('BJ9','作品名',2000,4,'BJ2','A1');";
     async fn search_state() -> (Arc<AppState>, Arc<crate::engine::tests::Hits>) {
         let (engine, hits, _) = crate::engine::tests::setup(&SearchConfig { min_delay_ms: 0, ..SearchConfig::default() }).await;
 
-        (Arc::new(AppState { hub: None, romanizer: romanizer_state().romanizer.clone(), max_query_chars: 300, search: Some(engine), mirror_path: None }), hits)
+        (Arc::new(AppState { lean: false, hub: None, romanizer: romanizer_state().romanizer.clone(), max_query_chars: 300, search: Some(engine), mirror_path: None }), hits)
     }
 
     #[tokio::test]
