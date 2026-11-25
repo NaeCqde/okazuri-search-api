@@ -252,6 +252,8 @@ impl SearchStore {
         db.execute(backend.build(works.if_not_exists())).await?;
         db.execute(backend.build(tags.if_not_exists())).await?;
         db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS tags_kind_name ON tags (kind, name)").await?;
+        // the names of a batch of works are looked up by name alone (an import): the index of (kind, name) cannot answer that, and a scan of the tags is minutes
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS tags_name ON tags (name)").await?;
         db.execute(backend.build(uploaders.if_not_exists())).await?;
         // the names of the numbers a site gives its tags (AsmHentai, HentaiEra): only the ones that works carry are kept
         db.execute_unprepared("CREATE TABLE IF NOT EXISTS site_tag_names (website TEXT NOT NULL, attribute TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (website, attribute, id))").await?;
