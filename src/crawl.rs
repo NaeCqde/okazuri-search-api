@@ -167,7 +167,7 @@ pub struct Step {
 }
 
 /// One part of the walk of a site: the pages of this shard, the ids of E-Hentai of this part, and the name its state is saved under (`crawls`).
-/// A server on its own has one part, the whole list; the host of workers (`[distribute]`) cuts a site in as many parts as there are workers.
+/// A server on its own has one part, the whole list; the host of workers (`[distribute]`) cuts a site in `[distribute] parts` parts (the workers take them as jobs).
 #[derive(Debug, Clone)]
 struct Lane {
     shard: (u64, u64),
@@ -293,9 +293,9 @@ impl Crawler {
         Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None })
     }
 
-    /// The pages of the sites are read by the workers of this host, `workers` of them (each site is read in as many parts at the same time).
-    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, workers: usize) -> Self {
-        self.hub = Some((hub, workers.max(1)));
+    /// The pages of the sites are read by the workers of this host, in `parts` parts of each site that the workers take as jobs.
+    pub fn with_hub(mut self, hub: Arc<crate::dist::Hub>, parts: usize) -> Self {
+        self.hub = Some((hub, parts.max(1)));
         self
     }
 
@@ -304,7 +304,7 @@ impl Crawler {
         self.sources.iter().map(|(index, _)| self.engine.site(*index).def.name).collect()
     }
 
-    /// The part of the walk that this server reads, for each site: the whole of it, or (with workers) as many parts as there are workers.
+    /// The part of the walk that this server reads, for each site: the whole of it, or (with workers) as many parts as `[distribute] parts` says (the workers take them as jobs, so their number does not matter).
     fn lanes(&self, source: &Source, name: &str) -> Vec<Lane> {
         let whole = Lane { shard: self.shard, ids: self.ids, key: name.to_string(), refresher: true };
         let Some((_, workers)) = &self.hub else { return vec![whole] };

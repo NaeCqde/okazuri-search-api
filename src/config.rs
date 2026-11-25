@@ -261,13 +261,16 @@ pub struct DistributeConfig {
     pub token: String,
     /// Of a worker: the address of the host (`http://100.67.47.81:8010`).
     pub host: String,
-    /// Of the host: how many workers there are; each site is read in as many parts at the same time.
+    /// Of the host: how many workers there are (the verification cuts its pages for them).
     pub workers: usize,
+    /// Of the host: in how many parts a site is cut for the crawl. The parts are jobs that any worker takes, so the number of workers can change
+    /// at any time without changing the parts (the state of a part is kept by its number); more parts than workers is the usual case.
+    pub parts: usize,
 }
 
 impl Default for DistributeConfig {
     fn default() -> Self {
-        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3 }
+        Self { role: "off".to_string(), token: String::new(), host: String::new(), workers: 3, parts: 12 }
     }
 }
 
