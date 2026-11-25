@@ -85,7 +85,7 @@ pub enum Title {
 
 /// The sites whose title is not the text of the link.
 const TITLES: &[(&str, Title)] = &[
-    ("FANZA", Title::Class("line-clamp-2")),
+    ("FANZA", Title::Class("line-clamp-2 m-boxListBookProduct2Tmb__ttl")),
     ("momon:GA", Title::ImgAlt),
     ("Nya:Hentai", Title::Tag("span")),
     ("JComic", Title::Class("comic-title")),
@@ -169,7 +169,7 @@ pub const SITES: &[SiteDef] = &[
         )
     },
     SiteDef {
-        filter: Some(r"^https://book\.dmm\.co\.jp/product/"),
+        filter: Some(r"^https://book\.dmm\.co\.jp/product/[^/?]+/[^/?]+/?(?:\?|$)"),
         keep_times: true,
         ..site(
             "FANZA",
@@ -618,6 +618,39 @@ pub fn listed_slugs(html: &str, word: &str) -> Vec<String> {
     slugs
 }
 
+/// The cards of a list page of JComic: the author (`/author/…`) and the categories (`/cat/…`) of each, by the address of the work (`/page/<name>`, as the page writes it).
+fn jcomic_extras(html: &str) -> HashMap<String, Extra> {
+    static LINK: OnceLock<Regex> = OnceLock::new();
+    static AUTHOR: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY: OnceLock<Regex> = OnceLock::new();
+    let link = LINK.get_or_init(|| Regex::new(r#"<a [^>]*href="/(?:page|eps)/([^"]*)""#).unwrap());
+    let author = AUTHOR.get_or_init(|| Regex::new(r#"href="/author/([^"]*)""#).unwrap());
+    let category = CATEGORY.get_or_init(|| Regex::new(r#"href="/cat/([^"]*)""#).unwrap());
+    let mut found = HashMap::new();
+    let cards: Vec<_> = link.captures_iter(html).map(|c| (c.get(0).unwrap().end(), c[1].to_string())).collect();
+
+    for (n, (start, path)) in cards.iter().enumerate() {
+        let stop = cards.get(n + 1).map_or(html.len(), |next| next.0);
+        let card = &html[*start..stop];
+        let mut extra = Extra::default();
+
+        for c in author.captures_iter(card) {
+            // an author may be `name (circle)`: the whole text is the tag
+            extra.tags.push(Tag::new(decode(c[1].trim()).to_lowercase(), TagKind::Author));
+        }
+        for c in category.captures_iter(card) {
+            extra.tags.push(Tag::new(decode(c[1].trim()).to_lowercase(), TagKind::Tag));
+        }
+        // the address as the link of the work has it (the characters of the name percent-encoded)
+        let encoded = Url::parse(&format!("https://jcomic.net/page/{}", decode(path))).ok().and_then(|url| url.path().strip_prefix("/page/").map(str::to_string));
+        if let (Some(encoded), false) = (encoded, extra.is_empty()) {
+            found.insert(encoded, extra);
+        }
+    }
+
+    found
+}
+
 fn hentaienvy_extras(html: &str) -> HashMap<String, Extra> {
     static ID: OnceLock<Regex> = OnceLock::new();
     static CATEGORY: OnceLock<Regex> = OnceLock::new();
@@ -895,6 +928,7 @@ impl Site {
             "DLsite" => Some((dlsite_extras(html), |path| path.rsplit('/').next()?.strip_suffix(".html").map(str::to_string))),
             "HentaiEnvy" => Some((hentaienvy_extras(html), |path| path.split('/').filter(|part| !part.is_empty()).nth(1).map(str::to_string))),
             "Wnacg" => Some((wnacg_extras(html), |path| path.rsplit_once("aid-")?.1.strip_suffix(".html").map(str::to_string))),
+            "JComic" => Some((jcomic_extras(html), |path| Some(path.strip_prefix("/page/")?.to_string()))),
             "RokuHentai" => Some((rokuhentai_extras(html), |path| path.split('/').find(|part| !part.is_empty()).map(str::to_string))),
             _ => None,
         };
@@ -903,6 +937,15 @@ impl Site {
                 if let Some(extra) = key(&link.path).and_then(|id| extras.remove(&id)) {
                     link.extra = extra;
                 }
+            }
+        }
+
+        // JComic writes the number of the images after the title (`... [DL版] (92)`)
+        if self.def.name == "JComic" {
+            static COUNT: OnceLock<Regex> = OnceLock::new();
+            let count = COUNT.get_or_init(|| Regex::new(r"\s*\(\d+\)$").unwrap());
+            for link in &mut links {
+                link.title = count.replace(&link.title, "").to_string();
             }
         }
 
@@ -917,7 +960,8 @@ impl Site {
             Title::Text => link_title(attributes, inner),
             Title::ImgAlt => image_alt(inner),
             Title::Tag(tag) => element_text(inner, |name, _| name == tag),
-            Title::Class(class) => element_text(inner, |_, classes| classes.split_whitespace().any(|c| c == class)),
+            // `class` may name several classes (any of them): the list page and the search page of a site show the title in different ones
+            Title::Class(class) => element_text(inner, |_, classes| classes.split_whitespace().any(|c| class.split(' ').any(|wanted| wanted == c))),
             Title::Bookmark if attributes.contains("rel=\"bookmark\"") => text_of(inner),
             Title::Bookmark => String::new(),
         };
@@ -1243,7 +1287,7 @@ mod tests {
         let jcomic = r#"<a target="_blank" href="/page/abc"> <div><img class="img-responsive comic-thumb" src="https://images.jcomic.net/1.jpg" alt=""></div> <div> <p class='comic-title'>我が光 (COMIC 快楽天 2026年11月号) (24)</p> <p class='comic-author'>作者:</p><a href="/author/x"><button>どろずみ</button></a>"#;
         assert_eq!(
             site("JComic").extract("https://jcomic.net/search/x", jcomic, 50),
-            vec![link("/page/abc", "我が光 (COMIC 快楽天 2026年11月号) (24)")]
+            vec![Link { path: "/page/abc".into(), title: "我が光 (COMIC 快楽天 2026年11月号)".into(), extra: Extra { tags: vec![Tag::new("x", TagKind::Author)], ..Extra::default() } }]
         );
 
         // R18Best: the "Read More" link and the title link go to the same page
@@ -1396,5 +1440,14 @@ mod tests {
 
         let listing = r#"<a href="/tag/big-breasts/">big breasts</a><a href="/tag/big-breasts/popular/">p</a><a href="/tag/anal/">anal</a><a href="/tag/big-breasts/">again</a>"#;
         assert_eq!(listed_slugs(listing, "tag"), ["big-breasts", "anal"]);
+    }
+
+    #[test]
+    fn jcomic_gives_the_author_and_the_categories_and_no_count_in_the_title() {
+        let html = "<a target=\"_blank\" href=\"/eps/Alpha [DL]\" ><div><p class='comic-title'>Alpha [DL] (92)</p><p class='comic-author'>作者:</p><a href=\"/author/Circle (Name)\"><button>x</button></a><p class='comic-category'>分類:</p><a href=\"/cat/同人\"><button>同人</button></a></div></a>";
+        let links = Site::new(SITES.iter().find(|d| d.name == "JComic").unwrap()).extract("https://jcomic.net/cat/x/1", html, 10);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].title, "Alpha [DL]");
+        assert_eq!(links[0].extra.tags, vec![Tag::new("circle (name)", TagKind::Author), Tag::new("同人", TagKind::Tag)]);
     }
 }
