@@ -8,6 +8,7 @@
 //! A work that is saved already is left as it is (the shards do not overlap, and a work does not change when it is read again), except that
 //! its tags, account and posted date are set when the file has them (a database filled before the tags were read). The tags go by name and kind,
 //! the ids are the ids of one database; a file of an older version has none.
+//! The names of the numbers that AsmHentai and HentaiEra give their tags (`site_tag_names`) go in the file too, before the works.
 //! The queries and the translations are not moved: only the works, which is what the crawl made.
 
 use crate::entity::work;
