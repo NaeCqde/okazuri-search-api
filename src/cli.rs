@@ -630,12 +630,15 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         return Err(format!("[distribute] role must be off, host or worker, not {:?}", config.distribute.role).into());
     }
 
+    // a worker, and a process that does not keep the text index, only read pages: they answer /health and nothing else
+    let lean = config.distribute.role == "worker" || std::env::var("OKAZURI_TEXT_INDEX").is_ok_and(|value| value == "off");
     let state = Arc::new(AppState {
+        lean,
         hub: hub.clone(),
         romanizer: romanizer.clone(),
         max_query_chars: config.romaji.max_query_chars,
-        search: engine.clone(),
-        mirror_path: (config.magazine.enabled || config.magazine.mirror_path.exists()).then(|| config.magazine.mirror_path.clone()),
+        search: engine.clone().filter(|_| !lean),
+        mirror_path: (!lean && (config.magazine.enabled || config.magazine.mirror_path.exists())).then(|| config.magazine.mirror_path.clone()),
     });
 
     // an IPv6 address has to be in brackets

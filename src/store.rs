@@ -160,7 +160,7 @@ pub struct SearchStore {
     /// The most rows one search of the database reads (`[search] max_candidates`).
     max_candidates: std::sync::atomic::AtomicU64,
     /// The text index of the titles (`textindex.rs`), in the directory beside the database, and kept up to date from `index_queue`.
-    text: TextIndex,
+    text: Option<TextIndex>,
     /// One task at a time brings the index up to date.
     sync: tokio::sync::Mutex<()>,
     /// The romaji of the tags (`tags.romaji`) by id, kept in memory: the tags are some tens of thousands, and every search reads them.
@@ -204,17 +204,17 @@ impl SearchStore {
         // a process that does not keep the text index (`OKAZURI_TEXT_INDEX=off`: a crawl, an import) does not open the directory of it either (the server
         // that answers searches on the same database holds the lock of its writer)
         let kept = std::env::var("OKAZURI_TEXT_INDEX").map_or(true, |value| value != "off");
-        let text = if kept { TextIndex::open(&dir)? } else { TextIndex::in_ram()? };
+        let text = if kept { Some(TextIndex::open(&dir)?) } else { None };
 
         Self::init(options, Some(readers), text, kept.then_some(dir)).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
     }
 
     #[cfg(test)]
     pub async fn in_memory() -> Result<Self> {
-        Self::init(SqliteConnectOptions::new().in_memory(true), None, TextIndex::in_ram()?, None).await
+        Self::init(SqliteConnectOptions::new().in_memory(true), None, Some(TextIndex::in_ram()?), None).await
     }
 
-    async fn init(options: SqliteConnectOptions, readers: Option<sea_orm::sqlx::SqlitePool>, text: TextIndex, dir: Option<std::path::PathBuf>) -> Result<Self> {
+    async fn init(options: SqliteConnectOptions, readers: Option<sea_orm::sqlx::SqlitePool>, text: Option<TextIndex>, dir: Option<std::path::PathBuf>) -> Result<Self> {
         // one connection: the writes go one after the other, as the engine's tasks come
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -231,7 +231,8 @@ impl SearchStore {
             None => db.clone(),
         };
 
-        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default(), kind_boost: std::sync::Mutex::new(KIND_BOOST), index_on: std::env::var("OKAZURI_TEXT_INDEX").map_or(true, |value| value != "off") };
+        let text_kept = text.is_some();
+        let store = Self { db, reader, max_candidates: std::sync::atomic::AtomicU64::new(MAX_CANDIDATES), text, sync: tokio::sync::Mutex::new(()), tag_romaji: Default::default(), tag_keys: Default::default(), kind_boost: std::sync::Mutex::new(KIND_BOOST), index_on: text_kept };
         store.fill_text_index(dir.as_deref()).await?;
 
         Ok(store)
@@ -367,6 +368,11 @@ impl SearchStore {
 
     /// Fills the text index from the table when it is not complete (it has not the marker file, or has not as many works as the table) and takes
     /// in the changes that were queued: it takes a few minutes for ten million works, and a search waits for it.
+    /// The text index, which a process with `OKAZURI_TEXT_INDEX=off` does not have (it does not answer searches).
+    fn text(&self) -> Result<&TextIndex> {
+        self.text.as_ref().ok_or_else(|| "the text index is off (OKAZURI_TEXT_INDEX=off)".into())
+    }
+
     async fn fill_text_index(&self, dir: Option<&Path>) -> Result<()> {
         if !self.index_on {
             log::info!("OKAZURI_TEXT_INDEX=off: the text index is not kept (this process crawls, it does not answer searches)");
@@ -375,13 +381,13 @@ impl SearchStore {
         let marker = dir.map(|dir| dir.join("filled"));
         self.sync_index().await?;
         let works = self.count_works().await?;
-        let complete = marker.as_ref().is_none_or(|marker| marker.exists()) && self.text.len() == works;
+        let complete = marker.as_ref().is_none_or(|marker| marker.exists()) && self.text()?.len() == works;
 
         if complete {
             return Ok(());
         }
 
-        log::info!("the text index has {} works, the table {works}: the index is filled again", self.text.len());
+        log::info!("the text index has {} works, the table {works}: the index is filled again", self.text()?.len());
         let _guard = self.sync.lock().await;
 
         if let Some(marker) = &marker {
@@ -390,7 +396,7 @@ impl SearchStore {
 
         let started = Instant::now();
         let last: Option<i64> = self.db.query_one(Statement::from_string(self.db.get_database_backend(), "SELECT max(seq) AS m FROM index_queue")).await?.and_then(|row| row.try_get("", "m").ok());
-        self.text.clear()?;
+        self.text()?.clear()?;
         let (mut after, mut filled) = (0_i64, 0_u64);
 
         loop {
@@ -411,13 +417,13 @@ impl SearchStore {
                 .collect::<Result<_>>()?;
             let keys = self.keys_of(&rows).await?;
             let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader, tags))| Doc { rowid: *rowid, key, romaji, title, uploader, tags }).collect();
-            self.text.add(&docs)?;
+            self.text()?.add(&docs)?;
             filled += docs.len() as u64;
             if filled % FILL_COMMIT_EVERY < INDEX_FILL_CHUNK as u64 {
-                self.text.commit()?;
+                self.text()?.commit()?;
             }
         }
-        self.text.commit()?;
+        self.text()?.commit()?;
 
         if let Some(last) = last {
             self.db.execute(Statement::from_sql_and_values(self.db.get_database_backend(), "DELETE FROM index_queue WHERE seq <= ?", [last.into()])).await?;
@@ -584,7 +590,7 @@ impl SearchStore {
             let gone: Vec<i64> = rowids.iter().copied().filter(|rowid| !found.contains(rowid)).collect();
             let keys = self.keys_of(&rows).await?;
             let docs: Vec<Doc> = rows.iter().zip(&keys).map(|((rowid, title, romaji, _, _), (key, uploader, tags))| Doc { rowid: *rowid, key, romaji, title, uploader, tags }).collect();
-            self.text.replace(&docs, &gone)?;
+            self.text()?.replace(&docs, &gone)?;
         }
 
         self.db.execute(Statement::from_sql_and_values(backend, "DELETE FROM index_queue WHERE seq <= ?", [last.into()])).await?;
@@ -1692,7 +1698,7 @@ impl SearchStore {
     /// The websites of every work that `matcher` finds: the index finds the pieces as trigrams, and a work that has them apart is not counted.
     async fn found_websites(&self, matcher: &crate::query::Matcher) -> Result<Vec<String>> {
         self.sync_index().await?;
-        let rowids = self.text.all(matcher)?;
+        let rowids = self.text()?.all(matcher)?;
         let mut websites = Vec::new();
 
         for chunk in rowids.chunks(INDEX_FILL_CHUNK as usize) {
@@ -1764,7 +1770,7 @@ impl SearchStore {
         let mut read = limit + limit / 4 + 16;
 
         loop {
-            let rowids = self.text.best(&boosted.iter().map(|(matcher, weight)| (matcher, *weight)).collect::<Vec<_>>(), 0, read)?;
+            let rowids = self.text()?.best(&boosted.iter().map(|(matcher, weight)| (matcher, *weight)).collect::<Vec<_>>(), 0, read)?;
             let exhausted = rowids.len() < read;
             let found: Vec<IndexedRow> =
                 self.load(&rowids).await?.into_iter().filter(|row| matchers.iter().any(|(matcher, _)| matcher.accepts(&row.key(), &row.title_romaji))).collect();
@@ -1825,7 +1831,7 @@ impl SearchStore {
         // the works that the index finds, the last added first (all the works when it has nothing to look for)
         if loose.is_empty() {
             if narrowed {
-                let mut rowids = self.text.all(&matcher)?;
+                let mut rowids = self.text()?.all(&matcher)?;
                 rowids.reverse();
                 rowids.truncate(most as usize);
 
@@ -1839,7 +1845,7 @@ impl SearchStore {
 
         // a short piece that is not letters or digits is looked for in the keys of the works the others leave, chunk by chunk
         let mut found: Vec<i64> = Vec::new();
-        let mut rest: Vec<i64> = if narrowed { self.text.all(&matcher)? } else { Vec::new() };
+        let mut rest: Vec<i64> = if narrowed { self.text()?.all(&matcher)? } else { Vec::new() };
         rest.reverse();
         let mut before = i64::MAX;
 
