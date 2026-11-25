@@ -6,7 +6,7 @@
 //!
 //! (The other SQLite file, the copy of D1, is `mirror.rs`.)
 
-use crate::entity::{crawl_state, listing, search, tag, translation, translation_lookup, uploader, work};
+use crate::entity::{crawl_state, listing, search, site_tag_name, tag, translation, translation_lookup, uploader, work};
 use crate::language;
 use crate::query::{outside_key, title_key};
 use crate::sites::toggle_slash;
@@ -252,6 +252,8 @@ impl SearchStore {
         db.execute(backend.build(works.if_not_exists())).await?;
         db.execute(backend.build(tags.if_not_exists())).await?;
         db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS tags_kind_name ON tags (kind, name)").await?;
+        // the names of a batch of works are looked up by name alone (an import): the index of (kind, name) cannot answer that, and a scan of the tags is minutes
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS tags_name ON tags (name)").await?;
         db.execute(backend.build(uploaders.if_not_exists())).await?;
         // the names of the numbers a site gives its tags (AsmHentai, HentaiEra): only the ones that works carry are kept
         db.execute_unprepared("CREATE TABLE IF NOT EXISTS site_tag_names (website TEXT NOT NULL, attribute TEXT NOT NULL, id INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (website, attribute, id))").await?;
@@ -442,12 +444,11 @@ impl SearchStore {
         let stale = self.tag_keys.lock().map_err(|_| "the tags are poisoned")?.as_ref().is_none_or(|(at, _)| at.elapsed() > TAG_KEYS_FOR);
 
         if stale {
-            let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT id, kind, romaji, weight FROM tags")).await?;
+            let rows = tag::Entity::find().select_only().columns([tag::Column::Id, tag::Column::Kind, tag::Column::Romaji, tag::Column::Weight]).into_tuple::<(i64, i64, String, f64)>().all(&self.reader).await?;
             let mut keys: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
             let kind_boost = *self.kind_boost.lock().map_err(|_| "the boosts are poisoned")?;
 
-            for row in rows {
-                let (id, kind, romaji, weight): (i64, i64, String, f64) = (row.try_get("", "id")?, row.try_get("", "kind")?, row.try_get("", "romaji")?, row.try_get("", "weight")?);
+            for (id, kind, romaji, weight) in rows {
                 let milli = (kind_boost.get(kind as usize).copied().unwrap_or(1.0) * weight * 1000.0).round().max(0.0) as u32;
 
                 keys.entry(title_key(&romaji)).or_default().push((id as u64, milli));
@@ -538,9 +539,7 @@ impl SearchStore {
     }
 
     pub async fn count_works(&self) -> Result<u64> {
-        let row = self.db.query_one(Statement::from_string(self.db.get_database_backend(), "SELECT count(*) AS n FROM works")).await?.ok_or("no count")?;
-
-        Ok(row.try_get::<i64>("", "n")?.max(0) as u64)
+        Ok(work::Entity::find().count(&self.db).await?)
     }
 
     /// Takes the changes of the works that were queued since the last time into the text index (a search does this first, and it costs a
@@ -825,19 +824,18 @@ impl SearchStore {
         tags.sort_unstable();
         tags.dedup_by_key(|(kind, name, _)| (*kind, *name));
         for chunk in tags.chunks(300) {
-            let sql = format!("INSERT OR IGNORE INTO tags (kind, name, romaji, weight) VALUES {}", vec!["(?, ?, ?, 1.0)"; chunk.len()].join(", "));
-            let values: Vec<sea_orm::Value> = chunk.iter().flat_map(|(kind, name, romaji)| [(*kind).into(), (*name).into(), (*romaji).into()]).collect();
-            db.execute(Statement::from_sql_and_values(backend, sql, values)).await?;
+            let rows = chunk.iter().map(|(kind, name, romaji)| tag::ActiveModel { id: sea_orm::ActiveValue::NotSet, name: Set(name.to_string()), kind: Set(*kind), romaji: Set(romaji.to_string()), weight: Set(1.0) });
+            tag::Entity::insert_many(rows).on_conflict(OnConflict::new().do_nothing().to_owned()).do_nothing().exec(db).await?;
         }
         accounts.sort_unstable();
         accounts.dedup_by_key(|(id, _, _)| *id);
         for chunk in accounts.chunks(200) {
-            let sql = format!(
-                "INSERT INTO uploaders (website, id, name, romaji) VALUES {} ON CONFLICT(website, id) DO UPDATE SET name = excluded.name, romaji = excluded.romaji",
-                vec!["(?, ?, ?, ?)"; chunk.len()].join(", ")
-            );
-            let values: Vec<sea_orm::Value> = chunk.iter().flat_map(|(id, name, romaji)| [website.into(), (*id).into(), (*name).into(), (*romaji).into()]).collect();
-            db.execute(Statement::from_sql_and_values(backend, sql, values)).await?;
+            let rows = chunk.iter().map(|(id, name, romaji)| uploader::ActiveModel { website: Set(website.to_string()), id: Set(id.to_string()), name: Set(name.to_string()), romaji: Set(romaji.to_string()) });
+            uploader::Entity::insert_many(rows)
+                .on_conflict(OnConflict::columns([uploader::Column::Website, uploader::Column::Id]).update_columns([uploader::Column::Name, uploader::Column::Romaji]).to_owned())
+                .do_nothing()
+                .exec(db)
+                .await?;
         }
 
         let names: Vec<&str> = tags.iter().map(|(_, name, _)| *name).collect();
@@ -1287,40 +1285,38 @@ impl SearchStore {
     /// Where the crawl of a site stands (None: it never ran).
     /// The names of the numbers a site gives its tags, learned before: (attribute, id, name).
     pub async fn site_tag_names(&self, website: &str) -> Result<Vec<(String, u64, String)>> {
-        let rows = self
-            .reader
-            .query_all(Statement::from_sql_and_values(self.reader.get_database_backend(), "SELECT attribute, id, name FROM site_tag_names WHERE website = ?", [website.into()]))
-            .await?;
-        let mut names = Vec::new();
+        let rows = site_tag_name::Entity::find().filter(site_tag_name::Column::Website.eq(website)).all(&self.reader).await?;
 
-        for row in rows {
-            names.push((row.try_get::<String>("", "attribute")?, row.try_get::<i64>("", "id")? as u64, row.try_get::<String>("", "name")?));
-        }
-
-        Ok(names)
+        Ok(rows.into_iter().map(|row| (row.attribute, row.id as u64, row.name)).collect())
     }
 
     /// The names of the numbers of every site (for `transfer export`): (website, attribute, id, name).
     pub async fn all_site_tag_names(&self) -> Result<Vec<(String, String, u64, String)>> {
-        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT website, attribute, id, name FROM site_tag_names ORDER BY website, attribute, id")).await?;
-        let mut names = Vec::new();
+        let rows = site_tag_name::Entity::find()
+            .order_by_asc(site_tag_name::Column::Website)
+            .order_by_asc(site_tag_name::Column::Attribute)
+            .order_by_asc(site_tag_name::Column::Id)
+            .all(&self.reader)
+            .await?;
 
-        for row in rows {
-            names.push((row.try_get::<String>("", "website")?, row.try_get::<String>("", "attribute")?, row.try_get::<i64>("", "id")? as u64, row.try_get::<String>("", "name")?));
-        }
-
-        Ok(names)
+        Ok(rows.into_iter().map(|row| (row.website, row.attribute, row.id as u64, row.name)).collect())
     }
 
     /// Keeps the name of one number of a site.
     pub async fn save_site_tag_name(&self, website: &str, attribute: &str, id: u64, name: &str) -> Result<()> {
-        self.db
-            .execute(Statement::from_sql_and_values(
-                self.db.get_database_backend(),
-                "INSERT OR REPLACE INTO site_tag_names (website, attribute, id, name) VALUES (?, ?, ?, ?)",
-                [website.into(), attribute.into(), (id as i64).into(), name.into()],
-            ))
-            .await?;
+        site_tag_name::Entity::insert(site_tag_name::ActiveModel {
+            website: Set(website.to_string()),
+            attribute: Set(attribute.to_string()),
+            id: Set(id as i64),
+            name: Set(name.to_string()),
+        })
+        .on_conflict(
+            OnConflict::columns([site_tag_name::Column::Website, site_tag_name::Column::Attribute, site_tag_name::Column::Id])
+                .update_column(site_tag_name::Column::Name)
+                .to_owned(),
+        )
+        .exec_without_returning(&self.db)
+        .await?;
 
         Ok(())
     }
@@ -1592,16 +1588,16 @@ impl SearchStore {
 
     /// Every tag by id: (name, kind). The tags are some tens of thousands.
     pub async fn tag_table(&self) -> Result<HashMap<i64, (String, i64)>> {
-        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT id, name, kind FROM tags")).await?;
+        let rows = tag::Entity::find().select_only().columns([tag::Column::Id, tag::Column::Name, tag::Column::Kind]).into_tuple::<(i64, String, i64)>().all(&self.reader).await?;
 
-        rows.iter().map(|row| Ok((row.try_get("", "id")?, (row.try_get("", "name")?, row.try_get("", "kind")?)))).collect()
+        Ok(rows.into_iter().map(|(id, name, kind)| (id, (name, kind))).collect())
     }
 
     /// Every account by site and id: its name.
     pub async fn uploader_table(&self) -> Result<HashMap<(String, String), String>> {
-        let rows = self.reader.query_all(Statement::from_string(self.reader.get_database_backend(), "SELECT website, id, name FROM uploaders")).await?;
+        let rows = uploader::Entity::find().all(&self.reader).await?;
 
-        rows.iter().map(|row| Ok(((row.try_get("", "website")?, row.try_get("", "id")?), row.try_get("", "name")?))).collect()
+        Ok(rows.into_iter().map(|row| ((row.website, row.id), row.name)).collect())
     }
 
     /// Writes the tags, the account and the posted date of works that are saved already (an import of works that came with them): the tags and
