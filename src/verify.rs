@@ -25,8 +25,8 @@ pub struct Verifier {
     hub: Option<(Arc<crate::dist::Hub>, usize)>,
 }
 
-/// Every site that has a rule, by name.
-const NAMES: &[&str] = &["RokuHentai", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy", "DLsite", "FANZA", "R18Best", "JComic", "同人の森"];
+/// Every site that has a rule, by name. The legal sites (DLsite, FANZA) are left out: this program does not remove their works.
+const NAMES: &[&str] = &["RokuHentai", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy", "R18Best", "JComic", "同人の森"];
 
 impl Verifier {
     /// An unknown site, or one whose pages do not tell, is an error.
