@@ -311,6 +311,7 @@ fn def_at(name: &'static str, origin: &'static str, port: u16) -> &'static SiteD
         keep_times: false,
         support: Support::Ready,
         note: "",
+        plain_agent: false,
     }))
 }
 
