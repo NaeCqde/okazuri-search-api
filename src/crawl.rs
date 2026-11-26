@@ -1101,9 +1101,10 @@ fn numbered(source: &Source) -> bool {
     matches!(source, Source::Pages(_) | Source::WordPress(_) | Source::Hitomi)
 }
 
-/// The address of a list with the oldest works first, from the address with the newest first (WordPress `order=desc`, DLsite `order/release_d/`).
+/// The address of a list with the oldest works first, from the address with the newest first (WordPress `order=desc`, DLsite `order/release_d/`). A WordPress list is
+/// ordered by `id`, not by the date: the date of a post can be set to the past, so a post that is new may come in the middle of the pages read, and the id of a new one is always the highest.
 fn oldest_first(template: &str) -> String {
-    template.replace("order=desc", "order=asc").replace("order/release_d/", "order/release/")
+    template.replace("orderby=date&order=desc", "orderby=id&order=asc").replace("order=desc", "order=asc").replace("order/release_d/", "order/release/")
 }
 
 /// Whether the list of the site can be read with the oldest works first (`oldest_first`). The pages of such a list do not move when a work is added (a new work
@@ -1456,7 +1457,7 @@ mod tests {
 
     #[test]
     fn the_oldest_first_address_is_made_for_the_lists_that_have_one() {
-        assert_eq!(oldest_first("https://x/wp-json/wp/v2/posts?page={n}&orderby=date&order=desc"), "https://x/wp-json/wp/v2/posts?page={n}&orderby=date&order=asc");
+        assert_eq!(oldest_first("https://x/wp-json/wp/v2/posts?page={n}&orderby=date&order=desc"), "https://x/wp-json/wp/v2/posts?page={n}&orderby=id&order=asc");
         assert_eq!(oldest_first("https://www.dlsite.com/books/fsr/order/release_d/per_page/100/page/{n}/"), "https://www.dlsite.com/books/fsr/order/release/per_page/100/page/{n}/");
         assert!(can_oldest(&Source::WordPress("https://x/?order=desc".to_string())));
         assert!(!can_oldest(&Source::Pages("https://wnacg/albums-index-page-{n}.html".to_string())));

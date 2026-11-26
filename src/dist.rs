@@ -54,8 +54,8 @@ impl Job {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Done {
     Step(Result<Step, String>),
-    /// (path, gone) of each page that could be read.
-    Probe(Vec<(String, bool)>),
+    /// What was found at each page that was looked at, by its path.
+    Probe(Vec<(String, crate::engine::Looked)>),
 }
 
 struct Item {
@@ -394,7 +394,7 @@ pub async fn work_local(hub: Arc<Hub>, engine: Arc<Engine>, crawler: Arc<Crawler
 }
 
 /// Looks at the pages of `paths` of `site`, `spacing` apart (the pages of the site are spread over the interval of the verification).
-pub(crate) async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, spacing: Duration) -> Vec<(String, bool)> {
+pub(crate) async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, spacing: Duration) -> Vec<(String, crate::engine::Looked)> {
     let (Some(index), Some(rule)) = (engine.site_named(site), gone_rule(site)) else { return Vec::new() };
     let mut results = Vec::new();
 
@@ -402,8 +402,8 @@ pub(crate) async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, 
         let started = Instant::now();
         let url = engine.site(index).address(&path);
 
-        if let Some(gone) = engine.probe(index, &url, rule).await {
-            results.push((path, gone));
+        if let Some(looked) = engine.probe(index, &url, rule).await {
+            results.push((path, looked));
         }
         if let Some(rest) = spacing.checked_sub(started.elapsed()) {
             tokio::time::sleep(rest).await;

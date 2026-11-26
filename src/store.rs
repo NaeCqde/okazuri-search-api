@@ -52,6 +52,14 @@ pub struct NewWork {
     pub extra: crate::sites::Extra,
 }
 
+/// What a look at the page of a saved work found: whether it is gone, and the tags a page that is there shows.
+#[derive(Debug, Clone)]
+pub struct Checked {
+    pub path: String,
+    pub gone: bool,
+    pub extra: crate::sites::Extra,
+}
+
 /// A saved work.
 pub type Work = work::Model;
 
@@ -997,10 +1005,18 @@ impl SearchStore {
 
     /// Notes that the pages were looked at (`true`: the page is gone). A work whose page is gone keeps its row as a mark with no title (so no
     /// search finds it, and a list, the crawl and an import do not save it again), and the lists forget it.
-    pub async fn record_checks(&self, website: &str, results: &[(String, bool)], now: i64) -> Result<()> {
+    pub async fn record_checks(&self, website: &str, results: &[Checked], now: i64) -> Result<()> {
         let transaction = self.db.begin().await?;
+        // the tags that the pages that are there show (a work whose list showed none, or showed them in another form, gets them here)
+        let shown: Vec<NewWork> = results
+            .iter()
+            .filter(|check| !check.gone && !check.extra.tags.is_empty())
+            .map(|check| NewWork { path: check.path.clone(), title: String::new(), romaji: String::new(), language: None, extra: check.extra.clone() })
+            .collect();
+        let ids = Self::save_extras(&transaction, website, &shown).await?;
 
-        for (path, gone) in results {
+        for Checked { path, gone, .. } in results {
+            let gone = &gone.clone();
             let update = work::Entity::update_many()
                 .col_expr(work::Column::CheckedAt, Expr::value(now))
                 .filter(work::Column::Website.eq(website))
@@ -1015,6 +1031,8 @@ impl SearchStore {
                     .exec(&transaction)
                     .await?;
                 listing::Entity::delete_many().filter(listing::Column::Website.eq(website)).filter(listing::Column::Path.eq(path.as_str())).exec(&transaction).await?;
+            } else if let Some(tags) = ids.get(path) {
+                update.col_expr(work::Column::Tags, Expr::value(tags.clone())).exec(&transaction).await?;
             } else {
                 update.exec(&transaction).await?;
             }
@@ -2446,7 +2464,10 @@ mod tests {
         store.save("q", "Site", 100, &Ok(vec![work("/a"), work("/b")]), false).await.unwrap();
         assert_eq!(store.due_checks("Site", 0, "", 10).await.unwrap(), ["/a", "/b"], "never looked at: all of them");
 
-        store.record_checks("Site", &[("/a".into(), true), ("/b".into(), false)], 200).await.unwrap();
+        let shown = crate::sites::Extra { tags: vec![crate::sites::Tag::new("anal", crate::sites::TagKind::Tag)], ..Default::default() };
+        store.record_checks("Site", &[Checked { path: "/a".into(), gone: true, extra: Default::default() }, Checked { path: "/b".into(), gone: false, extra: shown }], 200).await.unwrap();
+        let tags: Option<String> = work::Entity::find().filter(work::Column::Website.eq("Site")).filter(work::Column::Path.eq("/b")).one(&store.db).await.unwrap().unwrap().tags;
+        assert!(tags.is_some_and(|tags| tags.trim().parse::<i64>().is_ok()), "a page that is there gives its tags to the work");
         assert_eq!(paths(store.candidates_owned(&["title"]).await.unwrap()).await, ["/b"], "the work that is gone is not found: its title is blank");
         assert!(store.due_checks("Site", 150, "", 10).await.unwrap().is_empty(), "looked at since 150");
         assert_eq!(store.due_checks("Site", 300, "", 10).await.unwrap(), ["/b"], "a look that is old is made again; /a is not a work any more");

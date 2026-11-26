@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::VerifyConfig;
-use crate::engine::{gone_rule, Engine, GoneRule};
+use crate::engine::{gone_rule, Engine, GoneRule, Looked};
+use crate::store::Checked;
 use crate::utils::Result;
 
 /// How many pages are looked at before the answers are written.
@@ -25,7 +26,7 @@ pub struct Verifier {
 }
 
 /// Every site that has a rule, by name.
-const NAMES: &[&str] = &["RokuHentai", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy"];
+const NAMES: &[&str] = &["RokuHentai", "HentaiEnvy", "Nya:Hentai", "momon:GA", "Sukebei", "AsmHentai", "HentaiEra", "Wnacg", "177Picyy", "DLsite", "FANZA", "R18Best", "JComic", "同人の森"];
 
 impl Verifier {
     /// An unknown site, or one whose pages do not tell, is an error.
@@ -127,13 +128,7 @@ impl Verifier {
                     results.extend(part);
                 }
             }
-            let removed = results.iter().filter(|(_, gone)| *gone).count();
-            self.engine.store().record_checks(name, &results, now()).await?;
-            if removed > 0 {
-                log::info!("verify {name}: {} pages looked at, {removed} gone", results.len());
-            }
-
-            return Ok(results.len());
+            return self.record(index, name, results).await;
         }
 
         for path in due {
@@ -141,8 +136,8 @@ impl Verifier {
             let url = self.engine.site(index).address(&path);
 
             // a page that cannot be read now is looked at again by a later batch
-            if let Some(gone) = self.engine.probe(index, &url, rule).await {
-                results.push((path, gone));
+            if let Some(looked) = self.engine.probe(index, &url, rule).await {
+                results.push((path, looked));
             }
 
             // the pages of the site are spread over the whole interval
@@ -151,14 +146,41 @@ impl Verifier {
             }
         }
 
-        let removed = results.iter().filter(|(_, gone)| *gone).count();
-        self.engine.store().record_checks(name, &results, now()).await?;
+        self.record(index, name, results).await
+    }
 
-        if removed > 0 {
-            log::info!("verify {name}: {} pages looked at, {removed} gone", results.len());
+    /// Writes what the look at the pages found: the pages that are gone are marked, the tags of the pages that are there are saved, and a page that was
+    /// not understood goes to the log with its address (what the rule of the site is made better by).
+    async fn record(&self, index: usize, name: &'static str, results: Vec<(String, Looked)>) -> Result<usize> {
+        let looked = results.len();
+        let mut checks = Vec::new();
+        // half of a batch (of ten or more) with no title is the rule or the site that changed, not the works: none of them is marked gone
+        let titleless = results.iter().filter(|(_, found)| found.titleless).count();
+        let hold = looked >= 10 && titleless * 2 >= looked;
+        if hold {
+            log::warn!("verify {name}: {titleless} of {looked} pages have no title, none is marked gone (is the rule of the site wrong?)");
         }
 
-        Ok(results.len())
+        for (path, found) in results {
+            if let Some(odd) = &found.odd {
+                log::warn!("verify {name}: {}: {odd}", self.engine.site(index).address(&path));
+            }
+            let Some(gone) = found.gone else { continue };
+            if hold && found.titleless {
+                continue;
+            }
+            let romaji: Vec<String> = found.tags.iter().map(|tag| self.engine.romanize_query(&tag.name).unwrap_or_else(|_| tag.name.clone())).collect();
+
+            checks.push(Checked { path, gone, extra: crate::sites::Extra { tags: if gone { Vec::new() } else { found.tags }, romaji, ..Default::default() } });
+        }
+        let removed = checks.iter().filter(|check| check.gone).count();
+        self.engine.store().record_checks(name, &checks, now()).await?;
+
+        if removed > 0 {
+            log::info!("verify {name}: {} pages looked at, {removed} gone", checks.len());
+        }
+
+        Ok(looked)
     }
 }
 
