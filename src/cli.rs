@@ -689,7 +689,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
         let mut verifier = if background.verify { Some(Verifier::new(engine.clone(), config.crawl.verify.clone(), &config.crawl.disabled_sites)?) } else { None };
 
         if let Some(hub) = &hub {
-            crawler = crawler.with_hub(hub.clone(), config.distribute.workers * 2, config.distribute.job_pages, config.distribute.job_seconds);
+            crawler = crawler
+                .with_hub(hub.clone(), config.distribute.workers * 2, config.distribute.job_pages, config.distribute.job_seconds)
+                .with_probe_sites(verifier.as_ref().map(|verifier| verifier.site_names()).unwrap_or_default());
             verifier = verifier.map(|verifier| verifier.with_hub(hub.clone(), config.distribute.workers));
         }
         let crawler = Arc::new(crawler);
