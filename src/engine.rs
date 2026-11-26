@@ -2233,6 +2233,7 @@ pub(crate) mod tests {
             support: Support::Ready,
             note: "",
             plain_agent: false,
+            absent_is_gone: false,
         }
     }
 

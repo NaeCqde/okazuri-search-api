@@ -297,7 +297,7 @@ impl Gallery {
             }
         }
         // Hitomi.La has no uploader: the artists and the circles are tags (the author of a work is not the one who posted it)
-        let extra = crate::sites::Extra { tags, uploader: None, posted_at: self.posted_at, romaji: Vec::new() };
+        let extra = crate::sites::Extra { tags, uploader: None, posted_at: self.posted_at, romaji: Vec::new(), site_id: None };
 
         Link { path: self.path(), title, extra }
     }

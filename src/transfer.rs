@@ -196,6 +196,7 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                         uploader: line.uploader.as_ref().map(|(id, name)| Account { id: id.clone(), name: name.clone() }),
                         posted_at: line.posted_at,
                         romaji: Vec::new(),
+                        site_id: None,
                     };
                     extra.romaji = extra.texts().iter().map(|text| romaji(text, &romanizer).unwrap_or_else(|_| text.clone())).collect();
                     extras.push((line.website.clone(), NewWork { path: line.path.clone(), title: String::new(), romaji: String::new(), language: None, extra }));
@@ -214,6 +215,7 @@ async fn save(store: &SearchStore, lines: Vec<Line>, romanizer: &Arc<Romanizer>)
                     tags: None,
                     uploader: None,
                     posted_at: None,
+                    site_id: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -312,6 +314,7 @@ mod tests {
             uploader: Some(Account { id: "u1".into(), name: "Uploader One".into() }),
             posted_at: Some(1_700_000_000),
             romaji: vec!["cosplay".into(), "fini".into(), "uploader one".into()],
+            site_id: None,
         };
         let from = SearchStore::in_memory().await.unwrap();
         from.save_crawled("A", 100, &[tagged, work("/a/2", "Alpha two")], None).await.unwrap();

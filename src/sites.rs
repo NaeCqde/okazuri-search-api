@@ -125,6 +125,10 @@ pub struct SiteDef {
     /// Cloudflare challenges a browser that is not one (HentaiName, checked 2026-11-26) but lets a plain client through: the pages
     /// are asked with the User-Agent of this program and without the headers of a browser.
     pub plain_agent: bool,
+    /// The list of the site, read in the order of the ids of its posts (WordPress, `orderby=id`), is the whole of what is published (checked 2026-11-26 for momon:GA):
+    /// a saved work whose id lies among the ids a read of the list gave, and is not one of them, is gone (`Store::mark_absent`), and the works that no read of the whole list
+    /// met are gone too (`Store::sweep_unseen`).
+    pub absent_is_gone: bool,
 }
 
 const AGE: &str = "adultchecked=1; age_check_done=1; nw=1; ckcy=1; is_intarnal=true";
@@ -155,6 +159,7 @@ const fn site(
         support,
         note,
         plain_agent: false,
+        absent_is_gone: false,
     }
 }
 
@@ -221,15 +226,18 @@ pub const SITES: &[SiteDef] = &[
             "",
         )
     },
-    site(
-        "momon:GA",
-        false,
-        "https://momon-ga.com",
-        r"^https://momon-ga\.com/(?:fanzine|magazine)/mo\d+.*",
-        Some("https://momon-ga.com/?s={q}"),
-        Support::Ready,
-        "",
-    ),
+    SiteDef {
+        absent_is_gone: true,
+        ..site(
+            "momon:GA",
+            false,
+            "https://momon-ga.com",
+            r"^https://momon-ga\.com/(?:fanzine|magazine)/mo\d+.*",
+            Some("https://momon-ga.com/?s={q}"),
+            Support::Ready,
+            "",
+        )
+    },
     site(
         "Nya:Hentai",
         false,
@@ -462,6 +470,10 @@ pub struct Extra {
     pub posted_at: Option<i64>,
     /// The romaji of the tags and then of the name of the account (one line each, in this order), made with the title: what a query is matched with.
     pub romaji: Vec<String>,
+    /// The id the site gives the post (WordPress): the ids of the posts of a list read in the order of the ids say which saved works are not listed any more.
+    /// It is not part of `is_empty`: a page that shows nothing else is still a page without extras.
+    #[serde(default)]
+    pub site_id: Option<i64>,
 }
 
 /// What a tag is (`tags.kind`): the score of a match depends on it (`store.rs`, `KIND_BOOST`).
