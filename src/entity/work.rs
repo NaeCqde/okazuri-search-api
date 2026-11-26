@@ -30,6 +30,8 @@ pub struct Model {
     pub uploader: Option<String>,
     /// When the work was posted (seconds since the epoch, UTC), when the list page shows it.
     pub posted_at: Option<i64>,
+    /// The id the site gives the post (WordPress sites whose list is read by id); NULL: unknown (`Store::mark_absent`, `sweep_unseen`).
+    pub site_id: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

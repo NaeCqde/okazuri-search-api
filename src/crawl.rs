@@ -573,6 +573,7 @@ impl Crawler {
         store.save_crawl_ranges(name, &done.list()).await.map_err(|e| e.to_string())?;
 
         let oldest = can_oldest(source);
+        let absent_is_gone = oldest && self.engine.site(index).def.absent_is_gone;
         // a newest-first list moves when a work is added at the top: when each page is read is kept, and the top is looked at (`gap.rs`)
         let check = gap_checked(source) && self.config.gap_check;
         let width = self.job_pages.max(1) as u64;
@@ -627,6 +628,20 @@ impl Crawler {
             let reads = if check { page_reads(start, asked, taken, answered, &step.at, next_ms()) } else { Vec::new() };
             let new = store.save_crawled_range_read(name, unix_now(), &works, start, read_to, &reads).await.map_err(|e| e.to_string())?;
 
+            // a list read in the order of the ids has no room for a saved work whose id is among the ones it gave and is not one of them
+            if absent_is_gone {
+                let ids: Vec<i64> = works.iter().filter_map(|work| work.extra.site_id).collect();
+
+                if ids.windows(2).all(|pair| pair[0] < pair[1]) {
+                    let gone = store.mark_absent(name, &works, unix_now()).await.map_err(|e| e.to_string())?;
+                    if gone > 0 {
+                        log::info!("crawl {name}: {gone} saved works are not in the pages {start}-{read_to}, marked gone");
+                    }
+                } else {
+                    log::warn!("crawl {name}: the pages {start}-{read_to} are not in the order of the ids, no work is marked gone by them");
+                }
+            }
+
             done.add(start, read_to);
             from = from.min(read_to + 1);
             walk.pages += (read_to - start + 1) as usize;
@@ -647,6 +662,10 @@ impl Crawler {
             }
             store.mark_crawled(name, unix_now()).await.map_err(|e| e.to_string())?;
             walk.finished = true;
+            // the whole list was read in the order of the ids: the saved works that none of its pages gave an id to are not in it
+            if absent_is_gone {
+                store.sweep_unseen(name, unix_now()).await.map_err(|e| e.to_string())?;
+            }
         }
 
         Ok(walk)
@@ -1209,6 +1228,7 @@ fn wordpress_links(site: &Site, body: &str) -> std::result::Result<Vec<Link>, St
                 }
             }
             extra.posted_at = post.get("date").and_then(|d| d.as_str()).and_then(wordpress_time);
+            extra.site_id = post.get("id").and_then(|id| id.as_i64());
 
             (!title.is_empty()).then_some(Link { path, title, extra })
         })
@@ -1284,6 +1304,7 @@ mod tests {
             support: Support::Ready,
             note: "",
             plain_agent: false,
+            absent_is_gone: false,
         }))
     }
 
@@ -1344,6 +1365,7 @@ mod tests {
             support: Support::Ready,
             note: "",
             plain_agent: false,
+            absent_is_gone: false,
         }));
         let store = Arc::new(SearchStore::in_memory().await.unwrap());
         let search = SearchConfig { min_delay_ms: 0, ..SearchConfig::default() };

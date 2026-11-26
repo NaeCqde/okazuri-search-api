@@ -377,7 +377,7 @@ impl SearchStore {
         }
 
         // the columns of what a list page shows besides the title (tags, uploader, posted date) are added to a database that has not got them
-        for (column, kind) in [("tags", "TEXT"), ("uploader", "TEXT"), ("posted_at", "INTEGER")] {
+        for (column, kind) in [("tags", "TEXT"), ("uploader", "TEXT"), ("posted_at", "INTEGER"), ("site_id", "INTEGER")] {
             let has = db
                 .query_one(Statement::from_sql_and_values(db.get_database_backend(), "SELECT 1 AS x FROM pragma_table_info('works') WHERE name = ?", [column.into()]))
                 .await?
@@ -387,6 +387,8 @@ impl SearchStore {
                 db.execute_unprepared(&format!("ALTER TABLE works ADD COLUMN {column} {kind}")).await?;
             }
         }
+        // the ids that sites give their posts (WordPress): only the works that have one are in the index, so it stays small (about 25 MB for 900,000 works)
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS works_site_id ON works (website, site_id) WHERE site_id IS NOT NULL").await?;
         db.execute_unprepared("DROP TRIGGER IF EXISTS works_queue_update").await?;
 
         // the text index is a directory beside the database (`textindex.rs`): the changes of the works are queued by three triggers, and the
@@ -949,6 +951,7 @@ impl SearchStore {
                     tags: Set(extras.get(&item.path).cloned()),
                     uploader: Set(item.extra.uploader.as_ref().map(|account| account.id.clone())),
                     posted_at: Set(item.extra.posted_at),
+                    site_id: Set(item.extra.site_id),
                 }),
                 // a work whose page is gone is not saved again
                 Some(known) if known.deleted => {}
@@ -963,6 +966,15 @@ impl SearchStore {
                     changed.title_romaji = Set(item.romaji.clone());
                     changed.language = Set(item.language.clone());
                     changed.updated_at = Set(now);
+                    if item.extra.site_id.is_some() {
+                        changed.site_id = Set(item.extra.site_id);
+                    }
+                    changed.update(db).await?;
+                }
+                // the id the site gives the post is learned (or changed): nothing else of the row is touched (`updated_at` stays, so the index does not take the row again)
+                Some(known) if item.extra.site_id.is_some() && known.site_id != item.extra.site_id => {
+                    let mut changed = known.clone().into_active_model();
+                    changed.site_id = Set(item.extra.site_id);
                     changed.update(db).await?;
                 }
                 // the same work again: its row is left as it is
@@ -1001,6 +1013,66 @@ impl SearchStore {
             .await?;
 
         rows.iter().map(|row| Ok(row.try_get::<String>("", "path")?)).collect()
+    }
+
+    /// The saved works of `website` whose id (`site_id`) lies among the ids that a read of the list gave (`listed`, a part of a list read in the order of the ids), and is not
+    /// one of them: the list has no room for them, so they are gone (as `record_checks` marks them). Nothing is marked when more than a tenth of the saved works in that
+    /// range would be (the read, not the works, is wrong then). Returns how many were marked.
+    pub async fn mark_absent(&self, website: &str, listed: &[NewWork], now: i64) -> Result<usize> {
+        let ids: std::collections::HashSet<i64> = listed.iter().filter_map(|work| work.extra.site_id).collect();
+        let (Some(&lo), Some(&hi)) = (ids.iter().min(), ids.iter().max()) else { return Ok(0) };
+        let saved = work::Entity::find()
+            .filter(work::Column::Website.eq(website))
+            .filter(work::Column::Deleted.eq(false))
+            .filter(work::Column::SiteId.between(lo, hi))
+            .all(&self.db)
+            .await?;
+        let absent: Vec<Checked> = saved
+            .iter()
+            .filter(|row| row.site_id.is_some_and(|id| !ids.contains(&id)))
+            .map(|row| Checked { path: row.path.clone(), gone: true, extra: crate::sites::Extra::default() })
+            .collect();
+
+        if absent.is_empty() {
+            return Ok(0);
+        }
+        if absent.len() * 10 > saved.len() {
+            log::warn!("{website}: {} of the {} saved works between the ids {lo} and {hi} are not in the list that was read: none is marked gone", absent.len(), saved.len());
+
+            return Ok(0);
+        }
+        self.record_checks(website, &absent, now).await?;
+
+        Ok(absent.len())
+    }
+
+    /// After a read of the whole list in the order of the ids: the saved works that no read gave an id to (`site_id` is NULL) are not in the list, so they are gone. Nothing is
+    /// marked unless 95% of the saved works have an id (a read of the whole list gives one to every work that is listed) and the works without one are at most 5%.
+    /// Returns how many were marked.
+    pub async fn sweep_unseen(&self, website: &str, now: i64) -> Result<usize> {
+        let alive = work::Entity::find().filter(work::Column::Website.eq(website)).filter(work::Column::Deleted.eq(false));
+        let total = alive.clone().count(&self.db).await?;
+        let known = alive.clone().filter(work::Column::SiteId.is_not_null()).count(&self.db).await?;
+        let unseen = total - known;
+
+        if unseen == 0 {
+            return Ok(0);
+        }
+        if known * 100 < total * 95 {
+            log::warn!("{website}: only {known} of {total} saved works have an id, the list was not read whole: none is marked gone");
+
+            return Ok(0);
+        }
+        let paths: Vec<String> = alive.filter(work::Column::SiteId.is_null()).select_only().column(work::Column::Path).into_tuple().all(&self.db).await?;
+
+        for chunk in paths.chunks(1000) {
+            let checks: Vec<Checked> = chunk.iter().map(|path| Checked { path: path.clone(), gone: true, extra: crate::sites::Extra::default() }).collect();
+
+            self.record_checks(website, &checks, now).await?;
+        }
+        log::info!("{website}: {} works are not in the list that was read whole, marked gone", paths.len());
+
+        Ok(paths.len())
     }
 
     /// Notes that the pages were looked at (`true`: the page is gone). A work whose page is gone keeps its row as a mark with no title (so no
@@ -2361,7 +2433,7 @@ mod tests {
         // the columns of the table are all there is
         assert_eq!(
             store.columns_of("works").await.unwrap(),
-            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at", "tags", "uploader", "posted_at"]
+            ["website", "path", "title", "title_romaji", "first_seen", "updated_at", "language", "deleted", "checked_at", "tags", "uploader", "posted_at", "site_id"]
         );
 
         let works = store.candidates_owned(&[]).await.unwrap();
@@ -2476,13 +2548,64 @@ mod tests {
         // the list, the crawl and an import all bring /a again: it is left out
         store.save("q2", "Site", 300, &Ok(vec![work("/a"), work("/c")]), false).await.unwrap();
         store.save_crawled("Site", 300, &[work("/a"), work("/d")], None).await.unwrap();
-        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None, tags: None, uploader: None, posted_at: None };
+        let gone = Work { website: "Site".into(), path: "/a".into(), title: "title /a".into(), title_romaji: "title /a".into(), first_seen: 1, updated_at: 1, language: None, deleted: false, checked_at: None, tags: None, uploader: None, posted_at: None, site_id: None };
         assert_eq!(store.import_works(vec![gone]).await.unwrap(), 0);
         let mut found = paths(store.candidates_owned(&["title"]).await.unwrap()).await;
         found.sort();
         assert_eq!(found, ["/b", "/c", "/d"]);
         assert_eq!(store.due_checks("Site", 400, "", 10).await.unwrap(), ["/b", "/c", "/d"], "in the order of the paths");
         assert_eq!(store.due_checks("Site", 400, "/b", 1).await.unwrap(), ["/c"], "going on after a path, a page at a time");
+    }
+
+    #[tokio::test]
+    async fn the_works_that_a_list_read_by_id_has_no_room_for_are_gone() {
+        let store = SearchStore::in_memory().await.unwrap();
+        let work = |id: Option<i64>, name: &str| NewWork {
+            path: format!("/w/{name}"),
+            title: format!("title {name}"),
+            romaji: format!("title {name}"),
+            language: None,
+            extra: crate::sites::Extra { site_id: id, ..Default::default() },
+        };
+        let ids = |first: i64, last: i64, skip: Option<i64>| -> Vec<NewWork> { (first..=last).filter(|id| Some(*id) != skip).map(|id| work(Some(id), &format!("a{id}"))).collect() };
+        let alive = |store: &SearchStore, website: &str| {
+            let db = store.db.clone();
+            let website = website.to_string();
+            async move { work::Entity::find().filter(work::Column::Website.eq(website)).filter(work::Column::Deleted.eq(false)).count(&db).await.unwrap() }
+        };
+
+        // 30 works with ids 1..=30; the list gives all of them but 15
+        store.save_crawled("S", 100, &ids(1, 30, None), None).await.unwrap();
+        assert_eq!(store.mark_absent("S", &ids(1, 30, Some(15)), 200).await.unwrap(), 1);
+        assert_eq!(alive(&store, "S").await, 29);
+        let gone = work::Entity::find().filter(work::Column::Website.eq("S")).filter(work::Column::Path.eq("/w/a15")).one(&store.db).await.unwrap().unwrap();
+        assert!(gone.deleted && gone.title.is_empty(), "the row stays as a mark with no title");
+        // an id outside the range of the list that was read is not judged
+        assert_eq!(store.mark_absent("S", &ids(40, 50, None), 200).await.unwrap(), 0);
+        assert_eq!(alive(&store, "S").await, 29);
+        // a read that gave 2 of the 29 ids of its range is the read's fault: nothing is marked
+        let two = vec![work(Some(1), "a1"), work(Some(30), "a30")];
+        assert_eq!(store.mark_absent("S", &two, 300).await.unwrap(), 0);
+        assert_eq!(alive(&store, "S").await, 29);
+        // the id is learned by a list that gives it for a work saved without one
+        store.save_crawled("T", 100, &[work(None, "x")], None).await.unwrap();
+        store.save_crawled("T", 200, &[work(Some(7), "x")], None).await.unwrap();
+        let row = work::Entity::find().filter(work::Column::Website.eq("T")).one(&store.db).await.unwrap().unwrap();
+        assert_eq!((row.site_id, row.updated_at), (Some(7), 100), "the id is set and the row is otherwise left as it is");
+
+        // after the whole list was read: the 2 of 100 works that have no id are not in it
+        let mut hundred = ids(1, 98, None);
+        hundred.push(work(None, "n1"));
+        hundred.push(work(None, "n2"));
+        store.save_crawled("U", 100, &hundred, None).await.unwrap();
+        assert_eq!(store.sweep_unseen("U", 300).await.unwrap(), 2);
+        assert_eq!(alive(&store, "U").await, 98);
+        // a list that was read in part (half of the works have no id) marks nothing
+        let mut half = ids(1, 10, None);
+        half.extend((0..10).map(|n| work(None, &format!("m{n}"))));
+        store.save_crawled("V", 100, &half, None).await.unwrap();
+        assert_eq!(store.sweep_unseen("V", 300).await.unwrap(), 0);
+        assert_eq!(alive(&store, "V").await, 20);
     }
 
     fn tr(source: &str, id: i64, english: &str, japanese: &str) -> translation::Model {
@@ -3118,7 +3241,7 @@ mod tests {
         let tagged = |path: &str, title: &str, uploader: &str, tags: &[&str]| {
             let mut work = link(path, title);
             let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
-            work.extra = Extra { romaji: tags.iter().cloned().chain([uploader.to_string()]).collect(), tags: tags.into_iter().map(|t| crate::sites::Tag::new(t, crate::sites::TagKind::Tag)).collect(), uploader: Some(crate::sites::Account { id: format!("id-{uploader}"), name: uploader.to_string() }), posted_at: Some(1_700_000_000) };
+            work.extra = Extra { romaji: tags.iter().cloned().chain([uploader.to_string()]).collect(), tags: tags.into_iter().map(|t| crate::sites::Tag::new(t, crate::sites::TagKind::Tag)).collect(), uploader: Some(crate::sites::Account { id: format!("id-{uploader}"), name: uploader.to_string() }), posted_at: Some(1_700_000_000), site_id: None };
             work
         };
 
