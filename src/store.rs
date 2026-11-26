@@ -210,6 +210,17 @@ pub const KIND_BOOST: [f64; 4] = [1.0, 6.0, 4.0, 0.25];
 
 impl SearchStore {
     pub async fn open(path: &Path) -> Result<Self> {
+        let kept = std::env::var("OKAZURI_TEXT_INDEX").map_or(true, |value| value != "off");
+
+        Self::open_with(path, kept).await
+    }
+
+    /// Only the database (a command that changes the crawl state while the server runs: the server holds the lock of the text index).
+    pub async fn open_database(path: &Path) -> Result<Self> {
+        Self::open_with(path, false).await
+    }
+
+    async fn open_with(path: &Path, kept: bool) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent).await.map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
@@ -231,7 +242,6 @@ impl SearchStore {
 
         // a process that does not keep the text index (`OKAZURI_TEXT_INDEX=off`: a crawl, an import) does not open the directory of it either (the server
         // that answers searches on the same database holds the lock of its writer)
-        let kept = std::env::var("OKAZURI_TEXT_INDEX").map_or(true, |value| value != "off");
         let text = if kept { Some(TextIndex::open(&dir)?) } else { None };
 
         Self::init(options, Some(readers), text, kept.then_some(dir)).await.map_err(|e| format!("cannot open {}: {e}", path.display()).into())
@@ -1463,36 +1473,27 @@ impl SearchStore {
         Ok(())
     }
 
-    /// Makes the first walk of a site be done again, once (`[crawl] rewalk`): the ranges of the pages read and the done mark of the site and of its shards are
-    /// cleared, so the crawl reads the list from the first page (the works that are saved stay, and get what the pages say now: the tags, say). A mark `<site>#rewalk`
-    /// says that it was done, so a restart does not do it again. Returns whether it was done now.
-    pub async fn rewalk(&self, website: &str, now: i64) -> Result<bool> {
-        let mark = format!("{website}#rewalk");
-
-        if crawl_state::Entity::find_by_id(mark.clone()).one(&self.db).await?.is_some() {
-            return Ok(false);
-        }
-
+    /// Makes the first walk of a site be done again (`rewalk` command): the done mark, the cursor and the ranges of the pages read of the site and of its shards
+    /// (`Site#k/N`) are cleared, so the crawl reads the list from the first page (the works that are saved stay, and get what the pages say now: the tags, say).
+    /// Returns how many states and ranges were cleared.
+    pub async fn rewalk(&self, website: &str, now: i64) -> Result<(u64, u64)> {
         let like = format!("{}#%", website.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         let transaction = self.db.begin().await?;
         let backend = transaction.get_database_backend();
 
-        transaction
+        let ranges = transaction
             .execute(Statement::from_sql_and_values(backend, "DELETE FROM crawl_ranges WHERE website = ? OR website LIKE ? ESCAPE '\\'", [website.into(), like.clone().into()]))
-            .await?;
-        transaction
+            .await?
+            .rows_affected();
+        let states = transaction
             .execute(Statement::from_sql_and_values(backend, "UPDATE crawls SET done = 0, cursor = '', updated_at = ? WHERE website = ? OR website LIKE ? ESCAPE '\\'", [now.into(), website.into(), like.into()]))
-            .await?;
-        transaction
-            .execute(Statement::from_sql_and_values(
-                backend,
-                "INSERT INTO crawls (website, cursor, done, saved, updated_at) VALUES (?, '', 1, 0, ?)",
-                [mark.into(), now.into()],
-            ))
-            .await?;
+            .await?
+            .rows_affected();
+        // the mark of the setting that this command replaced
+        transaction.execute(Statement::from_sql_and_values(backend, "DELETE FROM crawls WHERE website = ?", [format!("{website}#rewalk").into()])).await?;
         transaction.commit().await?;
 
-        Ok(true)
+        Ok((states, ranges))
     }
 
     /// The sites whose crawl read the whole list (so the works they list are saved, and a query does not need to ask them).
@@ -3391,14 +3392,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewalk_clears_the_walk_of_a_site_and_its_shards_once_and_keeps_the_works() {
+    async fn rewalk_clears_the_walk_of_a_site_and_its_shards_and_keeps_the_works() {
         let store = SearchStore::in_memory().await.unwrap();
 
         for name in ["A", "A#0/4", "A#1/4", "AB", "B"] {
             store.save_crawled_range(name, 1, &[link(&format!("/g/{name}/"), "One")], 1, 5).await.unwrap();
             store.mark_crawled(name, 1).await.unwrap();
         }
-        assert_eq!(store.rewalk("A", 9).await.unwrap(), true);
+        assert_eq!(store.rewalk("A", 9).await.unwrap(), (3, 3));
 
         let done = store.crawl_done().await.unwrap();
         assert!(!done.iter().any(|name| name == "A" || name.starts_with("A#0") || name.starts_with("A#1")), "{done:?}");
@@ -3408,9 +3409,9 @@ mod tests {
         assert_eq!(store.crawl_ranges("AB").await.unwrap(), [(1, 5)]);
         assert_eq!(store.counts_of("A").await.unwrap(), 1, "the works stay");
 
-        // a second time (a restart) does nothing, even though the site was read again in between
+        // the command can be run again: it clears what the site has read since
         store.mark_crawled("A", 10).await.unwrap();
-        assert_eq!(store.rewalk("A", 11).await.unwrap(), false);
-        assert!(store.crawl_done().await.unwrap().iter().any(|name| name == "A"));
+        assert_eq!(store.rewalk("A", 11).await.unwrap(), (3, 0));
+        assert!(!store.crawl_done().await.unwrap().iter().any(|name| name == "A"));
     }
 }

@@ -56,6 +56,9 @@ count <words>...                       Count the saved works whose title has all
 cloudflare-check                       Ask the top page of each site behind Cloudflare, to see which ones this machine
                                        gets through to
     --config <path>      Config file
+rewalk <site>...                       Read the whole list of each site again from the first page (a site whose tags were not read before, say): the done mark and the
+                                       pages read are cleared, the saved works stay. Works while the server runs; the server then needs a restart to start the walk
+    --config <path>      Config file
 stats                                  Print what the database holds: the works of each site (gone, not yet looked at by the
                                        verification), the crawl of each site, the translations by source. Safe while the server runs
     --config <path>      Config file
@@ -119,6 +122,7 @@ pub enum Command {
     Works { issue: String, config: Option<PathBuf> },
     Count { query: String, config: Option<PathBuf> },
     Stats { config: Option<PathBuf> },
+    Rewalk { sites: Vec<String>, config: Option<PathBuf> },
     CloudflareCheck { config: Option<PathBuf> },
     BuildIndex { config: Option<PathBuf> },
     DropLegacyIndex { config: Option<PathBuf> },
@@ -151,6 +155,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "works" => parse_works(rest),
         "count" => parse_count(rest),
         "stats" => parse_config_only(rest, "stats").map(|config| Command::Stats { config }),
+        "rewalk" => parse_rewalk(rest),
         "cloudflare-check" => parse_config_only(rest, "cloudflare-check").map(|config| Command::CloudflareCheck { config }),
         "build-index" => parse_config_only(rest, "build-index").map(|config| Command::BuildIndex { config }),
         "drop-legacy-index" => parse_config_only(rest, "drop-legacy-index").map(|config| Command::DropLegacyIndex { config }),
@@ -496,6 +501,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Works { issue, config } => works(issue, config).await,
         Command::Count { query, config } => count(query, config).await,
         Command::Stats { config } => stats(config).await,
+        Command::Rewalk { sites, config } => rewalk(sites, config).await,
         Command::CloudflareCheck { config } => cloudflare_check(config).await,
         Command::BuildIndex { config } => build_index(config).await,
         Command::DropLegacyIndex { config } => drop_legacy_index(config).await,
@@ -827,6 +833,45 @@ async fn title(urls: Vec<String>, live: Live, config: Option<PathBuf>) -> Result
             Err(Some(why)) => println!("  {why}"),
         }
     }
+
+    Ok(())
+}
+
+fn parse_rewalk(args: &[String]) -> Result<Command> {
+    let (mut sites, mut config) = (Vec::new(), None);
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => config = Some(PathBuf::from(value(&mut iter, arg)?)),
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}\n\n{USAGE}").into()),
+            site => sites.push(site.to_string()),
+        }
+    }
+    if sites.is_empty() {
+        return Err(format!("rewalk needs the names of the sites\n\n{USAGE}").into());
+    }
+
+    Ok(Command::Rewalk { sites, config })
+}
+
+/// Reads the whole list of the sites again: the state of their crawl is cleared (the database only, so it works while the server runs).
+async fn rewalk(sites: Vec<String>, config: Option<PathBuf>) -> Result<()> {
+    let config = load(config).await?;
+    let store = SearchStore::open_database(&config.search.db_path).await?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let known: Vec<&str> = crate::sites::SITES.iter().map(|site| site.name).collect();
+
+    for site in &sites {
+        let Some(name) = known.iter().find(|name| name.eq_ignore_ascii_case(site)) else {
+            println!("{site}: no such site");
+            continue;
+        };
+        let (states, ranges) = store.rewalk(name, now).await?;
+
+        println!("{name}: {states} states and {ranges} ranges of pages cleared");
+    }
+    println!("restart the server: the walk starts when it does");
 
     Ok(())
 }
@@ -1177,6 +1222,11 @@ mod tests {
         assert!(parse(&args(&["count"])).is_err());
         assert_eq!(parse(&args(&["stats"])).unwrap(), Command::Stats { config: None });
         assert!(parse(&args(&["stats", "--limit", "1"])).is_err());
+        assert_eq!(
+            parse(&args(&["rewalk", "Wnacg", "Sukebei", "--config", "a.toml"])).unwrap(),
+            Command::Rewalk { sites: args(&["Wnacg", "Sukebei"]), config: Some(PathBuf::from("a.toml")) }
+        );
+        assert!(parse(&args(&["rewalk"])).is_err());
     }
 
     #[test]
