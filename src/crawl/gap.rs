@@ -53,7 +53,7 @@ pub(super) fn next_ms() -> i64 {
 }
 
 /// When each page of a job was read: the job took the pages `first..first + pages` one after another from `taken` (the host handed the job out) to `reported`
-/// (the host got the answer), and `at` says how long after `taken` each page was done (the clock of the worker is never used). Without `at` (an old worker, a job
+/// (the host got the answer), and `at` says how long after `taken` each page was done (the clock of the worker is never used). Without `at` (a job
 /// that stopped on a repeated page) every page may have been read at any time of the job.
 pub(super) fn page_reads(first: u64, pages: u64, taken: i64, reported: i64, at: &[u32], job: i64) -> Vec<PageRead> {
     let exact = pages > 0 && at.len() as u64 == pages;

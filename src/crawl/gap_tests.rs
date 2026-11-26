@@ -194,16 +194,15 @@ fn the_hitomi_watch_uses_the_index_length() {
 }
 
 #[test]
-fn an_old_worker_without_offsets_is_handled() {
-    // the answer of a worker from before the offsets: no `at`
-    let step: Step = serde_json::from_str(r#"{"links":[],"next":null}"#).unwrap();
-    assert!(step.at.is_empty());
+fn an_answer_without_offsets_is_refused_and_a_job_that_stopped_early_has_the_whole_window() {
+    // `at` is part of the answer of a worker: there is no worker from before it to be handled
+    assert!(serde_json::from_str::<Step>(r#"{"links":[],"next":null}"#).is_err());
 
-    let done: Done = serde_json::from_str(r#"{"Step":{"Ok":{"links":[],"next":"5"}}}"#).unwrap();
+    let done: Done = serde_json::from_str(r#"{"Step":{"Ok":{"links":[],"next":"5","at":[]}}}"#).unwrap();
     assert!(matches!(done, Done::Step(Ok(step)) if step.at.is_empty() && step.next.as_deref() == Some("5")));
 
-    // so the pages of the job may have been read at any time of it
-    assert_eq!(page_reads(1, 2, 10, 20, &step.at, 3), [read(1, 3, 10, 20), read(2, 3, 10, 20)]);
+    // a job that stopped on a repeated page has no offsets for the pages it did not read: they may have been read at any time of it
+    assert_eq!(page_reads(1, 2, 10, 20, &[], 3), [read(1, 3, 10, 20), read(2, 3, 10, 20)]);
 }
 
 #[test]

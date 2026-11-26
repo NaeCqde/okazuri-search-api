@@ -185,8 +185,7 @@ pub struct Step {
     pub links: Vec<Link>,
     pub next: Option<String>,
     /// For each page of the job, the milliseconds from the start of the job to the end of that page's read (the host adds them to the time it handed the job
-    /// out; the clocks of the machines are never compared). Empty from a worker that does not tell, and from a job of one page that is not timed.
-    #[serde(default)]
+    /// out; the clocks of the machines are never compared). Empty for a job of one page that is not timed.
     pub at: Vec<u32>,
 }
 
