@@ -72,8 +72,31 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
+/// What a worker has done since the host started: the jobs that it reported, by site.
+#[derive(Default, Clone, serde::Serialize)]
+struct WorkerStats {
+    jobs: u64,
+    /// The pages of the lists that were read (`step`) and the pages of saved works that were looked at (`probe`).
+    list_pages: u64,
+    works_listed: u64,
+    pages_probed: u64,
+    /// Jobs that came back as an error.
+    errors: u64,
+    by_site: std::collections::BTreeMap<String, SiteStats>,
+}
+
+#[derive(Default, Clone, serde::Serialize)]
+struct SiteStats {
+    jobs: u64,
+    list_pages: u64,
+    works_listed: u64,
+    pages_probed: u64,
+}
+
 #[derive(Default)]
 struct Queue {
+    /// What each worker reported (by name), since the host started.
+    stats: HashMap<String, WorkerStats>,
     next: u64,
     waiting: VecDeque<Item>,
     /// The jobs that are taken, with the worker that has them.
@@ -140,12 +163,48 @@ impl Hub {
 
         match queue.running.remove(&id) {
             Some((worker, item)) => {
-                queue.seen.insert(worker, Instant::now());
+                queue.seen.insert(worker.clone(), Instant::now());
+                let stats = queue.stats.entry(worker).or_default();
+                let site = stats.by_site.entry(item.site.clone()).or_default();
+                stats.jobs += 1;
+                site.jobs += 1;
+                match &done {
+                    Done::Step(Ok(step)) => {
+                        let pages = step.at.len().max(1) as u64;
+                        stats.list_pages += pages;
+                        stats.works_listed += step.links.len() as u64;
+                        site.list_pages += pages;
+                        site.works_listed += step.links.len() as u64;
+                    }
+                    Done::Step(Err(_)) => stats.errors += 1,
+                    Done::Probe(looked) => {
+                        stats.pages_probed += looked.len() as u64;
+                        site.pages_probed += looked.len() as u64;
+                    }
+                }
                 let taken = item.taken.unwrap_or_else(now_ms);
                 item.done.send((done, taken)).is_ok()
             }
             None => false,
         }
+    }
+
+    /// What each worker reported since the host started, and when it was heard of last (seconds ago).
+    fn workers(&self) -> serde_json::Value {
+        let queue = self.queue.lock().unwrap();
+        let mut names: Vec<&String> = queue.stats.keys().chain(queue.seen.keys()).collect();
+        names.sort();
+        names.dedup();
+
+        serde_json::Value::Array(
+            names
+                .into_iter()
+                .map(|name| {
+                    let stats = queue.stats.get(name).cloned().unwrap_or_default();
+                    serde_json::json!({ "worker": name, "seen_seconds_ago": queue.seen.get(name).map(|at| at.elapsed().as_secs()), "stats": stats })
+                })
+                .collect(),
+        )
     }
 
     /// A worker says it is alive.
@@ -254,6 +313,13 @@ pub async fn report(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     let Some(hub) = state.hub.clone().filter(|hub| hub.allows(&headers)) else { return StatusCode::UNAUTHORIZED };
 
     if hub.report(id, done) { StatusCode::OK } else { StatusCode::GONE }
+}
+
+/// `GET /dist/workers`: what each worker has reported since the host started (for the people who run the workers).
+pub async fn workers(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(hub) = state.hub.clone().filter(|hub| hub.allows(&headers)) else { return StatusCode::UNAUTHORIZED.into_response() };
+
+    Json(hub.workers()).into_response()
 }
 
 /// `POST /dist/alive` (the name of the worker in `X-Worker`): the worker says it is alive.
@@ -419,6 +485,30 @@ mod tests {
 
     fn step() -> Job {
         Job::Step { cursor: "1".to_string(), shard: (0, 1), ids: (None, None), pages: 2, seconds: 0, oldest: false }
+    }
+
+    #[tokio::test]
+    async fn the_host_counts_what_each_worker_reports() {
+        let hub = Arc::new(Hub::new("t".to_string()));
+        for _ in 0..2 {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.submit("A", step()).await });
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (first, _) = hub.take("A", "step", "w1").unwrap();
+        let (second, _) = hub.take("A", "step", "w2").unwrap();
+        let link = |n: u32| crate::sites::Link { path: format!("/work/{n}"), title: format!("title {n}"), extra: Default::default() };
+
+        assert!(hub.report(first, Done::Step(Ok(crate::crawl::Step { links: vec![link(1), link(2), link(3)], next: None, at: vec![10, 20] }))));
+        assert!(hub.report(second, Done::Step(Err("blocked".to_string()))));
+        let workers = hub.workers();
+        let of = |name: &str| workers.as_array().unwrap().iter().find(|w| w["worker"] == name).unwrap().clone();
+
+        assert_eq!(of("w1")["stats"]["works_listed"], 3);
+        assert_eq!(of("w1")["stats"]["list_pages"], 2);
+        assert_eq!(of("w1")["stats"]["by_site"]["A"]["jobs"], 1);
+        assert_eq!(of("w2")["stats"]["errors"], 1);
+        assert_eq!(of("w2")["stats"]["works_listed"], 0);
     }
 
     #[tokio::test]
