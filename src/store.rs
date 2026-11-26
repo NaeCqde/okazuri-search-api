@@ -1463,6 +1463,38 @@ impl SearchStore {
         Ok(())
     }
 
+    /// Makes the first walk of a site be done again, once (`[crawl] rewalk`): the ranges of the pages read and the done mark of the site and of its shards are
+    /// cleared, so the crawl reads the list from the first page (the works that are saved stay, and get what the pages say now: the tags, say). A mark `<site>#rewalk`
+    /// says that it was done, so a restart does not do it again. Returns whether it was done now.
+    pub async fn rewalk(&self, website: &str, now: i64) -> Result<bool> {
+        let mark = format!("{website}#rewalk");
+
+        if crawl_state::Entity::find_by_id(mark.clone()).one(&self.db).await?.is_some() {
+            return Ok(false);
+        }
+
+        let like = format!("{}#%", website.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let transaction = self.db.begin().await?;
+        let backend = transaction.get_database_backend();
+
+        transaction
+            .execute(Statement::from_sql_and_values(backend, "DELETE FROM crawl_ranges WHERE website = ? OR website LIKE ? ESCAPE '\\'", [website.into(), like.clone().into()]))
+            .await?;
+        transaction
+            .execute(Statement::from_sql_and_values(backend, "UPDATE crawls SET done = 0, cursor = '', updated_at = ? WHERE website = ? OR website LIKE ? ESCAPE '\\'", [now.into(), website.into(), like.into()]))
+            .await?;
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO crawls (website, cursor, done, saved, updated_at) VALUES (?, '', 1, 0, ?)",
+                [mark.into(), now.into()],
+            ))
+            .await?;
+        transaction.commit().await?;
+
+        Ok(true)
+    }
+
     /// The sites whose crawl read the whole list (so the works they list are saved, and a query does not need to ask them).
     pub async fn crawl_done(&self) -> Result<Vec<String>> {
         Ok(crawl_state::Entity::find().filter(crawl_state::Column::Done.eq(true)).all(&self.db).await?.into_iter().map(|row| row.website).collect())
@@ -3356,5 +3388,29 @@ mod tests {
         store.save_crawled("B", 1, &[link("/gallery/99/", "t")], None).await.unwrap();
 
         assert_eq!(store.site_ids("A", |path| crate::sites::work_id("HentaiEra", path)).await.unwrap(), [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn rewalk_clears_the_walk_of_a_site_and_its_shards_once_and_keeps_the_works() {
+        let store = SearchStore::in_memory().await.unwrap();
+
+        for name in ["A", "A#0/4", "A#1/4", "AB", "B"] {
+            store.save_crawled_range(name, 1, &[link(&format!("/g/{name}/"), "One")], 1, 5).await.unwrap();
+            store.mark_crawled(name, 1).await.unwrap();
+        }
+        assert_eq!(store.rewalk("A", 9).await.unwrap(), true);
+
+        let done = store.crawl_done().await.unwrap();
+        assert!(!done.iter().any(|name| name == "A" || name.starts_with("A#0") || name.starts_with("A#1")), "{done:?}");
+        // the other sites (also one whose name starts with the same letters) are not touched
+        assert!(done.iter().any(|name| name == "AB") && done.iter().any(|name| name == "B"));
+        assert!(store.crawl_ranges("A").await.unwrap().is_empty() && store.crawl_ranges("A#0/4").await.unwrap().is_empty());
+        assert_eq!(store.crawl_ranges("AB").await.unwrap(), [(1, 5)]);
+        assert_eq!(store.counts_of("A").await.unwrap(), 1, "the works stay");
+
+        // a second time (a restart) does nothing, even though the site was read again in between
+        store.mark_crawled("A", 10).await.unwrap();
+        assert_eq!(store.rewalk("A", 11).await.unwrap(), false);
+        assert!(store.crawl_done().await.unwrap().iter().any(|name| name == "A"));
     }
 }

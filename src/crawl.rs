@@ -357,6 +357,19 @@ impl Crawler {
 
         log::info!("crawl: {} sites, shard {}/{}", self.sources.len(), self.shard.0, self.shard.1);
 
+        // the sites whose first walk is asked to be done again (`[crawl] rewalk`)
+        for (index, _) in &self.sources {
+            let name = self.engine.site(*index).def.name;
+
+            if self.config.rewalk.iter().any(|site| site.eq_ignore_ascii_case(name)) {
+                match self.engine.store().rewalk(name, unix_now()).await {
+                    Ok(true) => log::info!("crawl {name}: the first walk is done again"),
+                    Ok(false) => {}
+                    Err(e) => log::warn!("crawl {name}: cannot start the walk again: {e}"),
+                }
+            }
+        }
+
         for place in 0..self.sources.len() {
             let (index, source) = &self.sources[place];
             let name = self.engine.site(*index).def.name;
