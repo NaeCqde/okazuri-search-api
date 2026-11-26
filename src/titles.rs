@@ -14,7 +14,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("IMHentai", r"<h1>(?<title>.+)</h1>"),
     (
         "momon:GA",
-        r#"<h1>(?<title>.+)</h1>(?:(?:\n|\t|.)+作者</div>.+https://momon-ga\.com/cartoonist/[^ ]+ rel="tag">(?<artist>[^<]+)?</a>)"#,
+        r#"<h1>(?<title>.+)</h1>(?:(?:\n|\t|.)+作者</div>.+https://momon-ga\.com/cartoonist/[^ ]+ rel="tag">(?<artist>[^<]+)?</a>)?"#,
     ),
     (
         "Nya:Hentai",
@@ -96,6 +96,8 @@ mod tests {
         assert_eq!(title_of_page("Sukebei", "<title>[Circle] file (touhou).zip :: Sukebei</title>").as_deref(), Some("[Circle] file (touhou).zip"));
         assert_eq!(title_of_page("JComic", r#"<h1>作品名</h1><a href="/author/作者""#).as_deref(), Some("作品名 作者"));
         assert_eq!(title_of_page("Sukebei", "<title>名前 | Sukebei | Nyaa</title>").as_deref(), Some("名前"));
+        // a page of momon:GA with no author block still has its title
+        assert_eq!(title_of_page("momon:GA", "<h1>[Circle] 作品名</h1>\n<div id=\"post-meta\"></div><h1>パロディ</h1>").as_deref(), Some("[Circle] 作品名"));
         assert_eq!(title_of_page("Wnacg", "<p>no title</p>"), None);
         assert_eq!(title_of_page("Unknown", "<h1>x</h1>"), None);
     }
