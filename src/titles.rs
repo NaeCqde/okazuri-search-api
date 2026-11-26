@@ -25,10 +25,10 @@ const PATTERNS: &[(&str, &str)] = &[
     ("R18Best", r"<h1>(?<title>.+)</h1>"),
     ("HentaiOMG", r"<h1>(?<title>.+)</h1>"),
     ("HentaiCore", r"<h1>(?<title>.+)</h1>"),
-    ("Sukebei", r"<title>(?<title>.+) \| Sukebei \| Nyaa"),
+    ("Sukebei", r"<title>(?<title>.+?) (?:::|\|) Sukebei"),
     ("NijiGazo", r"<title>(?<title>.+) \| NijiGazo"),
     ("RokuHentai", r"<h1>(?<title>.+)</h1>"),
-    ("HentaiEnvy", r"<h1>(?<title>.+)</h1>"),
+    ("HentaiEnvy", r"<h1[^>]*>(?<title>.+)</h1>"),
     ("HentaiEra", r"<h1>(?<title>.+)</h1>"),
     ("MasDr", r"<h1>(?<title>.+)</h1>"),
     ("JMwu", r"<h1>(?<title>.+)</h1>"),
@@ -92,6 +92,8 @@ mod tests {
             Some("COMIC快楽天 2026年07月号")
         );
         assert_eq!(title_of_page("Wnacg", "<h1>作品名</h1>").as_deref(), Some("作品名"));
+        assert_eq!(title_of_page("HentaiEnvy", r#"<h1 id="gallery-title">[Circle] Title</h1>"#).as_deref(), Some("[Circle] Title"));
+        assert_eq!(title_of_page("Sukebei", "<title>[Circle] file (touhou).zip :: Sukebei</title>").as_deref(), Some("[Circle] file (touhou).zip"));
         assert_eq!(title_of_page("JComic", r#"<h1>作品名</h1><a href="/author/作者""#).as_deref(), Some("作品名 作者"));
         assert_eq!(title_of_page("Sukebei", "<title>名前 | Sukebei | Nyaa</title>").as_deref(), Some("名前"));
         assert_eq!(title_of_page("Wnacg", "<p>no title</p>"), None);
