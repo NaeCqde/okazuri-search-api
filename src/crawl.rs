@@ -78,7 +78,7 @@ pub fn sources() -> Vec<(&'static str, Source)> {
         ("HentaiEnvy", pages("https://hentaienvy.com/?page={n}")),
         ("RokuHentai", Source::Cards("https://rokuhentai.com/_search?sort=recent".to_string())),
         ("EHentai", Source::GalleryIds("https://e-hentai.org/".to_string())),
-        ("R18Best", Source::WordPress("https://r18.best/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
+        ("R18Best", Source::WordPress("https://r18.best/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,categories,class_list".to_string())),
         ("177Picyy", Source::WordPress("https://www.177picyy.com/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,categories,class_list".to_string())),
         // the site lists only what a search finds: every hiragana is searched, and a work has some of them in its title
         ("同人の森", Source::Lists("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん".chars().map(|kana| format!("https://doujinnomori.com/comics/free-search?keyword={kana}&page={{n}}")).collect())),
