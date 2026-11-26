@@ -539,10 +539,16 @@ async fn the_budget_limits_the_rereads_and_warns() {
 
     rig.watch(true).await.unwrap();
     // three jobs, each read before the one above it: the boundaries 6|7, 4|5 and 2|3 are read out of order
+    // (the times are in milliseconds: a pause keeps two reads, and the growth, from falling in the same one)
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
     rig.read_by_hand(7, 2, true).await;
+    pause().await;
     rig.read_by_hand(5, 2, true).await;
+    pause().await;
     rig.read_by_hand(3, 2, true).await;
+    pause().await;
     grow.add();
+    pause().await;
 
     assert!(rig.walk().await.unwrap().finished);
     // two pages fit: the spans with the same growth are taken from the top (3 and 5), and the span of page 7 is left to the refresher
