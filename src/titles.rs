@@ -27,7 +27,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("HentaiCore", r"<h1>(?<title>.+)</h1>"),
     ("Sukebei", r"<title>(?<title>.+?) (?:::|\|) Sukebei"),
     ("NijiGazo", r"<title>(?<title>.+) \| NijiGazo"),
-    ("RokuHentai", r"<h1>(?<title>.+)</h1>"),
+    ("RokuHentai", r#"<meta property="og:title" content="(?<title>.+) - Roku Hentai">"#),
     ("HentaiEnvy", r"<h1[^>]*>(?<title>.+)</h1>"),
     ("HentaiEra", r"<h1>(?<title>.+)</h1>"),
     ("MasDr", r"<h1>(?<title>.+)</h1>"),
@@ -35,7 +35,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("NukiBooks", r"<h1>(?<title>.+)</h1>"),
     ("177Picyy", r"<h1>(?<title>.+)</h1>"),
     ("BatoTo", r"<h1>(?<title>.+)</h1>"),
-    ("Wnacg", r"<h1>(?<title>.+)</h1>"),
+    ("Wnacg", r"<h[12]>(?<title>.+?)</h[12]>"),
     ("HentaiName", r"<h1>(?<title>.+)</h1>"),
     ("HentaiDesi", r"<h1>(?<title>.+)</h1>"),
     ("AsmHentai", r"<h1>(?<title>.+)</h1>"),
@@ -92,6 +92,12 @@ mod tests {
             Some("COMIC快楽天 2026年07月号")
         );
         assert_eq!(title_of_page("Wnacg", "<h1>作品名</h1>").as_deref(), Some("作品名"));
+        // the page of an album of Wnacg has its title in an h2, and the page of RokuHentai has none in an h1 (checked 2026-11-26)
+        assert_eq!(title_of_page("Wnacg", "<h2>[胡桃もか] 崩れ去る日常[DL版]</h2>").as_deref(), Some("[胡桃もか] 崩れ去る日常[DL版]"));
+        assert_eq!(
+            title_of_page("RokuHentai", r#"<title>[Circle] Title - Roku Hentai</title><meta property="og:title" content="[Circle] Title - Roku Hentai">"#).as_deref(),
+            Some("[Circle] Title")
+        );
         assert_eq!(title_of_page("HentaiEnvy", r#"<h1 id="gallery-title">[Circle] Title</h1>"#).as_deref(), Some("[Circle] Title"));
         assert_eq!(title_of_page("Sukebei", "<title>[Circle] file (touhou).zip :: Sukebei</title>").as_deref(), Some("[Circle] file (touhou).zip"));
         assert_eq!(title_of_page("JComic", r#"<h1>作品名</h1><a href="/author/作者""#).as_deref(), Some("作品名 作者"));
