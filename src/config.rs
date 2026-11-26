@@ -308,6 +308,9 @@ pub struct CrawlConfig {
     pub sites: Vec<String>,
     /// The sites that the crawl and the verification leave out (names as in `GET /okazuri/sites`), apart from the searches (`[search] disabled_sites`).
     pub disabled_sites: Vec<String>,
+    /// The sites whose first walk is done again, once: when the crawl starts, a site listed here that was not done again yet is read from the first page (the works
+    /// that are saved stay and get what the pages say now). A mark in the database says that it was done, so the line can stay.
+    pub rewalk: Vec<String>,
     /// The verification of the saved works (`[crawl.verify]`): it goes with the crawl, which keeps the list of the sites that are left out.
     pub verify: VerifyConfig,
     /// `k/N`: this machine reads the pages whose number leaves k when divided by N, so N machines (each with its own IP address) read
@@ -353,6 +356,7 @@ impl Default for CrawlConfig {
             utc_offset: "UTC".to_string(),
             sites: Vec::new(),
             disabled_sites: Vec::new(),
+            rewalk: Vec::new(),
             verify: VerifyConfig::default(),
             shard: "0/1".to_string(),
             gallery_ids: String::new(),

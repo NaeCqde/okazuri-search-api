@@ -176,6 +176,9 @@ utc_offset = "UTC"
 sites = []
 # Sites that the crawl and the verification leave out (the names of GET /okazuri/sites). The searches have a list of their own: [search] disabled_sites.
 disabled_sites = []
+# Sites whose first walk is done again, once (the works that are saved stay and get what the pages say now: the tags of the sites that only got them later). A mark in the
+# database says that it was done, so the line can stay.
+rewalk = []
 # k/N: this machine reads the pages whose number leaves k when divided by N. Run N machines with 0/N ... N-1/N, then `export` on each and
 # `import` the files on the server. Lists that go one page to the next (RokuHentai, E-Hentai) are read by 0/N only.
 shard = "0/1"
