@@ -1481,6 +1481,9 @@ impl Engine {
         let mut request = client.get(url).header("Accept-Language", "ja,en;q=0.8");
         if let Some(cookie) = &passport_cookie {
             request = request.header("Cookie", cookie.as_str());
+        } else if let Some(cookie) = self.sites[index].def.cookie {
+            // the same as the pages of the lists: FANZA sends a page that is not the work's to a client without the age cookie
+            request = request.header("Cookie", cookie);
         }
         let response = request.send().await.ok()?;
         let status = response.status().as_u16();
