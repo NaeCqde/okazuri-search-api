@@ -59,9 +59,9 @@ okazuri-search-api convert "文"...       ローマ字を表示。文がなけ�
 
 `[server]`(`host` 既定 `127.0.0.1`、`port` 既定 8000)、`[search]`(`enabled`、`db_path`、`ttl_hours` 720、`max_query_chars` 300、`timeout_secs`、`min_delay_ms`、`max_results_per_site`、`max_results` 100、`disabled_sites`)、`[cloudflare]`(`enabled`、`api`、`cache_minutes` 30。チャレンジの向こうのサイトを読むための、クッキー・User-Agent・proxy を返すサーバー)、`[magazine]`(Cloudflare の D1 の写し。`api_token` は環境変数 `CLOUDFLARE_API_TOKEN`。事前検索は `[magazine.prefetch]`)、`[cron]`(`[[cron.jobs]]`、値の `${NAME}` は環境変数)、`[romaji]`(`max_query_chars`、`[romaji.exceptions]`)。
 
-## 全件読み直し(`[crawl]` の `rewalk`)
+## 全件読み直し(`rewalk` コマンド)
 
-あとから取れるようになった項目(タグなど)を、保存済みの作品に入れ直すための、一度きりの読み直し。`rewalk = ["Wnacg"]` のように書くと、クロールの開始時に、そのサイトの読み取り済みの印(`crawls.done`)とページの範囲(`crawl_ranges`)を、サイトと各シャード(`Site#k/N`)ぶん消し、最初のページから読み直す。保存済みの作品は消えず、ページの今の内容(タグ・投稿日など)で更新される。`Site#rewalk` という印(`crawls`)が「もうやった」を表すので、再起動しても二度やらない(設定の行は残してよい)。もう一度やりたいときは、印の行を消す。
+あとから取れるようになった項目(タグなど)を、保存済みの作品に入れ直すための読み直し。`okazuri-search-api rewalk Wnacg Sukebei` のように、サイト名(大文字小文字は区別しない)を並べて実行する。そのサイトと各シャード(`Site#k/N`)の、読み取り済みの印(`crawls.done`)とカーソルを戻し、読んだページの範囲(`crawl_ranges`)を消す。保存済みの作品は消えず、ページの今の内容(タグ・投稿日など)で更新される。テキスト索引は開かず、DB だけを開くので、サーバーが動いている間も実行できる。ただしサーバーを再起動したときに読み直しが始まる(読み終えたレーンは終了しているため)。何度でも実行できる。
 
 ## ギャップチェック(`[crawl]` の `gap_check`、`watch_seconds` など)
 
