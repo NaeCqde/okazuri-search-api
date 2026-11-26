@@ -1474,7 +1474,7 @@ impl Engine {
 
     /// Asks for the page of a work, after the turn of the site, and says whether the page is gone (`rule`): `Some(true)` it is gone, `Some(false)`
     /// it is there, `None` nothing can be said (the request failed, or the answer is no sign).
-    pub(crate) async fn probe(&self, index: usize, url: &str, rule: GoneRule) -> Option<bool> {
+    pub(crate) async fn probe(&self, index: usize, url: &str, rule: GoneRule) -> Option<Looked> {
         self.wait_turn(index).await;
 
         let (client, passport_cookie) = self.client_of(&self.sites[index]).await.ok()?;
@@ -1484,10 +1484,30 @@ impl Engine {
         }
         let response = request.send().await.ok()?;
         let status = response.status().as_u16();
+        let final_url = response.url().to_string();
         let final_path = response.url().path().to_string();
         let body = response.text().await.ok()?;
+        let name = self.sites[index].def.name;
+        let mut gone = page_status(rule, status, &final_path, &body);
+        let (title, tags) = if gone == Some(false) { (crate::titles::title_of_page(name, &body), sites::detail_tags(name, &body)) } else { (None, Vec::new()) };
 
-        page_status(rule, status, &final_path, &body)
+        // a page is there only when it shows its work: an answer of 200 without a title is taken as a page that is gone (what the page of a work that is gone looks like
+        // is learned from the log, which has its address), unless it is the challenge of the site; `titleless` lets the verification hold back when it is the rule that is wrong
+        let mut odd = None;
+        let mut titleless = false;
+        if gone == Some(false) && title.is_none() {
+            odd = Some(format!("200 but no title: HTTP {status}, {final_url}, {} bytes: {}", body.len(), snippet(&body)));
+            if !sites::is_challenge(status, &body) {
+                gone = Some(true);
+                titleless = true;
+            } else {
+                gone = None;
+            }
+        } else if gone.is_none() {
+            odd = Some(format!("no sign: HTTP {status}, {final_url}, {} bytes: {}", body.len(), snippet(&body)));
+        }
+
+        Some(Looked { gone, title, tags, odd, titleless })
     }
 
     /// The search of Hitomi.La (`hitomi.rs`): a few dozen small requests to its index files, each one after its turn.
@@ -2063,11 +2083,35 @@ pub enum GoneRule {
     Sentence(&'static str),
 }
 
+/// What the look at one page found (`Engine::probe`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Looked {
+    /// `Some(true)` the page is gone, `Some(false)` it is there, `None` the answer says neither (the page is looked at again later).
+    pub gone: Option<bool>,
+    /// The title read from a page that is there.
+    pub title: Option<String>,
+    /// The tags the page of the work shows (`sites::detail_tags`).
+    pub tags: Vec<sites::Tag>,
+    /// Set when the page was not understood: the answer in short, for the log.
+    pub odd: Option<String>,
+    /// The page answered 200 with no title and is counted as gone for that (the rule may be wrong, not the page).
+    pub titleless: bool,
+}
+
+/// The visible text at the start of a page, in a line (for the log).
+fn snippet(body: &str) -> String {
+    static TAGS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tags = TAGS.get_or_init(|| regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>|<[^>]*>").unwrap());
+    let text = tags.replace_all(body, " ");
+
+    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect()
+}
+
 /// The sites whose pages tell that a work is gone, and how. (Hitomi.La's page is the same shell for any id: its index file says which
 /// galleries there are. E-Hentai answers 200 with a short text, and it bans an address that asks more than a page every few seconds.)
 pub fn gone_rule(site: &str) -> Option<GoneRule> {
     match site {
-        "RokuHentai" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" | "177Picyy" => Some(GoneRule::NotFound),
+        "RokuHentai" | "HentaiEnvy" | "Nya:Hentai" | "momon:GA" | "Sukebei" | "177Picyy" | "DLsite" | "FANZA" | "R18Best" | "JComic" | "同人の森" => Some(GoneRule::NotFound),
         "AsmHentai" | "HentaiEra" => Some(GoneRule::RedirectsTo404),
         "Wnacg" => Some(GoneRule::Sentence("您要訪問的漫畫不存在")),
         _ => None,

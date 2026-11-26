@@ -774,6 +774,68 @@ fn fanza_extras(html: &str) -> HashMap<String, Extra> {
     found
 }
 
+/// The tags that the page of one work shows (the page of the work, not a list): what the crawl cannot get where a list has no tags. Names are lower case and flat;
+/// the kind is the artist or the circle where the page says so. Empty for a site whose page is not read for tags.
+pub fn detail_tags(site: &str, html: &str) -> Vec<Tag> {
+    static ROKU: OnceLock<Regex> = OnceLock::new();
+    static ASM: OnceLock<Regex> = OnceLock::new();
+    static ASM_TAG: OnceLock<Regex> = OnceLock::new();
+    static ERA: OnceLock<Regex> = OnceLock::new();
+    static ERA_TAG: OnceLock<Regex> = OnceLock::new();
+    static DNM: OnceLock<Regex> = OnceLock::new();
+    let mut found: Vec<Tag> = Vec::new();
+    let kind_of = |section: &str| match section.to_lowercase().as_str() {
+        "artist" | "artists" => Some(TagKind::Author),
+        "group" | "groups" | "circle" => Some(TagKind::Circle),
+        // the language is the column of its own, and the kind of the file is not a tag
+        "language" | "languages" | "kind" => None,
+        _ => Some(TagKind::Tag),
+    };
+
+    match site {
+        "RokuHentai" => {
+            // `<a class="mdc-chip__text" href="...?q=male%3Aanal">male: anal </a>`
+            let chip = ROKU.get_or_init(|| Regex::new(r#"mdc-chip__text"[^>]*>\s*([a-z]+):\s*([^<]+?)\s*</a>"#).unwrap());
+            for c in chip.captures_iter(html) {
+                if let Some(kind) = kind_of(&c[1]) {
+                    found.push(Tag::new(decode(&c[2]).to_lowercase(), kind));
+                }
+            }
+        }
+        "AsmHentai" => {
+            // `<h3>Tags:</h3><div class="tag_list"><a ...><span class="badge tag">stockings <span class="gallery_count">`
+            let section = ASM.get_or_init(|| Regex::new(r#"(?s)<h3>([A-Za-z]+):</h3>\s*<div class="tag_list">(.*?)</div>"#).unwrap());
+            let tag = ASM_TAG.get_or_init(|| Regex::new(r#"<span class="badge tag">([^<]+?)\s*<span class="gallery_count">"#).unwrap());
+            for c in section.captures_iter(html) {
+                if let Some(kind) = kind_of(&c[1]) {
+                    found.extend(tag.captures_iter(&c[2]).map(|t| Tag::new(decode(&t[1]).trim().to_lowercase(), kind)));
+                }
+            }
+        }
+        "HentaiEra" => {
+            // `<span class='tags_text'>Tags</span> <div class='info_tags'><a ...><span class='item_name'> lolicon</span>`
+            let section = ERA.get_or_init(|| Regex::new(r#"(?s)<span class='tags_text'>([A-Za-z]+)</span>\s*<div class='info_tags'>(.*?)</div>"#).unwrap());
+            let tag = ERA_TAG.get_or_init(|| Regex::new(r#"<span class='item_name'>([^<]+)</span>"#).unwrap());
+            for c in section.captures_iter(html) {
+                if let Some(kind) = kind_of(&c[1]) {
+                    found.extend(tag.captures_iter(&c[2]).map(|t| Tag::new(decode(&t[1]).trim().to_lowercase(), kind)));
+                }
+            }
+        }
+        "同人の森" => {
+            // `<a href="/comics/search?type=3&amp;id=199" class="tag__link ...">フルカラー</a>` (type 1 the series, 2 the character, 3 the tag)
+            let tag = DNM.get_or_init(|| Regex::new(r#"href="/comics/search\?type=\d&amp;id=\d+" class="tag__link[^"]*">([^<]+)</a>"#).unwrap());
+            found.extend(tag.captures_iter(html).map(|t| Tag::new(decode(&t[1]).trim().to_lowercase(), TagKind::Tag)));
+        }
+        _ => {}
+    }
+
+    found.retain(|tag| !tag.name.is_empty());
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// The works of a RokuHentai answer, by id: the time of a card (`Nov 24, 2026,  9:00 pm`).
 fn rokuhentai_extras(html: &str) -> HashMap<String, Extra> {
     static CARD: OnceLock<Regex> = OnceLock::new();
@@ -1402,6 +1464,23 @@ mod tests {
         let links = site("Nya:Hentai").extract("https://nyahentai.one/?s=x", html, 50);
 
         assert_eq!(links, vec![link("/magazine/re3280150/", "a"), link("/fanzine/re1/", "b")]);
+    }
+
+    /// The tags of the page of a work (`detail_tags`): the kind of the artist and the circle, no language, no kind of the file.
+    #[test]
+    fn the_page_of_a_work_gives_its_tags() {
+        let roku = r#"<a class="mdc-chip__text" href="?q=kind%3Aimageset">kind: imageset </a><a class="mdc-chip__text" href="?q=artist%3A%22canvas+solaris%22">artist: canvas solaris </a><a class="mdc-chip__text" href="?q=language%3Ajapanese">language: japanese </a><a class="mdc-chip__text" href="?q=male%3A%22big+penis%22">male: Big Penis </a>"#;
+        assert_eq!(detail_tags("RokuHentai", roku), [Tag::new("big penis", TagKind::Tag), Tag::new("canvas solaris", TagKind::Author)]);
+
+        let asm = r#"<div class="tags"><h3>Tags:</h3><div class="tag_list"><a href="/tag/anal/"><span class="badge tag">anal <span class="gallery_count">(1)</span></span></a></div></div><div class="tags"><h3>Artists:</h3><div class="tag_list"><a href="/artist/po-ju/"><span class="badge tag">po-ju <span class="gallery_count">(174)</span></span></a></div></div><div class="tags"><h3>Languages:</h3><div class="tag_list"><a href="/language/english/"><span class="badge tag">english <span class="gallery_count">(2)</span></span></a></div></div><div class="tags"><h3>Category:</h3><div class="tag_list"><a href="/category/manga/"><span class="badge tag">manga <span class="gallery_count">(3)</span></span></a></div></div>"#;
+        assert_eq!(detail_tags("AsmHentai", asm), [Tag::new("anal", TagKind::Tag), Tag::new("manga", TagKind::Tag), Tag::new("po-ju", TagKind::Author)]);
+
+        let era = "<li><span class='tags_text'>Tags</span> <div class='info_tags'><a class='tag  btn' href='/tag/lolicon/'>\n <span class='item_name'> lolicon</span>\n </a></div></li><li><span class='tags_text'>Groups</span> <div class='info_tags'><a class='tag' href='/group/x/'><span class='item_name'> circle x</span></a></div></li><li><span class='tags_text'>Languages</span> <div class='info_tags'><a href='/language/japanese/'><span class='item_name'> japanese</span></a></div></li>";
+        assert_eq!(detail_tags("HentaiEra", era), [Tag::new("circle x", TagKind::Circle), Tag::new("lolicon", TagKind::Tag)]);
+
+        let dnm = r#"<a href="/comics/search?type=3&amp;id=199" class="tag__link favorite_tag_x">フルカラー</a> <a href="/comics/search?type=1&amp;id=2" class="tag__link">シリーズ</a>"#;
+        assert_eq!(detail_tags("同人の森", dnm).len(), 2);
+        assert!(detail_tags("DLsite", asm).is_empty());
     }
 
     /// HentaiName: the cards are links to /g/N/ and the title is the caption inside.

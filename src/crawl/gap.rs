@@ -436,11 +436,16 @@ impl Crawler {
 
         match &self.hub {
             Some((hub, _)) => match hub.submit(name, Job::Probe { paths, spacing_ms: 0 }).await? {
-                Done::Probe(results) => Ok(results),
+                Done::Probe(results) => Ok(Self::conclusive(results)),
                 _ => Err("a worker answered with something that is not a probe".to_string()),
             },
-            None => Ok(crate::dist::probe(&self.engine, name, paths, Duration::ZERO).await),
+            None => Ok(Self::conclusive(crate::dist::probe(&self.engine, name, paths, Duration::ZERO).await)),
         }
+    }
+
+    /// The pages whose look said whether they are gone, as `(path, gone)`.
+    fn conclusive(results: Vec<(String, crate::engine::Looked)>) -> Vec<(String, bool)> {
+        results.into_iter().filter_map(|(path, looked)| looked.gone.map(|gone| (path, gone))).collect()
     }
 
     /// Reads the page of a work that the list does not show and saves it. False when it could not be read (nothing is noted, the id is asked again).
