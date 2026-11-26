@@ -106,8 +106,11 @@ const FANZA_PRICES: &[(Option<u32>, Option<u32>)] = &[
     (Some(2000), None),
 ];
 
+/// The floors (`floor=`) that the price of 330 yen, the one that holds most of the books (381 pages, near the 417 that can be read), is cut by.
+const FANZA_FLOORS: &[&str] = &["Abook", "Atl", "Abl", "Anovel", "Aphoto"];
+
 fn fanza_lists() -> Vec<String> {
-    FANZA_PRICES
+    let mut lists: Vec<String> = FANZA_PRICES
         .iter()
         .map(|(min, max)| {
             let mut address = "https://book.dmm.co.jp/list/?sort=date".to_string();
@@ -120,7 +123,17 @@ fn fanza_lists() -> Vec<String> {
             address.push_str("&page={n}");
             address
         })
-        .collect()
+        .collect();
+
+    // after the ones above, whose places in the walk stay: the band of 300-399 holds 417 pages or more (it was cut at 417), so its parts are read too
+    // (the price of 330 alone is 381 pages; by floor each is far under the limit)
+    for (min, max) in [(300, 329), (331, 399)] {
+        lists.push(format!("https://book.dmm.co.jp/list/?sort=date&price_min={min}&price_max={max}&page={{n}}"));
+    }
+    for floor in FANZA_FLOORS {
+        lists.push(format!("https://book.dmm.co.jp/list/?sort=date&price_min=330&price_max=330&floor={floor}&page={{n}}"));
+    }
+    lists
 }
 
 /// The categories of JComic (`/cat/<name>/<page>`); "最近更新" (the newest) comes first so that the walks that look for new works read it.
@@ -1187,6 +1200,19 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_fanza_lists_keep_their_places_and_the_price_of_330_is_cut_by_floor() {
+        let lists = super::fanza_lists();
+
+        // the first ones are the ones of the walks that ran (their places are in the saved state)
+        assert_eq!(lists[2], "https://book.dmm.co.jp/list/?sort=date&price_min=100&price_max=299&page={n}");
+        assert_eq!(lists[3], "https://book.dmm.co.jp/list/?sort=date&price_min=300&price_max=399&page={n}");
+        assert!(lists.iter().all(|list| list.contains("{n}")));
+        assert!(lists.contains(&"https://book.dmm.co.jp/list/?sort=date&price_min=330&price_max=330&floor=Atl&page={n}".to_string()));
+        assert!(lists.contains(&"https://book.dmm.co.jp/list/?sort=date&price_min=331&price_max=399&page={n}".to_string()));
+        assert_eq!(lists.len(), lists.iter().collect::<std::collections::HashSet<_>>().len());
+    }
+
     #[test]
     fn a_ban_is_waited_for_as_long_as_the_site_says() {
         use super::ban_wait;
