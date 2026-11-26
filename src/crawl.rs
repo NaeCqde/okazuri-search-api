@@ -79,7 +79,7 @@ pub fn sources() -> Vec<(&'static str, Source)> {
         ("RokuHentai", Source::Cards("https://rokuhentai.com/_search?sort=recent".to_string())),
         ("EHentai", Source::GalleryIds("https://e-hentai.org/".to_string())),
         ("R18Best", Source::WordPress("https://r18.best/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
-        ("177Picyy", Source::WordPress("https://www.177picyy.com/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,class_list".to_string())),
+        ("177Picyy", Source::WordPress("https://www.177picyy.com/wp-json/wp/v2/posts?per_page=100&page={n}&orderby=date&order=desc&_fields=id,link,title,date,tags,categories,class_list".to_string())),
         // the site lists only what a search finds: every hiragana is searched, and a work has some of them in its title
         ("同人の森", Source::Lists("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん".chars().map(|kana| format!("https://doujinnomori.com/comics/free-search?keyword={kana}&page={{n}}")).collect())),
         // the list stops after 417 pages of 120, so it is cut by price (the newest first in each part)
@@ -993,51 +993,57 @@ impl Crawler {
 
     /// Puts the names of the tags on the links of a page of the WordPress API (the posts only have their ids). The name of an id is asked of the
     /// site once (up to 100 ids in a request) and kept in memory; a failed request leaves the tags out, and the works are saved without them.
+    /// A site whose posts have no `class_list` (177Picyy) tells the categories only by their ids too: they are named the same way and are tags (the ids of the terms of
+    /// WordPress are one series, so a tag and a category never share an id).
     async fn name_tags(&self, index: usize, body: &str, links: &mut [Link]) {
         let Ok(posts) = serde_json::from_str::<Vec<serde_json::Value>>(body) else { return };
         let site = self.engine.site(index);
+        let attributes: &[&str] = if posts.iter().any(|post| post.get("class_list").is_some()) { &["tags"] } else { &["tags", "categories"] };
 
         // the names learned before (kept in `site_tag_names`) are read once
         if self.names_loaded.lock().unwrap().insert(index) {
             let known = self.engine.store().site_tag_names(site.def.name).await.unwrap_or_default();
             let mut names = self.tag_names.lock().unwrap();
-            for (_, id, name) in known.into_iter().filter(|(attribute, ..)| attribute == "tags") {
+            for (_, id, name) in known.into_iter().filter(|(attribute, ..)| attribute == "tags" || attribute == "categories") {
                 names.entry((index, id)).or_insert(name);
             }
         }
-        let ids_of = |post: &serde_json::Value| -> Vec<u64> { post.get("tags").and_then(|tags| tags.as_array()).map(|tags| tags.iter().filter_map(|id| id.as_u64()).collect()).unwrap_or_default() };
-        let unknown: Vec<u64> = {
-            let names = self.tag_names.lock().unwrap();
-            let mut ids: Vec<u64> = posts.iter().flat_map(ids_of).filter(|id| !names.contains_key(&(index, *id))).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        };
+        let ids_of = |post: &serde_json::Value, attribute: &str| -> Vec<u64> { post.get(attribute).and_then(|ids| ids.as_array()).map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect()).unwrap_or_default() };
 
-        for chunk in unknown.chunks(100) {
-            let list: Vec<String> = chunk.iter().map(u64::to_string).collect();
-            let url = format!("{}/wp-json/wp/v2/tags?per_page=100&include={}&_fields=id,name", site.def.origin.trim_end_matches('/'), list.join(","));
-            let Ok((_, answer)) = self.engine.get_page(index, &url).await else { continue };
-            let Ok(found) = serde_json::from_str::<Vec<serde_json::Value>>(&answer) else { continue };
-            let mut learned: Vec<(u64, String)> = Vec::new();
+        for attribute in attributes {
+            let unknown: Vec<u64> = {
+                let names = self.tag_names.lock().unwrap();
+                let mut ids: Vec<u64> = posts.iter().flat_map(|post| ids_of(post, attribute)).filter(|id| !names.contains_key(&(index, *id))).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
 
-            for tag in found {
-                if let (Some(id), Some(name)) = (tag.get("id").and_then(|id| id.as_u64()), tag.get("name").and_then(|name| name.as_str())) {
-                    learned.push((id, decode(name).trim().to_lowercase()));
+            for chunk in unknown.chunks(100) {
+                let list: Vec<String> = chunk.iter().map(u64::to_string).collect();
+                let url = format!("{}/wp-json/wp/v2/{attribute}?per_page=100&include={}&_fields=id,name", site.def.origin.trim_end_matches('/'), list.join(","));
+                let Ok((_, answer)) = self.engine.get_page(index, &url).await else { continue };
+                let Ok(found) = serde_json::from_str::<Vec<serde_json::Value>>(&answer) else { continue };
+                let mut learned: Vec<(u64, String)> = Vec::new();
+
+                for tag in found {
+                    if let (Some(id), Some(name)) = (tag.get("id").and_then(|id| id.as_u64()), tag.get("name").and_then(|name| name.as_str())) {
+                        learned.push((id, decode(name).trim().to_lowercase()));
+                    }
                 }
-            }
-            {
-                let mut names = self.tag_names.lock().unwrap();
-                for (id, name) in &learned {
-                    names.insert((index, *id), name.clone());
+                {
+                    let mut names = self.tag_names.lock().unwrap();
+                    for (id, name) in &learned {
+                        names.insert((index, *id), name.clone());
+                    }
+                    // an id the site does not know is not asked again (while this process runs)
+                    for id in chunk {
+                        names.entry((index, *id)).or_default();
+                    }
                 }
-                // an id the site does not know is not asked again (while this process runs)
-                for id in chunk {
-                    names.entry((index, *id)).or_default();
+                for (id, name) in learned.iter().filter(|(_, name)| !name.is_empty()) {
+                    let _ = self.engine.store().save_site_tag_name(site.def.name, attribute, *id, name).await;
                 }
-            }
-            for (id, name) in learned.iter().filter(|(_, name)| !name.is_empty()) {
-                let _ = self.engine.store().save_site_tag_name(site.def.name, "tags", *id, name).await;
             }
         }
 
@@ -1045,11 +1051,13 @@ impl Crawler {
         for link in links.iter_mut() {
             let Some(post) = posts.iter().find(|post| post.get("link").and_then(|l| l.as_str()).and_then(|l| site.path_of(l)).is_some_and(|path| path == link.path)) else { continue };
 
-            for id in ids_of(post) {
-                if let Some(name) = names.get(&(index, id)).filter(|name| !name.is_empty()) {
-                    let tag = crate::sites::Tag::new(name.clone(), crate::sites::TagKind::Tag);
-                    if !link.extra.tags.contains(&tag) {
-                        link.extra.tags.push(tag);
+            for attribute in attributes {
+                for id in ids_of(post, attribute) {
+                    if let Some(name) = names.get(&(index, id)).filter(|name| !name.is_empty()) {
+                        let tag = crate::sites::Tag::new(name.clone(), crate::sites::TagKind::Tag);
+                        if !link.extra.tags.contains(&tag) {
+                            link.extra.tags.push(tag);
+                        }
                     }
                 }
             }
@@ -1262,6 +1270,49 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
         (port, hits)
+    }
+
+    /// 177Picyy: the posts have no `class_list`, only the ids of their categories: the names are asked of the site and are tags (tags of the posts are named too).
+    #[tokio::test]
+    async fn the_categories_of_posts_without_class_list_are_tags() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = Router::new()
+            .route("/wp-json/wp/v2/categories", get(|| async { r#"[{"id":30,"name":"Chinese (tt)"},{"id":24,"name":"Japanese (jj)"}]"# }))
+            .route("/wp-json/wp/v2/tags", get(|| async { r#"[{"id":7,"name":"Color"}]"# }));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let origin: &'static str = Box::leak(format!("http://127.0.0.1:{port}").into_boxed_str());
+        let site: &'static SiteDef = Box::leak(Box::new(SiteDef {
+            name: "Listed",
+            legal: false,
+            origin,
+            keep_query: &[],
+            pattern: Box::leak(format!(r"^http://127\.0\.0\.1:{port}/html/\d+").into_boxed_str()),
+            filter: None,
+            search: None,
+            cookie: None,
+            clean: Clean::Plain,
+            format: Format::Html,
+            delay_ms: 0,
+            japanese: true,
+            keep_times: false,
+            support: Support::Ready,
+            note: "",
+            plain_agent: false,
+        }));
+        let store = Arc::new(SearchStore::in_memory().await.unwrap());
+        let search = SearchConfig { min_delay_ms: 0, ..SearchConfig::default() };
+        let engine = Engine::with_sites(vec![Site::new(site)], &search, store.clone(), crate::testing::romanizer_arc());
+        let crawler = Crawler::with_sources(engine, CrawlConfig::default(), vec![("Listed".to_string(), Source::Pages(String::new()))]).unwrap();
+
+        let body = format!(r#"[{{"id":1,"link":"{origin}/html/1","title":{{"rendered":"One"}},"categories":[30],"tags":[7]}},{{"id":2,"link":"{origin}/html/2","title":{{"rendered":"Two"}},"categories":[24],"tags":[]}}]"#);
+        let mut links = wordpress_links(crawler.engine.site(0), &body).unwrap();
+        crawler.name_tags(0, &body, &mut links).await;
+
+        let names = |link: &Link| link.extra.tags.iter().map(|tag| tag.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&links[0]), ["color", "chinese (tt)"]);
+        assert_eq!(names(&links[1]), ["japanese (jj)"]);
     }
 
     async fn crawler(port: u16, config: CrawlConfig) -> (Arc<Crawler>, Arc<SearchStore>) {
