@@ -52,7 +52,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     }
 
     if state.hub.is_some() {
-        router = router.route("/dist/claim", get(crate::dist::claim)).route("/dist/report/{id}", axum::routing::post(crate::dist::report)).route("/dist/alive", axum::routing::post(crate::dist::alive));
+        router = router.route("/dist/claim", get(crate::dist::claim)).route("/dist/report/{id}", axum::routing::post(crate::dist::report)).route("/dist/alive", axum::routing::post(crate::dist::alive))
+            .route("/dist/tag-names", get(crate::dist::tag_names).post(crate::dist::learn_tag_name));
     }
 
     if state.mirror_path.is_some() {

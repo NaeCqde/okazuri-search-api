@@ -700,6 +700,9 @@ async fn serve(config: Option<PathBuf>, host: Option<String>, port: Option<u16>)
                 .with_probe_sites(verifier.as_ref().map(|verifier| verifier.site_names()).unwrap_or_default());
             verifier = verifier.map(|verifier| verifier.with_hub(hub.clone(), config.distribute.workers));
         }
+        if config.distribute.role == "worker" {
+            crawler = crawler.with_remote(crate::dist::Remote::new(&config.distribute));
+        }
         let crawler = Arc::new(crawler);
 
         if config.distribute.role == "worker" {

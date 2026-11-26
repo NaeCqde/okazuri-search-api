@@ -160,6 +160,71 @@ impl Hub {
     }
 }
 
+/// A worker's way to the names of the tags that the host keeps (`site_tag_names`).
+#[derive(Clone)]
+pub struct Remote {
+    client: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+impl Remote {
+    pub fn new(config: &DistributeConfig) -> Self {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().unwrap_or_default();
+
+        Self { client, base: config.host.trim_end_matches('/').to_string(), token: config.token.clone() }
+    }
+
+    /// `GET /dist/tag-names?site=`: (attribute, id, name) of the site.
+    pub async fn names(&self, site: &str) -> Result<Vec<(String, u64, String)>, String> {
+        let response = self.client.get(format!("{}/dist/tag-names", self.base)).query(&[("site", site)]).bearer_auth(&self.token).send().await.map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// `POST /dist/tag-names`: a name this worker learned.
+    pub async fn learned(&self, site: &str, attribute: &str, id: u64, name: &str) -> Result<(), String> {
+        let body = Learned { site: site.to_string(), attribute: attribute.to_string(), id, name: name.to_string() };
+        let response = self.client.post(format!("{}/dist/tag-names", self.base)).bearer_auth(&self.token).json(&body).send().await.map_err(|e| e.to_string())?;
+        if response.status().is_success() { Ok(()) } else { Err(format!("HTTP {}", response.status())) }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Learned {
+    site: String,
+    attribute: String,
+    id: u64,
+    name: String,
+}
+
+#[derive(Deserialize)]
+pub struct NamesQuery {
+    site: String,
+}
+
+/// `GET /dist/tag-names?site=`: the names of the numbers the site gives its tags, as `[attribute, id, name]`.
+pub async fn tag_names(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(query): Query<NamesQuery>) -> impl IntoResponse {
+    let Some(engine) = state.hub.clone().filter(|hub| hub.allows(&headers)).and(state.search.clone()) else { return StatusCode::UNAUTHORIZED.into_response() };
+
+    match engine.store().site_tag_names(&query.site).await {
+        Ok(names) => Json(names).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /dist/tag-names`: keeps a name that a worker learned.
+pub async fn learn_tag_name(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(learned): Json<Learned>) -> impl IntoResponse {
+    let Some(engine) = state.hub.clone().filter(|hub| hub.allows(&headers)).and(state.search.clone()) else { return StatusCode::UNAUTHORIZED.into_response() };
+
+    match engine.store().save_site_tag_name(&learned.site, &learned.attribute, learned.id, &learned.name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ClaimQuery {
     site: String,

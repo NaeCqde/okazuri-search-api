@@ -269,6 +269,8 @@ pub struct Crawler {
     bans: std::sync::Mutex<HashMap<usize, std::time::Instant>>,
     /// The sites whose pages the workers look at (the verified ones): the id check sends its probes only to them.
     probe_sites: Vec<String>,
+    /// Of a worker: the host, which keeps the names of the tags of the sites (`site_tag_names`) for all the workers.
+    remote: Option<crate::dist::Remote>,
 }
 
 /// How many pages of tags (`/tag/big-breasts/`) are read for each page of the list while a number that works carry has no name.
@@ -320,7 +322,35 @@ impl Crawler {
             }
         }
 
-        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_pages: 0, job_seconds: 0, bans: Default::default(), probe_sites: Vec::new() })
+        Ok(Self { engine, config, sources: chosen, shard, ids, schedule, offset_seconds, tag_names: Default::default(), names_loaded: Default::default(), learners: Default::default(), hub: None, job_pages: 0, job_seconds: 0, bans: Default::default(), probe_sites: Vec::new(), remote: None })
+    }
+
+    /// A worker asks the host for the names of the tags and gives it the ones it learns, so no worker asks a site again for what another one knows.
+    pub fn with_remote(mut self, remote: crate::dist::Remote) -> Self {
+        self.remote = Some(remote);
+        self
+    }
+
+    /// The names of the numbers a site gives its tags (`site_tag_names`): of the host when this is a worker (the own database when the host does not answer).
+    async fn known_names(&self, website: &str) -> Vec<(String, u64, String)> {
+        if let Some(remote) = &self.remote {
+            match remote.names(website).await {
+                Ok(names) => return names,
+                Err(e) => log::warn!("crawl {website}: the names of the tags of the host: {e}"),
+            }
+        }
+        self.engine.store().site_tag_names(website).await.unwrap_or_default()
+    }
+
+    /// Keeps a name learned (with the host when this is a worker). False when it could not be kept.
+    async fn remember_name(&self, website: &str, attribute: &str, id: u64, name: &str) -> bool {
+        if let Some(remote) = &self.remote {
+            match remote.learned(website, attribute, id, name).await {
+                Ok(()) => return true,
+                Err(e) => log::warn!("crawl {website}: the name of a tag was not given to the host: {e}"),
+            }
+        }
+        self.engine.store().save_site_tag_name(website, attribute, id, name).await.is_ok()
     }
 
     /// The pages of the sites are read by the workers of this host: the first walk of a numbered list is cut in jobs of `job_pages` pages (up to `lookahead` of them wait
@@ -891,7 +921,7 @@ impl Crawler {
 
         if !learner.loaded {
             learner.loaded = true;
-            for (attribute, id, name) in self.engine.store().site_tag_names(website).await.unwrap_or_default() {
+            for (attribute, id, name) in self.known_names(website).await {
                 if let Some((attribute, ..)) = crate::sites::CARD_ATTRIBUTES.iter().find(|(known, ..)| *known == attribute) {
                     learner.names.insert((*attribute, id), name);
                 }
@@ -969,7 +999,7 @@ impl Crawler {
         if let [id] = common.into_iter().collect::<Vec<_>>()[..] {
             if learner.used.contains(&(*attribute, id)) {
                 let name = slug.replace('-', " ");
-                if self.engine.store().save_site_tag_name(site.def.name, attribute, id, &name).await.is_ok() {
+                if self.remember_name(site.def.name, attribute, id, &name).await {
                     learner.names.insert((*attribute, id), name);
                 }
             }
@@ -989,7 +1019,7 @@ impl Crawler {
 
         // the names learned before (kept in `site_tag_names`) are read once
         if self.names_loaded.lock().unwrap().insert(index) {
-            let known = self.engine.store().site_tag_names(site.def.name).await.unwrap_or_default();
+            let known = self.known_names(site.def.name).await;
             let mut names = self.tag_names.lock().unwrap();
             for (_, id, name) in known.into_iter().filter(|(attribute, ..)| attribute == "tags" || attribute == "categories") {
                 names.entry((index, id)).or_insert(name);
@@ -1029,7 +1059,7 @@ impl Crawler {
                     }
                 }
                 for (id, name) in learned.iter().filter(|(_, name)| !name.is_empty()) {
-                    let _ = self.engine.store().save_site_tag_name(site.def.name, attribute, *id, name).await;
+                    self.remember_name(site.def.name, attribute, *id, name).await;
                 }
             }
         }
