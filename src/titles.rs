@@ -22,7 +22,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("同人の森", r"<title>(?<title>.+) \| 同人の森"),
     ("JComic", r#"<h1>(?<title>.+)</h1>(?:<a href="/author/(?<artist>[^"]+)?")?"#),
-    ("R18Best", r"<h1>(?<title>.+)</h1>"),
+    ("R18Best", r#"<h1[^>]*>(?<title>.+)</h1>"#),
     ("HentaiOMG", r"<h1>(?<title>.+)</h1>"),
     ("HentaiCore", r"<h1>(?<title>.+)</h1>"),
     ("Sukebei", r"<title>(?<title>.+?) (?:::|\|) Sukebei"),
@@ -33,7 +33,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("MasDr", r"<h1>(?<title>.+)</h1>"),
     ("JMwu", r"<h1>(?<title>.+)</h1>"),
     ("NukiBooks", r"<h1>(?<title>.+)</h1>"),
-    ("177Picyy", r"<h1>(?<title>.+)</h1>"),
+    ("177Picyy", r#"<h1[^>]*>(?<title>.+)</h1>"#),
     ("BatoTo", r"<h1>(?<title>.+)</h1>"),
     ("Wnacg", r"<h[12]>(?<title>.+?)</h[12]>"),
     ("HentaiName", r"<h1>(?<title>.+)</h1>"),
@@ -104,6 +104,8 @@ mod tests {
         assert_eq!(title_of_page("Sukebei", "<title>名前 | Sukebei | Nyaa</title>").as_deref(), Some("名前"));
         // a page of momon:GA with no author block still has its title
         assert_eq!(title_of_page("momon:GA", "<h1>[Circle] 作品名</h1>\n<div id=\"post-meta\"></div><h1>パロディ</h1>").as_deref(), Some("[Circle] 作品名"));
+        assert_eq!(title_of_page("R18Best", r#"<h1 class="entry-title">作品名</h1>"#).as_deref(), Some("作品名"));
+        assert_eq!(title_of_page("177Picyy", r#"<h1 class="entry-title">[中文] 作品名[183P]</h1>"#).as_deref(), Some("[中文] 作品名[183P]"));
         assert_eq!(title_of_page("Wnacg", "<p>no title</p>"), None);
         assert_eq!(title_of_page("Unknown", "<h1>x</h1>"), None);
     }
