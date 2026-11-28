@@ -82,7 +82,16 @@ impl Verifier {
         loop {
             // the number of works changes slowly (the crawl): it is counted again now and then
             if batches % 20 == 0 {
-                works = self.engine.store().counts_of(name).await.unwrap_or(works).max(1);
+                match self.engine.store().counts_of(name).await {
+                    Ok(count) => works = count.max(1),
+                    // the pages are spread over the interval by the number of works: a count that failed would spread them over years (with a count of one,
+                    // a page a month), so no batch is taken until the works are counted
+                    Err(e) => {
+                        log::warn!("verify {name}: the works are not counted ({e}), again in 10 minutes");
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                        continue;
+                    }
+                }
             }
             batches += 1;
 
@@ -111,7 +120,8 @@ impl Verifier {
         } else {
             *after = due.last().cloned().unwrap_or_default();
         }
-        let spacing = Duration::from_millis((self.config.interval_days.max(1) * 86_400_000 / works).max(self.config.min_pause_ms));
+        let spacing = Duration::from_millis((self.config.interval_days.max(1) * 86_400_000 / works.max(1)).max(self.config.min_pause_ms));
+        log::debug!("verify {name}: {} pages due, {} ms apart ({} works)", due.len(), spacing.as_millis(), works);
         let mut results = Vec::new();
 
         if let Some((hub, workers)) = &self.hub {

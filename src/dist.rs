@@ -32,6 +32,11 @@ const LOST_AFTER: Duration = Duration::from_secs(25 * 60);
 const HOST: &str = "host";
 /// How long `claim` waits for a job before it answers that there is none.
 const LONG_POLL: Duration = Duration::from_secs(25);
+/// How long one page of a probe may take: the turn of the site and the timeout of the client, and a lot more. A page that hangs (the answer never
+/// comes) would otherwise hold the whole job, and the verification of the site, for as long as the worker is alive.
+const PAGE_LIMIT: Duration = Duration::from_secs(180);
+/// How much longer than its pages need a job may be taken before it is given to another worker.
+const JOB_SLACK: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
@@ -70,6 +75,19 @@ struct Item {
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Has a job been taken for longer than its pages need? A step ends after `seconds` of reading, a probe after the spacing of its pages, and either
+/// is given `JOB_SLACK` more (a page that is slow, the report that is tried again).
+fn over(item: &Item) -> bool {
+    let Some(taken) = item.taken else { return false };
+    let needed = match &item.job {
+        Job::Step { seconds, .. } => Duration::from_secs(*seconds),
+        Job::Probe { paths, spacing_ms } => Duration::from_millis(spacing_ms.saturating_mul(paths.len() as u64)),
+    };
+    let age = now_ms().saturating_sub(taken).max(0) as u128;
+
+    age > (needed + JOB_SLACK).as_millis()
 }
 
 /// What a worker has done since the host started: the jobs that it reported, by site.
@@ -135,16 +153,26 @@ impl Hub {
         wait.await.map_err(|_| "the job was dropped".to_string())
     }
 
-    /// The first job of `site` and `kind` that waits (or whose worker was lost).
+    /// The first job of `site` and `kind` that waits (or whose worker was lost, or has had it for longer than it needs).
     pub(crate) fn take(&self, site: &str, kind: &str, worker: &str) -> Option<(u64, Job)> {
         let mut queue = self.queue.lock().unwrap();
         queue.seen.insert(worker.to_string(), Instant::now());
-        let silent = |queue: &Queue, name: &str| name != HOST && queue.seen.get(name).is_none_or(|at| at.elapsed() > LOST_AFTER);
-        let lost: Vec<u64> = queue.running.iter().filter(|(_, (name, _))| silent(&queue, name)).map(|(id, _)| *id).collect();
-        for id in lost {
+        let lost: Vec<(u64, bool)> = queue
+            .running
+            .iter()
+            .filter_map(|(id, (name, item))| {
+                let silent = name != HOST && queue.seen.get(name).is_none_or(|at| at.elapsed() > LOST_AFTER);
+                (silent || over(item)).then_some((*id, silent))
+            })
+            .collect();
+        for (id, silent) in lost {
             if let Some((_, mut item)) = queue.running.remove(&id) {
                 item.taken = None;
-                log::warn!("dist: the job {id} of {} was not reported, given again", item.site);
+                if silent {
+                    log::warn!("dist: the job {id} of {} was not reported, given again", item.site);
+                } else {
+                    log::warn!("dist: the job {id} of {} was taken for longer than its pages need, given again", item.site);
+                }
                 queue.waiting.push_front(item);
             }
         }
@@ -459,17 +487,25 @@ pub async fn work_local(hub: Arc<Hub>, engine: Arc<Engine>, crawler: Arc<Crawler
     while tasks.join_next().await.is_some() {}
 }
 
-/// Looks at the pages of `paths` of `site`, `spacing` apart (the pages of the site are spread over the interval of the verification).
+/// Looks at the pages of `paths` of `site`, `spacing` apart (the pages of the site are spread over the interval of the verification). A page that
+/// takes longer than `PAGE_LIMIT` is left for a later batch, as one that could not be read: it is no sign that the work is gone, and a page that
+/// hangs would hold the job (and the verification of the site) for as long as the worker is alive.
 pub(crate) async fn probe(engine: &Arc<Engine>, site: &str, paths: Vec<String>, spacing: Duration) -> Vec<(String, crate::engine::Looked)> {
     let (Some(index), Some(rule)) = (engine.site_named(site), gone_rule(site)) else { return Vec::new() };
+    let count = paths.len();
     let mut results = Vec::new();
 
-    for path in paths {
+    for (at, path) in paths.into_iter().enumerate() {
         let started = Instant::now();
         let url = engine.site(index).address(&path);
 
-        if let Some(looked) = engine.probe(index, &url, rule).await {
-            results.push((path, looked));
+        match tokio::time::timeout(PAGE_LIMIT, engine.probe(index, &url, rule)).await {
+            Ok(Some(looked)) => {
+                log::debug!("dist {site}: page {} of {count} looked at in {} ms, gone {}", at + 1, started.elapsed().as_millis(), looked.gone.is_some_and(|gone| gone));
+                results.push((path, looked));
+            }
+            Ok(None) => log::debug!("dist {site}: page {} of {count} gave no answer", at + 1),
+            Err(_) => log::warn!("dist {site}: {url} took longer than {} s, left for a later batch", PAGE_LIMIT.as_secs()),
         }
         if let Some(rest) = spacing.checked_sub(started.elapsed()) {
             tokio::time::sleep(rest).await;
@@ -509,6 +545,31 @@ mod tests {
         assert_eq!(of("w1")["stats"]["by_site"]["A"]["jobs"], 1);
         assert_eq!(of("w2")["stats"]["errors"], 1);
         assert_eq!(of("w2")["stats"]["works_listed"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_probe_taken_longer_than_its_pages_need_is_given_again_while_its_worker_is_alive() {
+        let hub = Arc::new(Hub::new("t".to_string()));
+        let job = Job::Probe { paths: vec!["/a".to_string()], spacing_ms: 0 };
+        let waiting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.submit("A", job).await })
+        };
+        let (id, _) = loop {
+            if let Some(taken) = hub.take("A", "probe", "w1") {
+                break taken;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // the worker is heard of (it takes the jobs of other sites), but its page has needed far longer than a page does
+        assert!(hub.take("A", "probe", "w1").is_none(), "nothing else waits");
+        hub.queue.lock().unwrap().running.get_mut(&id).unwrap().1.taken = Some(now_ms() - (JOB_SLACK + Duration::from_secs(60)).as_millis() as i64);
+
+        let (again, _) = hub.take("A", "probe", "w2").expect("a job that is taken too long is given again");
+        assert_eq!(again, id);
+        assert!(hub.report(id, Done::Probe(Vec::new())));
+        assert!(waiting.await.unwrap().is_ok());
     }
 
     #[tokio::test]
